@@ -27,6 +27,7 @@ spec:
       containers:
         - name: modelserver
           image: quay.io/wseaton/mock-engine-nixl:dev
+          imagePullPolicy: Always
           env:
             - name: MODEL
               value: Qwen/Qwen3-0.6B

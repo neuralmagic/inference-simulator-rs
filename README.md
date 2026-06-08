@@ -55,8 +55,21 @@ upstream:
   streaming and non-streaming OpenAI completions through this backend over the genuine
   ZMQ/msgpack protocol, real tokenizer/detokenizer and chat template included, no GPU,
   no model weights, no NIXL. Run it: `./scripts/e2e.sh`.
-- **Bird two (NIXL data plane):** integration point is in place and typechecks against
-  the bindings; the register/transfer dance is the next step (see `TODO(bird-two)`).
+- **Bird two (NIXL data plane):** implemented. A prefill engine fabricates and
+  registers fake KV, advertises `{agent_md, block descriptors, pattern}` as
+  `kv_transfer_params`; a decode engine loads the remote metadata, posts a NIXL READ
+  over UCX, polls to completion, and verifies the bytes. Proven by the loopback test
+  (`tests/nixl_loopback.rs`). Runs on Linux with real libnixl+UCX; on macOS only the
+  typecheck gate runs (the bindings link `-lstdc++`, which macOS lacks):
+
+  ```bash
+  cargo check --features nixl-stub     # macOS gate: typechecks the NIXL path
+  cargo test  --features nixl          # Linux: actually moves bytes + verifies
+  ```
+
+  Still open: plumbing `kv_transfer_params` from a prefill output into a decode
+  request across processes (today `extract_kv_params` returns `None`, so the live
+  engine's decode-pull hook is dormant; the transfer mechanics are proven via the test).
 
 ## Test
 

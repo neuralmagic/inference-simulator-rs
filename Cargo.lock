@@ -904,7 +904,7 @@ name = "mock-engine-nixl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytemuck",
+ "base64",
  "clap",
  "futures",
  "nixl-sys",

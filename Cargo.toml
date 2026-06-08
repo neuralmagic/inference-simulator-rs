@@ -12,7 +12,7 @@ path = "src/main.rs"
 [features]
 default = []
 # Real NIXL KV data plane. Needs libnixl + UCX installed (Linux, RDMA or shared-memory).
-nixl = ["dep:nixl-sys", "dep:bytemuck"]
+nixl = ["dep:nixl-sys", "dep:base64"]
 # Compile the NIXL bindings against stubs so the data-plane code typechecks on
 # machines without libnixl (e.g. macOS dev boxes). Won't actually move bytes.
 nixl-stub = ["nixl", "nixl-sys/stub-api"]
@@ -25,7 +25,7 @@ vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", re
 # NIXL bindings live in the local nixl checkout. Optional: only compiled with the
 # `nixl`/`nixl-stub` features so the default (bird-one) build needs nothing extra.
 nixl-sys = { path = "/Users/weaton/git/nixl/src/bindings/rust", optional = true }
-bytemuck = { version = "1.25.0", optional = true }
+base64 = { version = "0.22.1", optional = true }
 
 anyhow = "1.0.100"
 clap = { version = "4.5.38", features = ["derive", "env"] }

@@ -57,6 +57,14 @@ pub struct Opt {
     #[arg(long, default_value_t = 0)]
     pub seed: u64,
 
+    /// Bytes per fabricated KV block (NIXL data plane only).
+    #[arg(long, default_value_t = 128 * 1024)]
+    pub kv_block_bytes: usize,
+
+    /// Prompt tokens that map to one KV block (NIXL data plane only).
+    #[arg(long, default_value_t = 16)]
+    pub tokens_per_block: usize,
+
     /// Log a summary line for each request.
     #[arg(long)]
     pub log_requests: bool,

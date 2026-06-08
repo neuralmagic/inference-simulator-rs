@@ -26,7 +26,7 @@ use vllm_engine_core_client::protocol::{
 };
 
 use crate::Opt;
-use crate::dataplane::{KvDataPlane, PdRole, RequestKv, make_data_plane};
+use crate::dataplane::{KvDataPlane, NixlConfig, PdRole, RequestKv, make_data_plane};
 
 /// Derive a stable per-request seed from the CLI seed, engine, and request id.
 fn request_seed(base_seed: u64, engine_index: u32, request_id: &str) -> u64 {
@@ -298,6 +298,7 @@ impl Engine {
                 let mut by_client =
                     BTreeMap::<u32, (Vec<EngineCoreOutput>, BTreeSet<String>)>::new();
                 for request_id in request_ids {
+                    self.data_plane.release(&request_id);
                     if let Some(request) = self.active_requests.remove(&request_id) {
                         let output = request_output(
                             request_id.clone(),
@@ -443,11 +444,15 @@ pub(crate) async fn run_engine_loop(
     shutdown: CancellationToken,
 ) -> Result<()> {
     let role = opt.pd_role;
+    let cfg = NixlConfig {
+        kv_block_bytes: opt.kv_block_bytes,
+        tokens_per_block: opt.tokens_per_block,
+    };
     let mut engine = Engine {
         engine_index,
         opt,
         role,
-        data_plane: make_data_plane(role),
+        data_plane: make_data_plane(role, cfg),
         active_requests: HashMap::new(),
     };
 

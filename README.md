@@ -55,21 +55,22 @@ upstream:
   streaming and non-streaming OpenAI completions through this backend over the genuine
   ZMQ/msgpack protocol, real tokenizer/detokenizer and chat template included, no GPU,
   no model weights, no NIXL. Run it: `./scripts/e2e.sh`.
-- **Bird two (NIXL data plane):** implemented. A prefill engine fabricates and
-  registers fake KV, advertises `{agent_md, block descriptors, pattern}` as
-  `kv_transfer_params`; a decode engine loads the remote metadata, posts a NIXL READ
-  over UCX, polls to completion, and verifies the bytes. Proven by the loopback test
-  (`tests/nixl_loopback.rs`). Runs on Linux with real libnixl+UCX; on macOS only the
-  typecheck gate runs (the bindings link `-lstdc++`, which macOS lacks):
+- **Wire-compat control plane:** done. The engine produces/consumes the real vLLM
+  NixlConnector `kv_transfer_params` schema (`do_remote_prefill`/`do_remote_decode`,
+  `remote_engine_id`/`remote_host`/`remote_port`/`remote_block_ids`/`remote_request_id`/
+  `tp_size`/`remote_num_tokens`), driven per-request. Proven against a routing-sidecar
+  emulation (`scripts/pd_control.sh`), no NIXL required.
+- **Bird two (NIXL data plane):** the transfer mechanic is implemented and tested
+  in-process (`tests/nixl_loopback.rs`: register → NIXL READ → verify, Linux + libnixl).
+  Cross-pod pull over the ZMQ metadata side channel (the `get_meta_msg` handshake
+  serving `NixlAgentMetadata`) is the remaining increment; the addressing it needs
+  (`remote_host:remote_port:remote_engine_id`) is already produced/consumed.
 
   ```bash
-  cargo check --features nixl-stub     # macOS gate: typechecks the NIXL path
-  cargo test  --features nixl          # Linux: actually moves bytes + verifies
+  ./scripts/pd_control.sh              # macOS: control-plane schema round trip
+  cargo check --features nixl-stub     # macOS gate: typecheck the NIXL path
+  cargo test  --features nixl          # Linux: real NIXL transfer
   ```
-
-  Still open: plumbing `kv_transfer_params` from a prefill output into a decode
-  request across processes (today `extract_kv_params` returns `None`, so the live
-  engine's decode-pull hook is dormant; the transfer mechanics are proven via the test).
 
 ## Test
 

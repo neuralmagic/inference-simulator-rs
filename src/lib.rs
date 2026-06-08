@@ -65,6 +65,20 @@ pub struct Opt {
     #[arg(long, default_value_t = 16)]
     pub tokens_per_block: usize,
 
+    /// This engine's id, advertised as `remote_engine_id` in kv_transfer_params.
+    /// Set per-pod (e.g. from POD_NAME) so a decode peer can address this prefill.
+    #[arg(long, env = "MOCK_ENGINE_ID", default_value = "mock-engine-0")]
+    pub engine_id: String,
+
+    /// Host advertised as `remote_host` for the NIXL metadata side channel
+    /// (set to the pod IP in k8s).
+    #[arg(long, env = "MOCK_SIDE_CHANNEL_HOST", default_value = "127.0.0.1")]
+    pub side_channel_host: String,
+
+    /// Port advertised as `remote_port` for the NIXL metadata side channel.
+    #[arg(long, env = "MOCK_SIDE_CHANNEL_PORT", default_value_t = 5600)]
+    pub side_channel_port: u32,
+
     /// Log a summary line for each request.
     #[arg(long)]
     pub log_requests: bool,

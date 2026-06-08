@@ -26,7 +26,7 @@ use vllm_engine_core_client::protocol::{
 };
 
 use crate::Opt;
-use crate::dataplane::{KvDataPlane, NixlConfig, PdRole, RequestKv, make_data_plane};
+use crate::dataplane::{KvDataPlane, NixlConfig, RemoteKv, RequestKv, make_data_plane};
 
 /// Derive a stable per-request seed from the CLI seed, engine, and request id.
 fn request_seed(base_seed: u64, engine_index: u32, request_id: &str) -> u64 {
@@ -133,23 +133,49 @@ fn extract_kv_params(request: &EngineCoreRequest) -> Option<JsonValue> {
         .cloned()
 }
 
-/// Phase 0 probe: a prefill-style request (`do_remote_decode: true`) gets a stub
-/// remote descriptor echoed back so we can confirm `kv_transfer_params` survives the
-/// full round trip through the real frontend. The real values land in the wire-compat
-/// rework (mirroring `nixl_connector.py`); this only proves the channel.
-fn phase0_probe_response(kv: &JsonValue) -> Option<JsonValue> {
-    let is_prefill = kv
-        .get("do_remote_decode")
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
-    is_prefill.then(|| {
-        serde_json::json!({
-            "remote_block_ids": [0],
-            "remote_engine_id": "mock-engine-nixl",
-            "remote_host": "127.0.0.1",
-            "remote_port": 0,
-            "phase0_probe": true,
-        })
+/// Read a boolean flag out of a `kv_transfer_params` object.
+fn kv_flag(kv: &JsonValue, key: &str) -> bool {
+    kv.get(key).and_then(JsonValue::as_bool).unwrap_or(false)
+}
+
+/// Parse the `remote_*` addressing out of a decode request's `kv_transfer_params`
+/// (set by the routing sidecar from the prefill response). `None` if this is not a
+/// `do_remote_prefill` request or the fields are missing.
+fn parse_remote_kv(kv: &JsonValue) -> Option<RemoteKv> {
+    if !kv_flag(kv, "do_remote_prefill") {
+        return None;
+    }
+    Some(RemoteKv {
+        engine_id: kv.get("remote_engine_id")?.as_str()?.to_string(),
+        host: kv.get("remote_host")?.as_str()?.to_string(),
+        port: kv.get("remote_port")?.as_u64()? as u32,
+        block_ids: kv
+            .get("remote_block_ids")?
+            .as_array()?
+            .iter()
+            .filter_map(JsonValue::as_i64)
+            .collect(),
+    })
+}
+
+/// Build the `kv_transfer_params` a prefill engine returns, matching vLLM's
+/// NixlConnector schema (`scheduler.py:664`). The routing sidecar relays these
+/// `remote_*` fields into the decode request.
+fn build_prefill_kv_params(
+    remote: &RemoteKv,
+    request_id: &str,
+    remote_num_tokens: usize,
+) -> JsonValue {
+    serde_json::json!({
+        "do_remote_prefill": true,
+        "do_remote_decode": false,
+        "remote_block_ids": remote.block_ids,
+        "remote_engine_id": remote.engine_id,
+        "remote_request_id": request_id,
+        "remote_host": remote.host,
+        "remote_port": remote.port,
+        "tp_size": 1,
+        "remote_num_tokens": remote_num_tokens,
     })
 }
 
@@ -176,9 +202,9 @@ struct ActiveRequest {
     max_tokens: usize,
     generated: usize,
     rng: StdRng,
-    /// `kv_transfer_params` to stamp on this request's finishing output (Phase 0 probe
-    /// today; the prefill engine's real remote descriptor after the wire-compat rework).
-    advertise_on_finish: Option<JsonValue>,
+    /// This request asked us to prefill for a remote decoder (`do_remote_decode`), so on
+    /// finish we register its KV and stamp the `remote_*` descriptor onto its output.
+    prefill_advertise: bool,
 }
 
 impl ActiveRequest {
@@ -189,7 +215,10 @@ impl ActiveRequest {
         opt: &Opt,
     ) -> Result<Self, EngineCoreFinishReason> {
         let incoming_kv = extract_kv_params(&request);
-        let advertise_on_finish = incoming_kv.as_ref().and_then(phase0_probe_response);
+        let prefill_advertise = incoming_kv
+            .as_ref()
+            .map(|kv| kv_flag(kv, "do_remote_decode"))
+            .unwrap_or(false);
         let request_id = request.request_id;
         let client_index = request.client_index;
         let prompt_len = request
@@ -232,7 +261,7 @@ impl ActiveRequest {
             prompt_len,
             max_tokens,
             generated: 0,
-            advertise_on_finish,
+            prefill_advertise,
         })
     }
 
@@ -247,15 +276,11 @@ impl ActiveRequest {
         self.generated += chunk_len;
 
         let finished = self.generated >= self.max_tokens;
-        let mut output = request_output(
+        request_output(
             self.request_id.clone(),
             new_token_ids,
             finished.then_some(EngineCoreFinishReason::Length),
-        );
-        if finished {
-            output.kv_transfer_params = self.advertise_on_finish.take();
-        }
-        output
+        )
     }
 }
 
@@ -263,17 +288,11 @@ impl ActiveRequest {
 struct Engine {
     engine_index: u32,
     opt: Opt,
-    role: PdRole,
     data_plane: Box<dyn KvDataPlane>,
     active_requests: HashMap<String, ActiveRequest>,
 }
 
 impl Engine {
-    /// Whether this engine advertises prefilled KV (prefill side of a P/D pair).
-    fn advertises(&self) -> bool {
-        matches!(self.role, PdRole::Prefill)
-    }
-
     /// Drain one frontend request message.
     fn handle_input(&mut self, input: EngineInput) -> Result<Vec<EngineOutput>> {
         let mut outputs = Vec::new();
@@ -298,19 +317,29 @@ impl Engine {
                     }]);
                 }
 
-                // === DATA PLANE: decode-side pull (bird two) ===
-                // A decode engine pulls remote KV before it starts generating.
-                if matches!(self.role, PdRole::Decode)
-                    && let Some(params) = extract_kv_params(&request)
+                // === DATA PLANE: decode-side pull ===
+                // A do_remote_prefill request carries the prefill engine's remote_*
+                // descriptor; pull its KV over NIXL before we start generating.
+                if let Some(remote) = extract_kv_params(&request)
+                    .as_ref()
+                    .and_then(parse_remote_kv)
                 {
+                    let prompt_len = request
+                        .prompt_token_ids
+                        .as_ref()
+                        .map(Vec::len)
+                        .unwrap_or_default();
                     let kv = RequestKv {
                         request_id: &request_id,
-                        num_tokens: 0,
+                        num_tokens: prompt_len,
                     };
-                    match self.data_plane.pull_prefilled(kv, &params) {
-                        Ok(bytes) => {
-                            debug!(request_id, bytes, "pulled remote KV before decode")
-                        }
+                    match self.data_plane.pull_prefilled(kv, &remote) {
+                        Ok(bytes) => info!(
+                            request_id,
+                            bytes,
+                            engine_id = remote.engine_id,
+                            "pulled remote KV before decode"
+                        ),
                         Err(error) => warn!(request_id, %error, "remote KV pull failed"),
                     }
                 }
@@ -395,12 +424,11 @@ impl Engine {
             return Vec::new();
         }
 
-        let advertises = self.advertises();
         let mut by_client = BTreeMap::<u32, (Vec<EngineCoreOutput>, BTreeSet<String>)>::new();
         let mut finished_ids = BTreeSet::new();
 
-        // Collect (request_id, num_tokens) for finished requests so we can advertise
-        // their KV after the borrow on active_requests ends.
+        // Collect (client_index, request_id, num_tokens) for finished prefill requests so
+        // we can advertise their KV after the borrow on active_requests ends.
         let mut to_advertise: Vec<(u32, String, usize)> = Vec::new();
 
         for request in self.active_requests.values_mut() {
@@ -410,7 +438,7 @@ impl Engine {
             let finished = output.finished();
             if finished {
                 finished_ids.insert(request_id.clone());
-                if advertises {
+                if request.prefill_advertise {
                     to_advertise.push((client_index, request_id.clone(), request.prompt_len));
                 }
                 if self.opt.log_requests {
@@ -437,19 +465,24 @@ impl Engine {
             self.active_requests.remove(request_id);
         }
 
-        // === DATA PLANE: prefill-side advertise (bird two) ===
-        // Once prefill finishes, register the fake KV and stamp the descriptors onto
-        // the finishing output's kv_transfer_params for the decode engine to pull.
+        // === DATA PLANE: prefill-side advertise ===
+        // Once prefill finishes, register the fake KV and stamp the real kv_transfer_params
+        // (remote_engine_id/host/port/block_ids) onto the finishing output for the decoder.
         for (client_index, request_id, num_tokens) in to_advertise {
             let kv = RequestKv {
                 request_id: &request_id,
                 num_tokens,
             };
-            if let Some(params) = self.data_plane.advertise_prefilled(kv)
-                && let Some((outs, _)) = by_client.get_mut(&client_index)
-                && let Some(out) = outs.iter_mut().find(|o| o.request_id == request_id)
-            {
-                out.kv_transfer_params = Some(params);
+            match self.data_plane.advertise_prefilled(kv) {
+                Ok(remote) => {
+                    if let Some((outs, _)) = by_client.get_mut(&client_index)
+                        && let Some(out) = outs.iter_mut().find(|o| o.request_id == request_id)
+                    {
+                        out.kv_transfer_params =
+                            Some(build_prefill_kv_params(&remote, &request_id, num_tokens));
+                    }
+                }
+                Err(error) => warn!(request_id, %error, "prefill KV advertise failed"),
             }
         }
 
@@ -485,11 +518,13 @@ pub(crate) async fn run_engine_loop(
     let cfg = NixlConfig {
         kv_block_bytes: opt.kv_block_bytes,
         tokens_per_block: opt.tokens_per_block,
+        engine_id: opt.engine_id.clone(),
+        side_channel_host: opt.side_channel_host.clone(),
+        side_channel_port: opt.side_channel_port,
     };
     let mut engine = Engine {
         engine_index,
         opt,
-        role,
         data_plane: make_data_plane(role, cfg),
         active_requests: HashMap::new(),
     };

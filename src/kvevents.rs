@@ -16,7 +16,7 @@
 //!     so trailing optional fields may be omitted:
 //!
 //! ```text
-//! BlockStored:      ["BlockStored", block_hashes, parent_hash|nil, token_ids, block_size, lora_id|nil, "GPU"]
+//! BlockStored:      ["BlockStored", block_hashes, parent_hash|nil, token_ids, block_size, lora_id|nil, "GPU", lora_name|nil]
 //! BlockRemoved:     ["BlockRemoved", block_hashes, "GPU"]
 //! AllBlocksCleared: ["AllBlocksCleared"]
 //! ```
@@ -115,14 +115,16 @@ fn encode_event(event: &KvCacheEvent) -> Value {
             parent_hash,
             token_ids,
             block_size,
+            lora_name,
         } => Value::Array(vec![
             Value::from("BlockStored"),
             hashes(block_hashes),
             parent_hash.map(hash_value).unwrap_or(Value::Nil),
             Value::Array(token_ids.iter().map(|&t| Value::from(t)).collect()),
             Value::from(*block_size as u64),
-            Value::Nil, // lora_id
+            Value::Nil, // lora_id (deprecated upstream; router keys on lora_name)
             Value::from(MEDIUM_GPU),
+            lora_name.as_deref().map(Value::from).unwrap_or(Value::Nil),
         ]),
         KvCacheEvent::Removed { block_hashes } => Value::Array(vec![
             Value::from("BlockRemoved"),
@@ -254,6 +256,7 @@ mod tests {
             parent_hash: Some(7),
             token_ids: vec![1, 2, 3, 4],
             block_size: 4,
+            lora_name: Some("adapterA".to_string()),
         }];
         let bytes = encode_batch(&events).unwrap();
         let decoded = decode(&bytes);
@@ -266,7 +269,7 @@ mod tests {
         let evs = as_array(&batch[1]);
         assert_eq!(evs.len(), 1);
         let stored = as_array(&evs[0]);
-        // Tag, block_hashes, parent_hash, token_ids, block_size, lora_id, medium
+        // Tag, block_hashes, parent_hash, token_ids, block_size, lora_id, medium, lora_name
         assert_eq!(stored[0].as_str(), Some("BlockStored"));
         assert_eq!(hash_list(&stored[1]), vec![10, 20, 30]);
         assert_eq!(hash_u64(&stored[2]), 7, "parent hash");
@@ -278,8 +281,9 @@ mod tests {
             vec![1, 2, 3, 4]
         );
         assert_eq!(stored[4].as_u64(), Some(4), "block size");
-        assert!(stored[5].is_nil(), "lora_id");
+        assert!(stored[5].is_nil(), "lora_id (deprecated)");
         assert_eq!(stored[6].as_str(), Some("GPU"), "medium");
+        assert_eq!(stored[7].as_str(), Some("adapterA"), "lora_name");
     }
 
     #[test]
@@ -289,6 +293,7 @@ mod tests {
             parent_hash: None,
             token_ids: vec![0, 0, 0, 0],
             block_size: 4,
+            lora_name: None,
         }];
         let decoded = decode(&encode_batch(&events).unwrap());
         let stored = as_array(&as_array(&as_array(&decoded)[1])[0]);

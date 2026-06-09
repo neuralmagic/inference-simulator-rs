@@ -694,9 +694,10 @@ impl Engine {
         // Measure the local prefix hit, allocate slots for the new blocks, pin them all, and
         // emit BlockStored/BlockRemoved for the router. The slot ids are what the data plane
         // pages over NIXL and what we advertise as remote_block_ids.
-        let outcome = self
-            .pool
-            .cache_prompt(&prompt_tokens, request.cache_salt.as_deref());
+        let lora_name = request.lora_request.as_ref().map(|l| l.lora_name.as_str());
+        let outcome =
+            self.pool
+                .cache_prompt(&prompt_tokens, lora_name, request.cache_salt.as_deref());
         if let Some(events) = &self.events {
             events.publish(outcome.events);
         }
@@ -1328,6 +1329,47 @@ mod tests {
             .find_map(|o| o.prefill_stats.as_ref().cloned())
             .expect("prefill stats");
         assert_eq!(s3.num_local_cached_tokens, 8, "same salt -> full hit");
+    }
+
+    #[test]
+    fn lora_isolates_prefix_cache_across_adapters() {
+        let mut opt = test_opt();
+        opt.tokens_per_block = 4; // 8-token prompt = 2 full blocks
+        let mut engine = test_engine(opt);
+
+        // request() builds an all-zero 8-token prompt; only the adapter differs. max_tokens 1
+        // so each finishes in one step.
+        let with_lora = |id: &str, name: &str| EngineCoreRequest {
+            lora_request: Some(LoraRequest::new(
+                name.to_string(),
+                1,
+                format!("/loras/{name}"),
+                false,
+                false,
+            )),
+            ..request(id, 8, 1)
+        };
+
+        // r1 (adapter A) warms the cache; a different adapter must recompute, not hit A's blocks.
+        add(&mut engine, with_lora("r1", "A"));
+        let _ = drain(&mut engine);
+        add(&mut engine, with_lora("r2", "B"));
+        let s2 = drain(&mut engine)
+            .iter()
+            .find_map(|o| o.prefill_stats.as_ref().cloned())
+            .expect("prefill stats");
+        assert_eq!(
+            s2.num_local_cached_tokens, 0,
+            "different adapter -> no prefix hit"
+        );
+
+        // Same adapter A, same prompt -> full hit.
+        add(&mut engine, with_lora("r3", "A"));
+        let s3 = drain(&mut engine)
+            .iter()
+            .find_map(|o| o.prefill_stats.as_ref().cloned())
+            .expect("prefill stats");
+        assert_eq!(s3.num_local_cached_tokens, 8, "same adapter -> full hit");
     }
 
     #[test]

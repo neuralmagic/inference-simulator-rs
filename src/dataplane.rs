@@ -5,21 +5,29 @@
 //! this module plays that connector role, wire-compatibly with the llm-d routing
 //! sidecar and a real vLLM peer:
 //!
-//!   - PREFILL registers a (fake) KV region with NIXL, runs a NIXL listener thread, and
-//!     advertises how to reach it as [`RemoteKv`] (`remote_engine_id` / `remote_host` /
-//!     `remote_port` / `remote_block_ids`). The engine wraps that into the real
-//!     `kv_transfer_params` dict the sidecar relays.
-//!   - DECODE fetches the prefill agent's NIXL metadata from its listener (host:port),
-//!     polls until it loads, then posts a NIXL READ to pull the bytes before generating.
+//!   - PREFILL registers one KV pool with NIXL and serves a [`PoolDescriptor`] (its NIXL
+//!     agent metadata + pool base address) over a small TCP metadata side channel. It
+//!     advertises how to reach it as [`RemoteKv`] (`remote_engine_id`/`remote_host`/
+//!     `remote_port`/`remote_block_ids`/`remote_request_id`), which the engine wraps into the
+//!     real `kv_transfer_params` dict the sidecar relays. No mock-specific fields ride there.
+//!   - DECODE connects to that side channel (host:port), loads the peer's agent metadata via
+//!     `load_remote_md`, then posts a paged NIXL READ (one descriptor per block at
+//!     `pool_base + block_id*block_bytes`) and verifies the per-request pattern.
 //!
 //! ```text
-//!   prefill engine                            decode engine
-//!   ┌────────────────────┐   kv_transfer_     ┌────────────────────┐
-//!   │ register KV w/ NIXL │   params dict      │ fetch_remote_md     │
-//!   │ NIXL listener :port │   {remote_host,    │ (host:port), poll,  │
-//!   │ advertise RemoteKv ─┼─  port,engine_id, ─┼▶ NIXL READ, verify  │
-//!   └────────────────────┘    block_ids}       └────────────────────┘
+//!   prefill engine                                    decode engine
+//!   ┌──────────────────────┐  kv_transfer_params      ┌──────────────────────┐
+//!   │ register KV pool      │  {remote_host,port,      │ connect side channel  │
+//!   │ TCP side channel :port│   engine_id,block_ids,  ─┼▶ load_remote_md,      │
+//!   │  -> PoolDescriptor ───┼─  request_id}            │  paged NIXL READ,     │
+//!   │  {agent_md,pool_base} ◀┼─────────────────────────┼─ verify(pattern)      │
+//!   └──────────────────────┘     (descriptor fetch)    └──────────────────────┘
 //! ```
+//!
+//! The pool base address travels over the side channel (vLLM ships it as
+//! `kv_caches_base_addr` in its own `NixlAgentMetadata`), not in `kv_transfer_params`, and the
+//! verify pattern is derived from `request_id` on both sides, so the params dict stays
+//! byte-faithful to what a real vLLM engine produces.
 //!
 //! The default build ships [`NoopDataPlane`] (control plane only: produces/consumes the
 //! real dict but moves no bytes), so the sidecar contract is exercisable with no NIXL.
@@ -39,10 +47,13 @@ pub enum PdRole {
 /// Sizing + identity knobs for the data plane.
 #[derive(Debug, Clone)]
 pub struct NixlConfig {
-    /// Bytes per fabricated KV block.
+    /// Bytes per KV block (one paged slot in the registered pool).
     pub kv_block_bytes: usize,
     /// Prompt tokens that map to one KV block.
     pub tokens_per_block: usize,
+    /// Total KV-cache capacity in blocks. The prefill registers one contiguous pool of
+    /// `kv_cache_blocks * kv_block_bytes`, so block `i` lives at `pool_base + i*kv_block_bytes`.
+    pub kv_cache_blocks: usize,
     /// This engine's id, advertised as `remote_engine_id` (a real decode peer matches
     /// it against the NIXL agent metadata's engine id).
     pub engine_id: String,
@@ -52,24 +63,98 @@ pub struct NixlConfig {
     pub side_channel_port: u32,
 }
 
-/// How a decode peer reaches a prefilled request's KV. `engine_id`/`host`/`port`/
-/// `block_ids` are the wire-faithful `remote_*` fields of vLLM's `kv_transfer_params`;
-/// `addr`/`len`/`pattern` are a mock extension (real vLLM carries the base address in the
-/// NixlAgentMetadata over its own channel, we piggyback it so two mock peers interoperate
-/// through the real sidecar without reimplementing that channel).
+/// How a decode peer reaches a prefilled request's KV. Every field here is a wire-faithful
+/// `remote_*` field of vLLM's `kv_transfer_params` (no mock extensions): the decode learns
+/// the pool base address out of band over the metadata side channel ([`PoolDescriptor`]), and
+/// the verify pattern is derived from `request_id` on both sides, so nothing mock-specific
+/// rides in the params dict.
 #[derive(Debug, Clone)]
 pub struct RemoteKv {
     pub engine_id: String,
     pub host: String,
     pub port: u32,
-    /// Logical KV block ids on the prefill side to read.
+    /// Physical slot ids of this request's blocks in the prefill's KV pool. The decode reads
+    /// each one at `pool_base + block_id * block_bytes` (pool base from the side channel).
     pub block_ids: Vec<i64>,
-    /// Base address of the prefill's registered KV buffer.
-    pub addr: u64,
-    /// Length of that buffer in bytes.
-    pub len: u64,
-    /// Fill byte, for the decode side to verify the pull moved the right bytes.
-    pub pattern: u8,
+    /// The prefill's request id (`remote_request_id`). Both sides derive the per-request
+    /// verify pattern from it, so it never has to be transmitted separately.
+    pub request_id: String,
+}
+
+/// The prefill's KV-pool metadata, served over the side channel and consumed by a decode peer
+/// to address the pool. This is the mock's minimal stand-in for vLLM's `NixlAgentMetadata`:
+/// it carries the NIXL agent metadata bytes (`get_local_md`, loaded via `load_remote_md`) plus
+/// the pool base address vLLM ships as `kv_caches_base_addr`. Unlike vLLM's versioned v4
+/// schema (compatibility hashes, heartbeats), it is deliberately tiny and unversioned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolDescriptor {
+    pub engine_id: String,
+    /// Serialized NIXL agent metadata (`Agent::get_local_md`), loaded by the peer.
+    pub nixl_agent_md: Vec<u8>,
+    /// Base address of the prefill's single registered KV pool.
+    pub pool_base: u64,
+    /// Bytes per block (paged slot stride) in that pool.
+    pub block_bytes: u64,
+    /// Total blocks in the pool.
+    pub num_blocks: u64,
+}
+
+impl PoolDescriptor {
+    /// Encode to self-describing msgpack (array form), the side-channel wire format.
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        use rmpv::Value;
+        let value = Value::Array(vec![
+            Value::from(self.engine_id.as_str()),
+            Value::Binary(self.nixl_agent_md.clone()),
+            Value::from(self.pool_base),
+            Value::from(self.block_bytes),
+            Value::from(self.num_blocks),
+        ]);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &value)?;
+        Ok(buf)
+    }
+
+    /// Decode from the msgpack array produced by [`PoolDescriptor::encode`].
+    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        use anyhow::{Context as _, bail};
+        use rmpv::Value;
+        let mut cursor = std::io::Cursor::new(bytes);
+        let value = rmpv::decode::read_value(&mut cursor).context("decode pool descriptor")?;
+        let Value::Array(fields) = value else {
+            bail!("pool descriptor is not an array");
+        };
+        if fields.len() < 5 {
+            bail!("pool descriptor has {} fields, need 5", fields.len());
+        }
+        let engine_id = fields[0]
+            .as_str()
+            .context("pool descriptor engine_id")?
+            .to_string();
+        let nixl_agent_md = match &fields[1] {
+            Value::Binary(b) => b.clone(),
+            other => bail!("pool descriptor nixl_agent_md is not binary: {other:?}"),
+        };
+        let pool_base = fields[2].as_u64().context("pool descriptor pool_base")?;
+        let block_bytes = fields[3].as_u64().context("pool descriptor block_bytes")?;
+        let num_blocks = fields[4].as_u64().context("pool descriptor num_blocks")?;
+        Ok(Self {
+            engine_id,
+            nixl_agent_md,
+            pool_base,
+            block_bytes,
+            num_blocks,
+        })
+    }
+}
+
+/// Stable per-request fill byte, so a decode pull can verify it got the right bytes. Derived
+/// identically on both sides from the (prefill) request id, so it never has to be transmitted.
+pub fn pattern_for(request_id: &str) -> u8 {
+    request_id
+        .bytes()
+        .fold(0xa5u8, |acc, b| acc.wrapping_add(b))
+        | 1
 }
 
 /// The minimal view of a request the data plane needs, decoupled from the wire
@@ -77,8 +162,11 @@ pub struct RemoteKv {
 #[derive(Debug, Clone, Copy)]
 pub struct RequestKv<'a> {
     pub request_id: &'a str,
-    /// Number of prompt tokens; drives how many KV blocks we fabricate.
+    /// Number of prompt tokens; informational (sizing comes from `block_ids`).
     pub num_tokens: usize,
+    /// Physical KV-pool slot ids this request occupies, assigned by the block pool. These are
+    /// the paged blocks the prefill advertises and the decode reads/lands.
+    pub block_ids: &'a [usize],
 }
 
 /// The connector boundary: where simulated KV cache bytes move between engines.
@@ -106,11 +194,6 @@ impl NoopDataPlane {
     pub fn new(cfg: NixlConfig) -> Self {
         Self { cfg }
     }
-
-    fn block_ids(&self, num_tokens: usize) -> Vec<i64> {
-        let n = num_tokens.div_ceil(self.cfg.tokens_per_block).max(1);
-        (0..n as i64).collect()
-    }
 }
 
 impl KvDataPlane for NoopDataPlane {
@@ -119,10 +202,8 @@ impl KvDataPlane for NoopDataPlane {
             engine_id: self.cfg.engine_id.clone(),
             host: self.cfg.side_channel_host.clone(),
             port: self.cfg.side_channel_port,
-            block_ids: self.block_ids(kv.num_tokens),
-            addr: 0,
-            len: 0,
-            pattern: 0,
+            block_ids: kv.block_ids.iter().map(|&id| id as i64).collect(),
+            request_id: kv.request_id.to_string(),
         })
     }
 
@@ -165,10 +246,49 @@ pub fn nixl_is_stub() -> bool {
     }
 }
 
-/// The real NIXL-backed KV data plane.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_descriptor_round_trips() {
+        let descriptor = PoolDescriptor {
+            engine_id: "mock-prefill-0".to_string(),
+            nixl_agent_md: vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x42],
+            pool_base: 0x7f00_1234_5000,
+            block_bytes: 4096,
+            num_blocks: 16,
+        };
+        let bytes = descriptor.encode().expect("encode");
+        let decoded = PoolDescriptor::decode(&bytes).expect("decode");
+        assert_eq!(decoded, descriptor);
+    }
+
+    #[test]
+    fn pool_descriptor_decode_rejects_truncated() {
+        assert!(
+            PoolDescriptor::decode(&[0x90]).is_err(),
+            "empty array -> too few fields"
+        );
+        assert!(
+            PoolDescriptor::decode(&[0xff, 0xff]).is_err(),
+            "garbage -> error"
+        );
+    }
+
+    #[test]
+    fn pattern_is_stable_nonzero_and_request_specific() {
+        // Both sides derive the verify pattern from the request id, so it must be a pure,
+        // stable function of the id, and never zero (zero would alias an unwritten slot).
+        assert_eq!(pattern_for("req-abc"), pattern_for("req-abc"));
+        assert_ne!(pattern_for("req-abc"), 0);
+        assert_ne!(pattern_for("req-abc"), pattern_for("req-xyz"));
+    }
+}
+
+/// The real NIXL-backed KV data plane, paged over a single registered KV pool.
 #[cfg(feature = "nixl")]
 mod nixl {
-    use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
     use anyhow::{Result, anyhow, bail};
@@ -188,43 +308,91 @@ mod nixl {
         anyhow!("nixl: {error:?}")
     }
 
+    use std::collections::HashMap;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+
+    use super::{PoolDescriptor, pattern_for};
+
+    /// A remote prefill peer the decode has loaded, cached by engine id so we only fetch its
+    /// metadata + `load_remote_md` once.
+    struct LoadedPeer {
+        /// NIXL agent name returned by `load_remote_md` (used to address transfers).
+        agent_name: String,
+        pool_base: u64,
+        block_bytes: u64,
+    }
+
     pub struct NixlDataPlane {
         role: PdRole,
         cfg: NixlConfig,
         /// NIXL agent name == engine id, so a peer's `remote_engine_id` is the agent name.
         agent: Agent,
         backend: Backend,
-        /// Prefill side: registered KV buffers kept alive (and registered) at their
-        /// advertised address until `release`d, keyed by request id.
-        staged: HashMap<String, SystemStorage>,
+        /// The single registered KV pool: `kv_cache_blocks * kv_block_bytes` bytes. Block `i`
+        /// lives at `base + i * kv_block_bytes`. Both roles register one (the prefill serves
+        /// reads from it; the decode lands pulled blocks into it). Its base address is captured
+        /// into the served `PoolDescriptor` at init; peers learn it over the side channel.
+        pool: SystemStorage,
+        /// Decode side: remote prefill peers loaded so far, keyed by engine id.
+        peers: HashMap<String, LoadedPeer>,
     }
 
     impl NixlDataPlane {
         pub fn new(role: PdRole, cfg: NixlConfig) -> Result<Self> {
-            // Both agents run the listener + prog threads (as in NIXL's basic_two_peers):
-            // prefill serves its metadata, decode fetches it asynchronously and needs the
-            // prog thread to process the response. Each listens on its own side-channel port.
+            // We exchange agent metadata ourselves over the side channel ([`PoolDescriptor`]
+            // via `get_local_md`/`load_remote_md`), so NIXL's own listener thread is off; we
+            // keep the prog thread, which advances UCX for both initiated and serviced reads.
             let acfg = AgentConfig {
                 enable_prog_thread: true,
-                enable_listen_thread: true,
+                enable_listen_thread: false,
                 listen_port: cfg.side_channel_port as i32,
                 ..AgentConfig::default()
             };
             let agent = Agent::new_configured(&cfg.engine_id, &acfg).map_err(ne)?;
             let (_, params) = agent.get_plugin_params("UCX").map_err(ne)?;
             let backend = agent.create_backend("UCX", &params).map_err(ne)?;
+
+            // Register the whole KV pool up front, exactly once. This is the paged store the
+            // block-pool slot ids index into.
+            let pool_bytes = cfg.kv_cache_blocks.max(1) * cfg.kv_block_bytes;
+            let mut pool = SystemStorage::new(pool_bytes).map_err(ne)?;
+            if !is_stub() {
+                let mut opt = OptArgs::new().map_err(ne)?;
+                opt.add_backend(&backend).map_err(ne)?;
+                pool.register(&agent, Some(&opt)).map_err(ne)?;
+                // SAFETY: the pool's heap buffer address is stable for the agent's lifetime.
+                let pool_base = unsafe { pool.as_ptr() as u64 };
+
+                // The prefill is the metadata producer: serve our PoolDescriptor (agent md +
+                // pool base) over the side channel so decode peers can address + connect to us.
+                if matches!(role, PdRole::Prefill) {
+                    let descriptor = PoolDescriptor {
+                        engine_id: cfg.engine_id.clone(),
+                        nixl_agent_md: agent.get_local_md().map_err(ne)?,
+                        pool_base,
+                        block_bytes: cfg.kv_block_bytes as u64,
+                        num_blocks: cfg.kv_cache_blocks as u64,
+                    };
+                    serve_descriptor(cfg.side_channel_port, descriptor)?;
+                }
+            }
+
             debug!(
                 engine_id = cfg.engine_id,
                 ?role,
-                listen_port = cfg.side_channel_port,
-                "NIXL data plane ready (UCX backend)"
+                side_channel_port = cfg.side_channel_port,
+                pool_blocks = cfg.kv_cache_blocks,
+                pool_bytes,
+                "NIXL data plane ready (UCX backend, paged pool, side-channel metadata)"
             );
             Ok(Self {
                 role,
                 cfg,
                 agent,
                 backend,
-                staged: HashMap::new(),
+                pool,
+                peers: HashMap::new(),
             })
         }
 
@@ -235,90 +403,117 @@ mod nixl {
             Ok(opt)
         }
 
+        /// Fill a block slot in our pool with `pattern`, so a decode pull can verify the
+        /// right bytes moved. `SystemStorage` only exposes a whole-buffer `memset`, so we
+        /// write the sub-range through the pool's raw pointer.
+        fn fill_slot(&mut self, block_id: usize, pattern: u8) {
+            let offset = block_id * self.cfg.kv_block_bytes;
+            let end = offset + self.cfg.kv_block_bytes;
+            // SAFETY: `pool` owns a `Vec<u8>` of `kv_cache_blocks * kv_block_bytes`; callers
+            // only pass in-range slot ids, so `[offset, end)` is within that allocation, and
+            // we hold `&mut self` so no other reference aliases it.
+            unsafe {
+                let base = self.pool.as_ptr() as *mut u8;
+                std::slice::from_raw_parts_mut(base.add(offset), end - offset).fill(pattern);
+            }
+        }
+
+        /// Load a remote prefill peer (fetch its PoolDescriptor over the side channel + register
+        /// its agent metadata), caching it by engine id so repeated pulls reuse the connection.
+        fn ensure_peer(&mut self, engine_id: &str, host: &str, port: u32) -> Result<&LoadedPeer> {
+            if !self.peers.contains_key(engine_id) {
+                let descriptor = fetch_descriptor(host, port)?;
+                let agent_name = self
+                    .agent
+                    .load_remote_md(&descriptor.nixl_agent_md)
+                    .map_err(ne)?;
+                debug!(
+                    engine_id,
+                    agent_name,
+                    pool_base = descriptor.pool_base,
+                    "loaded remote prefill peer over side channel"
+                );
+                self.peers.insert(
+                    engine_id.to_string(),
+                    LoadedPeer {
+                        agent_name,
+                        pool_base: descriptor.pool_base,
+                        block_bytes: descriptor.block_bytes,
+                    },
+                );
+            }
+            Ok(self.peers.get(engine_id).expect("peer just inserted"))
+        }
+
         fn do_advertise(&mut self, kv: RequestKv<'_>) -> Result<RemoteKv> {
-            let n_blocks = kv.num_tokens.div_ceil(self.cfg.tokens_per_block).max(1);
-            let total = n_blocks * self.cfg.kv_block_bytes;
-
-            let mut storage = SystemStorage::new(total).map_err(ne)?;
             let pattern = pattern_for(kv.request_id);
-            storage.memset(pattern);
-            let opt = self.opt_args()?;
-            storage.register(&self.agent, Some(&opt)).map_err(ne)?;
-            // SAFETY: the buffer is a heap `Vec<u8>`; its address is stable across the
-            // move into `staged` (moving the Vec header does not reallocate).
-            let addr = unsafe { storage.as_ptr() as u64 };
-
-            self.staged.insert(kv.request_id.to_string(), storage);
+            for &block_id in kv.block_ids {
+                self.fill_slot(block_id, pattern);
+            }
             debug!(
                 request_id = kv.request_id,
-                blocks = n_blocks,
-                bytes = total,
-                "advertised KV"
+                blocks = kv.block_ids.len(),
+                "advertised paged KV"
             );
-
             Ok(RemoteKv {
                 engine_id: self.cfg.engine_id.clone(),
                 host: self.cfg.side_channel_host.clone(),
                 port: self.cfg.side_channel_port,
-                block_ids: (0..n_blocks as i64).collect(),
-                addr,
-                len: total as u64,
-                pattern,
+                block_ids: kv.block_ids.iter().map(|&id| id as i64).collect(),
+                request_id: kv.request_id.to_string(),
             })
         }
 
-        /// Pull a remote prefill's KV: fetch its NIXL metadata from its listener at
-        /// host:port, then post a NIXL READ from the advertised buffer into a fresh local
-        /// landing buffer, and verify the pattern. Decode and prefill are distinct agents.
+        /// Pull a remote prefill's KV: load the peer's metadata over the side channel (once),
+        /// then post a single multi-descriptor NIXL READ, one descriptor per advertised block,
+        /// gathering each remote slot (`pool_base + id*block_bytes`) into a contiguous local
+        /// landing buffer, and verify the per-request pattern. Decode and prefill are distinct
+        /// agents.
         fn do_pull(&mut self, kv: RequestKv<'_>, remote: &RemoteKv) -> Result<u64> {
-            if remote.len == 0 {
-                // Peer advertised no real buffer (e.g. a no-op prefill plane); nothing to move.
+            let n_blocks = remote.block_ids.len();
+            if n_blocks == 0 {
                 return Ok(0);
             }
+            // Both sides derive the verify pattern from the prefill's request id; nothing about
+            // the bytes' identity travels on the wire.
+            let pattern = pattern_for(&remote.request_id);
 
-            // The remote source descriptor (the prefill's registered KV buffer).
+            let (peer_agent, pool_base, block_bytes) = {
+                let peer = self.ensure_peer(&remote.engine_id, &remote.host, remote.port)?;
+                (
+                    peer.agent_name.clone(),
+                    peer.pool_base,
+                    peer.block_bytes as usize,
+                )
+            };
+            if block_bytes == 0 || pool_base == 0 {
+                return Ok(0);
+            }
+            let total = n_blocks * block_bytes;
+
+            // One remote descriptor per block, at its paged address in the prefill's pool.
             let mut remote_descs = XferDescList::new(MemType::Dram).map_err(ne)?;
-            remote_descs.add_desc(remote.addr as usize, remote.len as usize, 0);
-
-            // Fetch the prefill agent's metadata over its listener socket (ip+port in the
-            // opt args). The fetch is async, so poll check_remote_metadata (for these descs)
-            // until the metadata has actually loaded before creating the transfer.
-            let mut fetch_opt = self.opt_args()?;
-            fetch_opt.set_ip_addr(&remote.host).map_err(ne)?;
-            fetch_opt.set_port(remote.port as u16).map_err(ne)?;
-            self.agent
-                .fetch_remote_md(&remote.engine_id, Some(&fetch_opt))
-                .map_err(ne)?;
-            let start = Instant::now();
-            while !self
-                .agent
-                .check_remote_metadata(&remote.engine_id, Some(&remote_descs))
-            {
-                if start.elapsed() > XFER_TIMEOUT {
-                    bail!("timed out fetching NIXL metadata for {}", remote.engine_id);
-                }
-                std::thread::sleep(Duration::from_millis(5));
+            for &block_id in &remote.block_ids {
+                let addr = pool_base as usize + block_id as usize * block_bytes;
+                remote_descs.add_desc(addr, block_bytes, 0);
             }
 
-            // Land the bytes in a fresh, registered local buffer.
+            // Land the bytes in a fresh, registered contiguous buffer, one local descriptor
+            // per block so the desc lists line up (matching count + sizes).
             let opt = self.opt_args()?;
-            let mut dst = SystemStorage::new(remote.len as usize).map_err(ne)?;
+            let mut dst = SystemStorage::new(total).map_err(ne)?;
             dst.register(&self.agent, Some(&opt)).map_err(ne)?;
             // SAFETY: stable heap address of the Vec backing the storage.
             let dst_base = unsafe { dst.as_ptr() as usize };
 
             let mut local = XferDescList::new(MemType::Dram).map_err(ne)?;
-            local.add_desc(dst_base, remote.len as usize, 0);
+            for j in 0..n_blocks {
+                local.add_desc(dst_base + j * block_bytes, block_bytes, 0);
+            }
 
             let req = self
                 .agent
-                .create_xfer_req(
-                    XferOp::Read,
-                    &local,
-                    &remote_descs,
-                    &remote.engine_id,
-                    Some(&opt),
-                )
+                .create_xfer_req(XferOp::Read, &local, &remote_descs, &peer_agent, Some(&opt))
                 .map_err(ne)?;
             self.agent.post_xfer_req(&req, Some(&opt)).map_err(ne)?;
 
@@ -336,38 +531,31 @@ mod nixl {
                 std::thread::sleep(Duration::from_micros(200));
             }
 
-            let got = dst.as_slice().first().copied();
-            if got != Some(remote.pattern) {
-                bail!(
-                    "KV verify failed: expected 0x{:02x}, got {got:?}",
-                    remote.pattern
-                );
+            // Verify each landed block carries the expected pattern, and copy it into our own
+            // pool slot so a later request can prefix-hit it locally.
+            let landed = dst.as_slice();
+            for (j, &local_id) in kv.block_ids.iter().take(n_blocks).enumerate() {
+                let got = landed.get(j * block_bytes).copied();
+                if got != Some(pattern) {
+                    bail!("KV verify failed for block {j}: expected 0x{pattern:02x}, got {got:?}");
+                }
+                self.fill_slot(local_id, pattern);
             }
             debug!(
                 request_id = kv.request_id,
-                bytes = remote.len,
+                bytes = total,
+                blocks = n_blocks,
                 engine_id = remote.engine_id,
-                "pulled + verified KV over NIXL"
+                "pulled + verified paged KV over NIXL"
             );
-            Ok(remote.len)
+            Ok(total as u64)
         }
     }
 
     impl KvDataPlane for NixlDataPlane {
         fn advertise_prefilled(&mut self, kv: RequestKv<'_>) -> Result<RemoteKv> {
-            // Even under stub we can return addressing (control plane); only the transfer
-            // is a no-op. But stub register/get_local_md may error, so short-circuit.
-            if is_stub() {
-                return Ok(RemoteKv {
-                    engine_id: self.cfg.engine_id.clone(),
-                    host: self.cfg.side_channel_host.clone(),
-                    port: self.cfg.side_channel_port,
-                    block_ids: vec![0],
-                    addr: 0,
-                    len: 0,
-                    pattern: 0,
-                });
-            }
+            // Under stub the addressing (control plane) is still produced; only the transfer is
+            // a no-op (the pool isn't registered and no descriptor server runs).
             self.do_advertise(kv)
         }
 
@@ -379,17 +567,58 @@ mod nixl {
         }
 
         fn release(&mut self, request_id: &str) {
-            if self.staged.remove(request_id).is_some() {
-                debug!(request_id, role = ?self.role, "released staged KV");
-            }
+            // Block lifetime is the block pool's job now; the registered KV pool persists for
+            // the agent's lifetime, so there is nothing per-request to free here.
+            debug!(request_id, role = ?self.role, "release (paged pool persists)");
         }
     }
 
-    /// Stable per-request fill byte, so a decode pull can verify it got the right bytes.
-    fn pattern_for(request_id: &str) -> u8 {
-        request_id
-            .bytes()
-            .fold(0xa5u8, |acc, b| acc.wrapping_add(b))
-            | 1
+    /// Length-prefix (u32 big-endian) + msgpack: the side-channel framing for one descriptor.
+    fn write_framed(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+        stream.write_all(&(payload.len() as u32).to_be_bytes())?;
+        stream.write_all(payload)?;
+        stream.flush()
+    }
+
+    fn read_framed(stream: &mut TcpStream) -> Result<Vec<u8>> {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf)?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Spawn a tiny blocking TCP server that answers every connection with the (constant)
+    /// encoded `PoolDescriptor`. This is the prefill's metadata side channel; a daemon thread
+    /// for the agent's lifetime (the mock pod runs one engine), mirroring NIXL's own listener.
+    fn serve_descriptor(port: u32, descriptor: PoolDescriptor) -> Result<()> {
+        let payload = descriptor.encode()?;
+        let listener = TcpListener::bind(("0.0.0.0", port as u16))
+            .map_err(|e| anyhow!("bind metadata side channel on :{port}: {e}"))?;
+        std::thread::Builder::new()
+            .name(format!("kv-meta-{port}"))
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(mut stream) => {
+                            if let Err(e) = write_framed(&mut stream, &payload) {
+                                debug!(%e, "metadata side channel write failed");
+                            }
+                        }
+                        Err(e) => debug!(%e, "metadata side channel accept failed"),
+                    }
+                }
+            })
+            .map_err(|e| anyhow!("spawn metadata side channel thread: {e}"))?;
+        Ok(())
+    }
+
+    /// Fetch and decode a prefill peer's `PoolDescriptor` from its side channel.
+    fn fetch_descriptor(host: &str, port: u32) -> Result<PoolDescriptor> {
+        let mut stream = TcpStream::connect((host, port as u16))
+            .map_err(|e| anyhow!("connect metadata side channel {host}:{port}: {e}"))?;
+        let payload = read_framed(&mut stream)?;
+        PoolDescriptor::decode(&payload)
     }
 }

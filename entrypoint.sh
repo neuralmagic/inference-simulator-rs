@@ -41,7 +41,30 @@ SCHEDULER_ARGS=(
     --long-prefill-token-threshold "${MOCK_LONG_PREFILL_TOKEN_THRESHOLD:-0}"
     --scheduling-policy "${MOCK_SCHEDULING_POLICY:-fcfs}"
     --kv-cache-size "${MOCK_KV_CACHE_SIZE:-1024}"
+    --tokens-per-block "${MOCK_TOKENS_PER_BLOCK:-16}"
 )
+
+# KV-cache events for the cache-aware router (Phase 4). Off unless MOCK_ENABLE_KV_EVENTS=1.
+# The precise-prefix-cache-routing guide binds tcp://*:5556 and expects the topic
+# kv@<pod-id>@<model>; the deployment sets MOCK_KV_EVENTS_TOPIC=kv@$(POD_IP):8000@$MODEL.
+# An empty topic auto-builds kv@<engine_id>@<model>.
+EVENT_ARGS=()
+if [ "${MOCK_ENABLE_KV_EVENTS:-0}" = "1" ]; then
+    EVENT_ARGS=(
+        --enable-kv-cache-events
+        --kv-events-endpoint "${MOCK_KV_EVENTS_ENDPOINT:-tcp://*:5556}"
+        --kv-events-topic "${MOCK_KV_EVENTS_TOPIC:-}"
+    )
+fi
+
+# Failure injection + context-length limit (Phase 5). All default to off.
+FAILURE_ARGS=(
+    --max-model-len "${MOCK_MAX_MODEL_LEN:-0}"
+    --failure-injection-rate "${MOCK_FAILURE_INJECTION_RATE:-0.0}"
+)
+if [ -n "${MOCK_FAILURE_TYPES:-}" ]; then
+    FAILURE_ARGS+=(--failure-types "${MOCK_FAILURE_TYPES}")
+fi
 
 # Decode sits behind the routing sidecar (sidecar :8000 -> vllm-rs :8200); prefill is
 # hit directly on :8000. Override with VLLM_PORT if needed.
@@ -68,6 +91,8 @@ inference-sim \
     --side-channel-port "$SIDE_CHANNEL_PORT" \
     "${LATENCY_ARGS[@]}" \
     "${SCHEDULER_ARGS[@]}" \
+    "${EVENT_ARGS[@]}" \
+    "${FAILURE_ARGS[@]}" \
     --log-requests &
 ENGINE_PID=$!
 

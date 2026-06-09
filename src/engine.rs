@@ -19,7 +19,9 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use vllm_engine_core_client::protocol::stats::{PrefillStats, SchedulerStats};
+use vllm_engine_core_client::protocol::stats::{
+    BaseCacheStats, PrefillStats, PrefixCacheStats, SchedulerStats,
+};
 use vllm_engine_core_client::protocol::utility::{
     EngineCoreUtilityRequest, UtilityOutput, UtilityResultEnvelope,
 };
@@ -27,7 +29,9 @@ use vllm_engine_core_client::protocol::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
 };
 
+use crate::blockpool::BlockPool;
 use crate::dataplane::{KvDataPlane, NixlConfig, RemoteKv, RequestKv, make_data_plane};
+use crate::kvevents::{self, KvEventTx};
 use crate::latency::LatencyModel;
 use crate::{Opt, SchedulingPolicy};
 
@@ -174,19 +178,14 @@ fn parse_remote_kv(kv: &JsonValue) -> Option<RemoteKv> {
             .iter()
             .filter_map(JsonValue::as_i64)
             .collect(),
-        // Mock extension fields (see RemoteKv); absent when the peer is a real vLLM.
-        addr: kv
-            .get("remote_buf_addr")
-            .and_then(JsonValue::as_u64)
-            .unwrap_or(0),
-        len: kv
-            .get("remote_buf_len")
-            .and_then(JsonValue::as_u64)
-            .unwrap_or(0),
-        pattern: kv
-            .get("remote_pattern")
-            .and_then(JsonValue::as_u64)
-            .unwrap_or(0) as u8,
+        // The prefill's request id; the data plane derives the verify pattern from it and the
+        // pool base/addressing comes over the NIXL metadata side channel, so no mock-specific
+        // fields ride in kv_transfer_params.
+        request_id: kv
+            .get("remote_request_id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
@@ -208,10 +207,6 @@ fn build_prefill_kv_params(
         "remote_port": remote.port,
         "tp_size": 1,
         "remote_num_tokens": remote_num_tokens,
-        // Mock extension: the prefill KV buffer the decode peer reads over NIXL.
-        "remote_buf_addr": remote.addr,
-        "remote_buf_len": remote.len,
-        "remote_pattern": remote.pattern,
     })
 }
 
@@ -244,6 +239,12 @@ struct ActiveRequest {
     /// This request's KV was prefilled remotely and pulled in (`do_remote_prefill`), so its
     /// prompt tokens count as externally cached for prefill stats / metrics.
     remote_prefill: bool,
+    /// Prompt tokens served from this engine's local prefix cache (the block-pool prefix
+    /// hit), feeding `num_local_cached_tokens` and the first-token (TTFT) timing.
+    num_local_cached_tokens: usize,
+    /// Physical block-pool slot ids this request pins (prompt blocks). Unpinned on finish or
+    /// abort so they become evictable; also the `remote_block_ids` the data plane pages.
+    block_ids: Vec<usize>,
     /// When the next output token is due. Set to `now + first-token delay` at admission, then
     /// advanced by the inter-token delay after each emitted token. The engine loop sleeps
     /// until the earliest deadline across all active requests, so this is the timing model.
@@ -261,6 +262,8 @@ impl ActiveRequest {
         opt: &Opt,
         latency: &LatencyModel,
         num_running: u64,
+        num_local_cached_tokens: usize,
+        block_ids: Vec<usize>,
     ) -> Result<Self, EngineCoreFinishReason> {
         let incoming_kv = extract_kv_params(&request);
         let prefill_advertise = incoming_kv
@@ -307,9 +310,15 @@ impl ActiveRequest {
         }
 
         let mut rng = StdRng::seed_from_u64(request_seed(opt.seed, engine_index, &request_id));
-        // No prefix cache yet, so no prompt tokens are served from the local cache.
-        let first_delay =
-            latency.first_token_delay(&mut rng, prompt_len, 0, remote_prefill, num_running);
+        // Prompt tokens served from the local prefix cache are not recomputed, so they
+        // shorten the prefill (TTFT). The block pool measured the hit at admission.
+        let first_delay = latency.first_token_delay(
+            &mut rng,
+            prompt_len,
+            num_local_cached_tokens,
+            remote_prefill,
+            num_running,
+        );
 
         Ok(ActiveRequest {
             rng,
@@ -320,6 +329,8 @@ impl ActiveRequest {
             generated: 0,
             prefill_advertise,
             remote_prefill,
+            num_local_cached_tokens,
+            block_ids,
             next_at: Instant::now() + first_delay,
         })
     }
@@ -353,30 +364,25 @@ impl ActiveRequest {
         }
     }
 
-    /// KV blocks this request currently occupies (prompt + generated so far), for the
-    /// `kv_cache_usage` metric. Rounds up to whole blocks.
-    fn blocks_used(&self, tokens_per_block: usize) -> u64 {
-        if tokens_per_block == 0 {
-            return 0;
-        }
-        let tokens = self.prompt_len + self.generated;
-        tokens.div_ceil(tokens_per_block) as u64
-    }
-
     /// Prefill breakdown for this request's first output, feeding the prefix-cache and
-    /// KV-transfer metrics. Until the prefix-cache model lands, prompt tokens are either all
-    /// local compute, or (for a remote-prefilled decode request) all externally cached.
+    /// KV-transfer metrics. Prompt tokens split three ways: local prefix-cache hits (the
+    /// block pool), external KV transfer (a `do_remote_prefill` decode pulls the rest from
+    /// the prefill peer), and fresh local compute (whatever neither covered).
     fn prefill_stats(&self) -> PrefillStats {
+        let prompt = self.prompt_len as u32;
+        let local = (self.num_local_cached_tokens as u32).min(prompt);
         let external = if self.remote_prefill {
-            self.prompt_len as u32
+            prompt.saturating_sub(local)
         } else {
             0
         };
+        let cached = local + external;
         PrefillStats {
-            num_prompt_tokens: self.prompt_len as u32,
-            num_computed_tokens: (self.prompt_len as u32).saturating_sub(external),
+            num_prompt_tokens: prompt,
+            num_computed_tokens: prompt.saturating_sub(cached),
+            num_cached_tokens: cached,
+            num_local_cached_tokens: local,
             num_external_cached_tokens: external,
-            ..Default::default()
         }
     }
 }
@@ -387,6 +393,13 @@ struct Engine {
     opt: Opt,
     latency: LatencyModel,
     data_plane: Box<dyn KvDataPlane>,
+    /// Prefix-cache + block-slot pool. Drives local cache hits, `kv_cache_usage`,
+    /// `prefix_cache_stats`, and the KV-cache events the cache-aware router consumes.
+    pool: BlockPool,
+    /// Publisher for KV-cache events; `None` when events are disabled.
+    events: Option<KvEventTx>,
+    /// RNG for failure injection (Phase 5), seeded per engine for reproducibility.
+    failure_rng: StdRng,
     /// The running batch: requests being actively decoded. Capped at `max_num_seqs`.
     active_requests: HashMap<String, ActiveRequest>,
     /// Admitted-but-not-yet-running requests, in arrival order. Drained into `active_requests`
@@ -395,6 +408,35 @@ struct Engine {
 }
 
 impl Engine {
+    /// Decide whether to fail a request on arrival (Phase 5). First the deterministic
+    /// context-length check (`prompt + max_tokens > max_model_len`), then the random
+    /// injection at `failure_injection_rate`. Returns the finish reason to fail with, if any.
+    fn maybe_fail(&mut self, request: &EngineCoreRequest) -> Option<EngineCoreFinishReason> {
+        if self.opt.max_model_len > 0 {
+            let prompt_len = request.prompt_token_ids.as_ref().map(Vec::len).unwrap_or(0) as u64;
+            let max_tokens = request
+                .sampling_params
+                .as_ref()
+                .map(|s| s.max_tokens as u64)
+                .unwrap_or(0);
+            if prompt_len + max_tokens > self.opt.max_model_len {
+                return Some(EngineCoreFinishReason::Length);
+            }
+        }
+
+        let rate = self.opt.failure_injection_rate;
+        if rate > 0.0
+            && !self.opt.failure_types.is_empty()
+            && self.failure_rng.random::<f64>() < rate
+        {
+            let idx = self
+                .failure_rng
+                .random_range(0..self.opt.failure_types.len());
+            return Some(self.opt.failure_types[idx].finish_reason());
+        }
+        None
+    }
+
     /// Drain one frontend request message.
     fn handle_input(&mut self, input: EngineInput) -> Result<Vec<EngineOutput>> {
         let mut outputs = Vec::new();
@@ -422,6 +464,18 @@ impl Engine {
                     }]);
                 }
 
+                // Phase 5: fail the request on arrival if the context-length check trips or
+                // the injector rolls a failure. It never enters the queue or the pool.
+                if let Some(reason) = self.maybe_fail(&request) {
+                    if self.opt.log_requests {
+                        info!(request_id, ?reason, "request failed on arrival (injected)");
+                    }
+                    return Ok(vec![EngineOutput {
+                        client_index,
+                        outputs: empty_finish_outputs(self.engine_index, request_id, reason),
+                    }]);
+                }
+
                 // vLLM never rejects on queue length, so the queue is unbounded. Enqueue, then
                 // admit into the batch if the seq cap and token budget allow; else it waits.
                 self.waiting.push_back(request);
@@ -444,6 +498,8 @@ impl Engine {
                     // A request is either running or waiting (never both); abort whichever.
                     let client_index =
                         if let Some(request) = self.active_requests.remove(&request_id) {
+                            // Free its prefix-cache pins so the blocks can be evicted later.
+                            self.pool.unpin(&request.block_ids);
                             Some(request.client_index)
                         } else if let Some(pos) =
                             self.waiting.iter().position(|r| r.request_id == request_id)
@@ -492,6 +548,14 @@ impl Engine {
                     method = request.method_name,
                     "utility request"
                 );
+                // Mirror vLLM: resetting the prefix cache clears the block pool and emits a
+                // single AllBlocksCleared so the router drops this engine's whole index.
+                if request.method_name == "reset_prefix_cache"
+                    && let Some(event) = self.pool.reset()
+                    && let Some(events) = &self.events
+                {
+                    events.publish(vec![event]);
+                }
                 let client_index = request.client_index;
                 outputs.push(EngineOutput {
                     client_index,
@@ -520,22 +584,30 @@ impl Engine {
     fn admit(&mut self, request: Box<EngineCoreRequest>) -> Option<EngineOutput> {
         let request_id = request.request_id.clone();
         let client_index = request.client_index;
+        let remote = extract_kv_params(&request)
+            .as_ref()
+            .and_then(parse_remote_kv);
+        let prompt_tokens: Vec<u32> = request.prompt_token_ids.clone().unwrap_or_default();
+
+        // === BLOCK POOL: cache this prompt locally ===
+        // Measure the local prefix hit, allocate slots for the new blocks, pin them all, and
+        // emit BlockStored/BlockRemoved for the router. The slot ids are what the data plane
+        // pages over NIXL and what we advertise as remote_block_ids.
+        let outcome = self.pool.cache_prompt(&prompt_tokens);
+        if let Some(events) = &self.events {
+            events.publish(outcome.events);
+        }
+        let num_local_cached = outcome.num_cached_tokens;
+        let block_ids = outcome.block_ids;
 
         // === DATA PLANE: decode-side pull ===
         // A do_remote_prefill request carries the prefill engine's remote_* descriptor; pull
-        // its KV over NIXL before we start generating.
-        if let Some(remote) = extract_kv_params(&request)
-            .as_ref()
-            .and_then(parse_remote_kv)
-        {
-            let prompt_len = request
-                .prompt_token_ids
-                .as_ref()
-                .map(Vec::len)
-                .unwrap_or_default();
+        // its KV over NIXL into our slots before we start generating.
+        if let Some(remote) = remote {
             let kv = RequestKv {
                 request_id: &request_id,
-                num_tokens: prompt_len,
+                num_tokens: prompt_tokens.len(),
+                block_ids: &block_ids,
             };
             match self.data_plane.pull_prefilled(kv, &remote) {
                 Ok(bytes) => info!(
@@ -556,15 +628,21 @@ impl Engine {
             &self.opt,
             &self.latency,
             num_running,
+            num_local_cached,
+            block_ids.clone(),
         ) {
             Ok(active) => {
                 self.active_requests.insert(request_id, active);
                 None
             }
-            Err(finish_reason) => Some(EngineOutput {
-                client_index,
-                outputs: empty_finish_outputs(self.engine_index, request_id, finish_reason),
-            }),
+            Err(finish_reason) => {
+                // The request never runs, so release the pins we just took.
+                self.pool.unpin(&block_ids);
+                Some(EngineOutput {
+                    client_index,
+                    outputs: empty_finish_outputs(self.engine_index, request_id, finish_reason),
+                })
+            }
         }
     }
 
@@ -647,9 +725,9 @@ impl Engine {
         let mut by_client = BTreeMap::<u32, (Vec<EngineCoreOutput>, BTreeSet<String>)>::new();
         let mut finished_ids = BTreeSet::new();
 
-        // Collect (client_index, request_id, num_tokens) for finished prefill requests so
-        // we can advertise their KV after the borrow on active_requests ends.
-        let mut to_advertise: Vec<(u32, String, usize)> = Vec::new();
+        // Collect (client_index, request_id, num_tokens, block_ids) for finished prefill
+        // requests so we can advertise their KV after the borrow on active_requests ends.
+        let mut to_advertise: Vec<(u32, String, usize, Vec<usize>)> = Vec::new();
 
         for request in self.active_requests.values_mut() {
             if request.next_at > now {
@@ -670,7 +748,12 @@ impl Engine {
             if finished {
                 finished_ids.insert(request_id.clone());
                 if request.prefill_advertise {
-                    to_advertise.push((client_index, request_id.clone(), request.prompt_len));
+                    to_advertise.push((
+                        client_index,
+                        request_id.clone(),
+                        request.prompt_len,
+                        request.block_ids.clone(),
+                    ));
                 }
                 if self.opt.log_requests {
                     info!(
@@ -700,16 +783,22 @@ impl Engine {
         }
 
         for request_id in &finished_ids {
-            self.active_requests.remove(request_id);
+            if let Some(request) = self.active_requests.remove(request_id) {
+                // Release the prefix-cache pins; the blocks stay cached (evictable) for hits.
+                // (A prefill-advertised block could in principle be evicted before its decode
+                // peer pulls it under heavy cache pressure; size the pool to avoid that.)
+                self.pool.unpin(&request.block_ids);
+            }
         }
 
         // === DATA PLANE: prefill-side advertise ===
         // Once prefill finishes, register the fake KV and stamp the real kv_transfer_params
         // (remote_engine_id/host/port/block_ids) onto the finishing output for the decoder.
-        for (client_index, request_id, num_tokens) in to_advertise {
+        for (client_index, request_id, num_tokens, block_ids) in to_advertise {
             let kv = RequestKv {
                 request_id: &request_id,
                 num_tokens,
+                block_ids: &block_ids,
             };
             match self.data_plane.advertise_prefilled(kv) {
                 Ok(remote) => {
@@ -755,23 +844,25 @@ impl Engine {
     }
 
     /// Snapshot of scheduler state for the frontend's `vllm:*` gauges: the running batch size,
-    /// the waiting-queue depth, and KV-cache utilization.
-    fn scheduler_stats(&self) -> SchedulerStats {
-        let used_blocks: u64 = self
-            .active_requests
-            .values()
-            .map(|request| request.blocks_used(self.opt.tokens_per_block))
-            .sum();
-        let kv_cache_usage = if self.opt.kv_cache_size == 0 {
-            0.0
-        } else {
-            (used_blocks as f64 / self.opt.kv_cache_size as f64).min(1.0)
-        };
-
+    /// the waiting-queue depth, KV-cache utilization, and the prefix-cache hit counters.
+    ///
+    /// Takes `&mut self` because the prefix-cache counters are per-report deltas (the frontend
+    /// does `inc_by` on them), so each snapshot drains them.
+    fn scheduler_stats(&mut self) -> SchedulerStats {
+        let prefix = self.pool.take_stats();
         SchedulerStats {
             num_running_reqs: self.active_requests.len() as u64,
             num_waiting_reqs: self.waiting.len() as u64,
-            kv_cache_usage,
+            kv_cache_usage: self.pool.usage(),
+            prefix_cache_stats: PrefixCacheStats {
+                base: BaseCacheStats {
+                    reset: false,
+                    requests: prefix.requests,
+                    queries: prefix.queries,
+                    hits: prefix.hits,
+                },
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -799,16 +890,34 @@ pub(crate) async fn run_engine_loop(
     let cfg = NixlConfig {
         kv_block_bytes: opt.kv_block_bytes,
         tokens_per_block: opt.tokens_per_block,
+        kv_cache_blocks: opt.kv_cache_size as usize,
         engine_id: opt.engine_id.clone(),
         side_channel_host: opt.side_channel_host.clone(),
         side_channel_port: opt.side_channel_port,
     };
     let latency = opt.latency_model();
+    let opt_seed = opt.seed;
+    let pool = BlockPool::new(
+        opt.tokens_per_block,
+        opt.kv_cache_size as usize,
+        opt.kv_cache_none_seed,
+    );
+    let events = kvevents::spawn(opt.kv_events_config(engine_index), shutdown.clone())
+        .await
+        .unwrap_or_else(|error| {
+            warn!(%error, "kv-event publisher failed to start; continuing without events");
+            None
+        });
     let mut engine = Engine {
         engine_index,
         opt,
         latency,
         data_plane: make_data_plane(role, cfg),
+        pool,
+        events,
+        failure_rng: StdRng::seed_from_u64(
+            opt_seed ^ (engine_index as u64).wrapping_mul(0x9e3779b9),
+        ),
         active_requests: HashMap::new(),
         waiting: VecDeque::new(),
     };
@@ -863,14 +972,23 @@ mod tests {
         let cfg = NixlConfig {
             kv_block_bytes: opt.kv_block_bytes,
             tokens_per_block: opt.tokens_per_block,
+            kv_cache_blocks: opt.kv_cache_size as usize,
             engine_id: opt.engine_id.clone(),
             side_channel_host: opt.side_channel_host.clone(),
             side_channel_port: opt.side_channel_port,
         };
+        let pool = crate::blockpool::BlockPool::new(
+            opt.tokens_per_block,
+            opt.kv_cache_size as usize,
+            opt.kv_cache_none_seed,
+        );
         Engine {
             engine_index: 0,
             latency: opt.latency_model(),
             data_plane: make_data_plane(PdRole::Both, cfg),
+            pool,
+            events: None,
+            failure_rng: StdRng::seed_from_u64(opt.seed),
             active_requests: HashMap::new(),
             waiting: VecDeque::new(),
             opt,
@@ -1020,6 +1138,102 @@ mod tests {
             .expect("prefill stats");
         assert_eq!(stats.num_external_cached_tokens, 9);
         assert_eq!(stats.num_computed_tokens, 0);
+    }
+
+    #[test]
+    fn shared_prompt_prefix_counts_as_local_cached() {
+        let mut opt = test_opt();
+        opt.tokens_per_block = 4; // small blocks so an 8-token prompt is 2 full blocks
+        let mut engine = test_engine(opt);
+
+        // First request is cold: both blocks are computed, none cached.
+        add(&mut engine, request("r1", 8, 1));
+        let first = drain(&mut engine);
+        let s1 = first
+            .iter()
+            .find_map(|o| o.prefill_stats.as_ref())
+            .expect("prefill stats");
+        assert_eq!(s1.num_local_cached_tokens, 0);
+        assert_eq!(s1.num_computed_tokens, 8);
+
+        // r1's blocks stay cached after it finishes. The identical prompt now fully hits.
+        add(&mut engine, request("r2", 8, 1));
+        let second = drain(&mut engine);
+        let s2 = second
+            .iter()
+            .find_map(|o| o.prefill_stats.as_ref())
+            .expect("prefill stats");
+        assert_eq!(
+            s2.num_local_cached_tokens, 8,
+            "both blocks served from cache"
+        );
+        assert_eq!(s2.num_computed_tokens, 0);
+        assert_eq!(s2.num_cached_tokens, 8);
+    }
+
+    #[test]
+    fn scheduler_stats_carry_prefix_cache_counters() {
+        let mut opt = test_opt();
+        opt.tokens_per_block = 4;
+        let mut engine = test_engine(opt);
+
+        // Cold request: its single step reports 2 queries and 0 hits (delta since last drain).
+        add(&mut engine, request("r1", 8, 1));
+        let batch = engine.step();
+        let stats = batch[0]
+            .outputs
+            .scheduler_stats
+            .as_ref()
+            .expect("stats on batch");
+        assert_eq!(stats.prefix_cache_stats.base.requests, 1);
+        assert_eq!(stats.prefix_cache_stats.base.queries, 2);
+        assert_eq!(stats.prefix_cache_stats.base.hits, 0);
+    }
+
+    #[test]
+    fn max_model_len_fails_oversized_request_with_length() {
+        let mut opt = test_opt();
+        opt.max_model_len = 10;
+        let mut engine = test_engine(opt);
+
+        // prompt 8 + max_tokens 5 = 13 > 10: context-length error, never queued.
+        let out = submit(&mut engine, request("big", 8, 5));
+        assert_eq!(finish_reason(&out[0]), Some(EngineCoreFinishReason::Length));
+        assert!(engine.active_requests.is_empty());
+        assert!(engine.waiting.is_empty());
+    }
+
+    #[test]
+    fn max_model_len_admits_a_fitting_request() {
+        let mut opt = test_opt();
+        opt.max_model_len = 100;
+        let mut engine = test_engine(opt);
+        submit(&mut engine, request("ok", 8, 5)); // 13 <= 100
+        assert_eq!(engine.active_requests.len(), 1);
+    }
+
+    #[test]
+    fn failure_injection_at_rate_one_fails_every_request() {
+        let mut opt = test_opt();
+        opt.failure_injection_rate = 1.0;
+        opt.failure_types = vec![crate::FailureType::Error];
+        let mut engine = test_engine(opt);
+
+        let out = submit(&mut engine, request("doomed", 4, 5));
+        assert_eq!(finish_reason(&out[0]), Some(EngineCoreFinishReason::Error));
+        assert!(engine.active_requests.is_empty());
+    }
+
+    #[test]
+    fn failure_injection_at_rate_zero_never_fails() {
+        let opt = test_opt(); // rate defaults to 0.0
+        let mut engine = test_engine(opt);
+        let out = submit(&mut engine, request("safe", 4, 5));
+        assert!(
+            out.iter()
+                .all(|o| finish_reason(o) != Some(EngineCoreFinishReason::Error))
+        );
+        assert_eq!(engine.active_requests.len(), 1);
     }
 
     fn submit(engine: &mut Engine, req: EngineCoreRequest) -> Vec<EngineOutput> {

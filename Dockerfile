@@ -98,7 +98,8 @@ RUN echo /usr/local/ucx/lib > /etc/ld.so.conf.d/nixl.conf \
 
 # Tokenizer cache (vllm-rs fetches the tokenizer from HF at startup).
 ENV HF_HOME=/tmp/hf
-# modelserver (prefill) / vllm-behind-sidecar (decode) / NIXL metadata side channel.
-EXPOSE 8000 8200 5600
+# modelserver (prefill) / vllm-behind-sidecar (decode) / NIXL metadata side channel /
+# KV-cache events PUB (cache-aware routing).
+EXPOSE 8000 8200 5600 5556
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -1,0 +1,113 @@
+# Monolithic mock model servers for llm-d's precise-prefix-cache-routing well-lit path.
+# Unlike P/D disaggregation, this path runs a single pool of (role=both) replicas and routes
+# by prefix-cache locality: each pod publishes KV-cache events over ZMQ, the EPP's
+# precise-prefix-cache-producer indexes them, and prefix-cache-scorer routes new requests to
+# the pod already holding the longest matching prefix.
+#
+# Each pod's mock engine emits BlockStored/BlockRemoved/AllBlocksCleared events (Phase 4) on
+# tcp://*:5556 with topic kv@<POD_IP>:8000@<model>, exactly what the guide's EPP expects.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-prefix-cache
+  labels:
+    llm-d.ai/guide: precise-prefix-cache-routing
+    llm-d.ai/model: qwen3-0-6b
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      llm-d.ai/guide: precise-prefix-cache-routing
+      llm-d.ai/model: qwen3-0-6b
+  template:
+    metadata:
+      labels:
+        llm-d.ai/guide: precise-prefix-cache-routing
+        llm-d.ai/model: qwen3-0-6b
+        # The kv-cache-manager's pod reconciler discovers pods to dial by this label
+        # (its default selector is llm-d.ai/inference-serving=true).
+        llm-d.ai/inference-serving: "true"
+    spec:
+      serviceAccountName: mock-pc-sa
+      containers:
+        - name: modelserver
+          image: quay.io/wseaton/mock-engine-nixl:amd64
+          imagePullPolicy: Always
+          env:
+            - name: MODEL
+              value: Qwen/Qwen3-0.6B
+            # Monolithic: no P/D handoff, so no NIXL data plane needed for this path.
+            - name: MOCK_PD_ROLE
+              value: both
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # --- KV-cache events (Phase 4) ---
+            - name: MOCK_ENABLE_KV_EVENTS
+              value: "1"
+            # Bind per-pod so every router replica can dial this pod's socket independently.
+            - name: MOCK_KV_EVENTS_ENDPOINT
+              value: "tcp://*:5556"
+            # Pod id + model in the topic, matching the guide's kv@<POD_IP>:<port>@<model>.
+            - name: MOCK_KV_EVENTS_TOPIC
+              value: "kv@$(POD_IP):8000@Qwen/Qwen3-0.6B"
+            # Block size must match the EPP's tokenProcessorConfig.blockSize (64) so the
+            # router re-chunks our token_ids into the same blocks.
+            - name: MOCK_TOKENS_PER_BLOCK
+              value: "64"
+            - name: MOCK_KV_CACHE_SIZE
+              value: "2048"
+            # --- Latency model (ms) so timing + vllm:* metrics are realistic ---
+            - name: MOCK_PREFILL_OVERHEAD_MS
+              value: "30"
+            - name: MOCK_PREFILL_TIME_PER_TOKEN_MS
+              value: "1"
+            - name: MOCK_ITL_MS
+              value: "8"
+            - name: MOCK_ITL_STDDEV_MS
+              value: "2"
+            - name: MOCK_TIME_FACTOR_UNDER_LOAD
+              value: "1.5"
+            - name: MOCK_MAX_NUM_SEQS
+              value: "16"
+          ports:
+            - name: modelserver
+              containerPort: 8000
+              protocol: TCP
+            # The per-pod KV-events PUB socket the router's SUB dials.
+            - name: kv-events
+              containerPort: 5556
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: modelserver
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /v1/models
+              port: modelserver
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /v1/models
+              port: modelserver
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              memory: 4Gi

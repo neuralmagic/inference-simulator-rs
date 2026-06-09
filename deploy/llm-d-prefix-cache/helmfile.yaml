@@ -1,0 +1,29 @@
+# Self-contained llm-d precise-prefix-cache-routing deployment driven by the
+# inference-simulator-rs image. GPU-free: a single pool of mock model servers (real vLLM
+# Rust frontend + our mock engine) publish KV-cache events over ZMQ; the real llm-d Router
+# (EPP) indexes them and routes by prefix-cache locality.
+#
+# Prereqs (see README.md): a kube context with the llm-d control-plane deps, the GAIE CRDs
+# applied, and the target namespace created.
+#
+#   helmfile -f deploy/llm-d-prefix-cache/helmfile.yaml apply
+
+releases:
+  # 1. llm-d Router: EPP (with the precise-prefix-cache-producer KV-events indexer), Envoy
+  #    sidecar, and the InferencePool selecting our pods via
+  #    matchLabels {llm-d.ai/guide: precise-prefix-cache-routing}.
+  - name: precise-prefix-cache-routing
+    namespace: llm-d-pc-mock
+    chart: oci://ghcr.io/llm-d/charts/llm-d-router-standalone-dev
+    version: v0
+    values:
+      - router/base.values.yaml
+      - router/precise-prefix-cache-routing.values.yaml
+
+  # 2. Mock model servers: one monolithic Deployment (kustomize) using our image, each pod
+  #    emitting KV-cache events on :5556.
+  - name: mock-modelservers
+    namespace: llm-d-pc-mock
+    chart: ./modelserver
+    needs:
+      - precise-prefix-cache-routing

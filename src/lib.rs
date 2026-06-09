@@ -19,14 +19,40 @@ use vllm_engine_core_client::EngineId;
 use vllm_engine_core_client::mock_engine::{
     MockEngineConfig, MockEngineSockets, connect_to_frontend,
 };
+use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
+pub mod blockpool;
 pub mod dataplane;
 mod engine;
 mod io;
+pub mod kvevents;
 pub mod latency;
 
 use dataplane::PdRole;
 use latency::LatencyModel;
+
+/// A failure the engine can inject at the configured rate (Phase 5). Maps to the engine-core
+/// finish reason a real vLLM engine would return for that class of failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum FailureType {
+    /// Retryable request-level internal error (the frontend may resubmit).
+    Error,
+    /// Truncation / context-length error.
+    Length,
+    /// A repetitive output pattern was detected.
+    Repetition,
+}
+
+impl FailureType {
+    /// The engine-core finish reason this failure surfaces as.
+    pub fn finish_reason(self) -> EngineCoreFinishReason {
+        match self {
+            FailureType::Error => EngineCoreFinishReason::Error,
+            FailureType::Length => EngineCoreFinishReason::Length,
+            FailureType::Repetition => EngineCoreFinishReason::Repetition,
+        }
+    }
+}
 
 /// Waiting-queue ordering, matching vLLM's `--scheduling-policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -175,9 +201,86 @@ pub struct Opt {
     /// KV-cache capacity in blocks, used to report `vllm:kv_cache_usage_perc`.
     #[arg(long, default_value_t = 1024)]
     pub kv_cache_size: u64,
+
+    // === KV-cache events (vLLM `--kv-events-config`) ===
+    /// Publish KV-cache events (BlockStored/BlockRemoved/AllBlocksCleared) over ZMQ so the
+    /// llm-d cache-aware router can index this engine's prefix cache.
+    #[arg(long, default_value_t = false)]
+    pub enable_kv_cache_events: bool,
+
+    /// ZMQ PUB endpoint for KV-cache events. Wildcards (`tcp://*:5557`) bind; concrete hosts
+    /// connect. Offset by engine index when running multiple engines in one process.
+    #[arg(long, default_value = "tcp://*:5557")]
+    pub kv_events_endpoint: String,
+
+    /// KV-cache event topic. The llm-d router expects `kv@<pod-id>@<model-name>` (its SUB
+    /// filter defaults to `kv@`). Leave empty to auto-build from `--engine-id`/`--model-name`.
+    #[arg(long, default_value = "")]
+    pub kv_events_topic: String,
+
+    /// Served model name, used only to build the default KV-event topic.
+    #[arg(long, env = "MODEL", default_value = "")]
+    pub model_name: String,
+
+    /// Fixed seed chaining the first block of every sequence's hash (vLLM's `NONE_HASH`).
+    /// Pinned (not random) so block hashes are reproducible across restarts and peers.
+    #[arg(long, default_value_t = 0)]
+    pub kv_cache_none_seed: u64,
+
+    // === Failure injection (Phase 5) ===
+    /// Maximum context length (prompt + output tokens). `0` (default) disables the check; a
+    /// request whose `prompt + max_tokens` exceeds it finishes immediately with a length error.
+    #[arg(long, default_value_t = 0)]
+    pub max_model_len: u64,
+
+    /// Probability in `[0, 1]` that an incoming request is failed on arrival. `0` disables
+    /// injection.
+    #[arg(long, default_value_t = 0.0)]
+    pub failure_injection_rate: f64,
+
+    /// Failure kinds to inject (one is chosen uniformly per injected failure).
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "error")]
+    pub failure_types: Vec<FailureType>,
+}
+
+/// Offset the port of a `tcp://host:port` endpoint by `n` (no-op for `n == 0` or non-tcp),
+/// mirroring vLLM's per-DP-rank port offset so multiple engines in one process don't clash.
+fn offset_endpoint_port(endpoint: &str, n: u32) -> String {
+    if n == 0 || !endpoint.starts_with("tcp://") {
+        return endpoint.to_string();
+    }
+    match endpoint.rsplit_once(':') {
+        Some((base, port)) => match port.parse::<u32>() {
+            Ok(port) => format!("{base}:{}", port + n),
+            Err(_) => endpoint.to_string(),
+        },
+        None => endpoint.to_string(),
+    }
 }
 
 impl Opt {
+    /// Build the KV-cache event publisher config for one engine. The endpoint port and the
+    /// topic's pod id are offset by `engine_index` so several engines in one process publish
+    /// on distinct sockets/streams.
+    pub fn kv_events_config(&self, engine_index: u32) -> kvevents::KvEventsConfig {
+        let endpoint = offset_endpoint_port(&self.kv_events_endpoint, engine_index);
+        let topic = if !self.kv_events_topic.is_empty() {
+            self.kv_events_topic.clone()
+        } else {
+            let pod = if engine_index == 0 {
+                self.engine_id.clone()
+            } else {
+                format!("{}-{engine_index}", self.engine_id)
+            };
+            format!("kv@{pod}@{}", self.model_name)
+        };
+        kvevents::KvEventsConfig {
+            enabled: self.enable_kv_cache_events,
+            endpoint,
+            topic,
+        }
+    }
+
     /// Build the latency model from the configured timing knobs.
     pub fn latency_model(&self) -> LatencyModel {
         LatencyModel {

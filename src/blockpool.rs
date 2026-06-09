@@ -59,6 +59,23 @@ fn hash_block(none_seed: u64, parent: Option<BlockHash>, tokens: &[u32]) -> Bloc
     h
 }
 
+/// Fold a request's `cache_salt` into the NONE seed. vLLM mixes `cache_salt` into the first
+/// block's hash; since only the first block chains onto the seed, salting the seed is
+/// equivalent and makes the whole prefix chain diverge for different salts (so a salted prompt
+/// never reuses a differently-salted or unsalted cached prefix). An absent or empty salt
+/// returns the seed unchanged, so plain requests keep sharing the cache (and existing hashes).
+fn salted_seed(none_seed: u64, cache_salt: Option<&str>) -> u64 {
+    let Some(salt) = cache_salt.filter(|s| !s.is_empty()) else {
+        return none_seed;
+    };
+    let mut h = FNV_OFFSET;
+    for &b in none_seed.to_le_bytes().iter().chain(salt.as_bytes()) {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
 /// A KV-cache event, wire-compatible (after msgpack encoding in [`crate::kvevents`]) with
 /// vLLM's `BlockStored` / `BlockRemoved` / `AllBlocksCleared`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,7 +204,11 @@ impl BlockPool {
     /// (a partial tail is dropped, matching vLLM, which only hashes full blocks), measures
     /// the longest leading run already cached, allocates+stores the remainder, and pins
     /// every block this request uses (call [`BlockPool::unpin`] when the request ends).
-    pub fn cache_prompt(&mut self, tokens: &[u32]) -> CacheOutcome {
+    ///
+    /// `cache_salt` (from the request) isolates this prompt's prefix from differently-salted
+    /// ones: identical tokens under different salts cache to disjoint blocks.
+    pub fn cache_prompt(&mut self, tokens: &[u32], cache_salt: Option<&str>) -> CacheOutcome {
+        let seed = salted_seed(self.none_seed, cache_salt);
         let n_blocks = tokens.len() / self.block_size;
         self.requests += 1;
         self.queries += n_blocks as u64;
@@ -208,7 +229,7 @@ impl BlockPool {
             // `parent` holds the previous block's hash (None for the first block); capture it
             // before we overwrite it, so the first miss can record it as the stored run's parent.
             let parent_before = parent;
-            let hash = hash_block(self.none_seed, parent, block_toks);
+            let hash = hash_block(seed, parent, block_toks);
             parent = Some(hash);
 
             if let Some(slot) = self.cached.get_mut(&hash) {
@@ -335,7 +356,7 @@ mod tests {
     #[test]
     fn first_prompt_is_all_misses_and_emits_one_stored() {
         let mut p = pool(4, 16);
-        let out = p.cache_prompt(&toks(12)); // 3 full blocks
+        let out = p.cache_prompt(&toks(12), None); // 3 full blocks
         assert_eq!(out.num_cached_tokens, 0, "cold cache: no prefix hit");
         assert_eq!(out.block_ids, vec![0, 1, 2]);
         assert_eq!(out.events.len(), 1);
@@ -358,7 +379,7 @@ mod tests {
     #[test]
     fn partial_tail_block_is_dropped() {
         let mut p = pool(4, 16);
-        let out = p.cache_prompt(&toks(10)); // 2 full blocks + 2 leftover tokens
+        let out = p.cache_prompt(&toks(10), None); // 2 full blocks + 2 leftover tokens
         assert_eq!(out.block_ids.len(), 2);
         match &out.events[0] {
             KvCacheEvent::Stored { token_ids, .. } => assert_eq!(token_ids.len(), 8),
@@ -369,13 +390,13 @@ mod tests {
     #[test]
     fn shared_prefix_is_a_hit_and_only_new_blocks_are_stored() {
         let mut p = pool(4, 16);
-        let first = p.cache_prompt(&toks(8)); // blocks [0,1]
+        let first = p.cache_prompt(&toks(8), None); // blocks [0,1]
         p.unpin(&first.block_ids);
 
         // Same 8-token prefix, then 4 new tokens -> block 2 is new, blocks 0,1 are hits.
         let mut longer = toks(8);
         longer.extend([100, 101, 102, 103]);
-        let out = p.cache_prompt(&longer);
+        let out = p.cache_prompt(&longer, None);
 
         assert_eq!(out.num_cached_tokens, 8, "two 4-token blocks hit");
         assert_eq!(
@@ -412,7 +433,7 @@ mod tests {
         // The router resolves parent_hash against hashes from earlier BlockStored events,
         // so a child's parent_hash must equal the parent block's own emitted block_hash.
         let mut p = pool(4, 16);
-        let first = p.cache_prompt(&toks(8));
+        let first = p.cache_prompt(&toks(8), None);
         let first_hashes = match &first.events[0] {
             KvCacheEvent::Stored { block_hashes, .. } => block_hashes.clone(),
             _ => unreachable!(),
@@ -421,7 +442,7 @@ mod tests {
 
         let mut longer = toks(8);
         longer.extend([100, 101, 102, 103]);
-        let out = p.cache_prompt(&longer);
+        let out = p.cache_prompt(&longer, None);
         let stored_parent = out.events.iter().find_map(|e| match e {
             KvCacheEvent::Stored { parent_hash, .. } => *parent_hash,
             _ => None,
@@ -436,11 +457,11 @@ mod tests {
     #[test]
     fn eviction_of_unpinned_block_emits_removed() {
         let mut p = pool(4, 2); // room for 2 blocks only
-        let a = p.cache_prompt(&toks(8)); // fills both slots with blocks [0,1]
+        let a = p.cache_prompt(&toks(8), None); // fills both slots with blocks [0,1]
         p.unpin(&a.block_ids); // unpinned -> evictable
 
         // A fresh 1-block prompt must evict an LRU block to fit.
-        let out = p.cache_prompt(&[900, 901, 902, 903]);
+        let out = p.cache_prompt(&[900, 901, 902, 903], None);
         let removed: Vec<_> = out
             .events
             .iter()
@@ -452,9 +473,9 @@ mod tests {
     #[test]
     fn pinned_blocks_are_not_evicted() {
         let mut p = pool(4, 2);
-        let _a = p.cache_prompt(&toks(8)); // pinned, both slots
+        let _a = p.cache_prompt(&toks(8), None); // pinned, both slots
         // Do NOT unpin. A new block cannot be stored (both slots pinned).
-        let out = p.cache_prompt(&[900, 901, 902, 903]);
+        let out = p.cache_prompt(&[900, 901, 902, 903], None);
         assert!(
             out.block_ids.is_empty(),
             "no slot available, nothing stored or paged"
@@ -470,7 +491,7 @@ mod tests {
     #[test]
     fn reset_clears_and_emits_all_cleared_once() {
         let mut p = pool(4, 8);
-        let a = p.cache_prompt(&toks(8));
+        let a = p.cache_prompt(&toks(8), None);
         p.unpin(&a.block_ids);
         assert_eq!(p.used_blocks(), 2);
 
@@ -479,16 +500,16 @@ mod tests {
         assert_eq!(p.reset(), None, "second reset on an empty cache is a no-op");
 
         // Slots are reusable after reset.
-        let out = p.cache_prompt(&toks(4));
+        let out = p.cache_prompt(&toks(4), None);
         assert_eq!(out.block_ids, vec![0]);
     }
 
     #[test]
     fn stats_accumulate_then_clear_on_take() {
         let mut p = pool(4, 16);
-        let a = p.cache_prompt(&toks(8)); // 2 queries, 0 hits
+        let a = p.cache_prompt(&toks(8), None); // 2 queries, 0 hits
         p.unpin(&a.block_ids);
-        let _b = p.cache_prompt(&toks(8)); // 2 queries, 2 hits
+        let _b = p.cache_prompt(&toks(8), None); // 2 queries, 2 hits
 
         let snap = p.take_stats();
         assert_eq!(snap.requests, 2);
@@ -506,7 +527,7 @@ mod tests {
     #[test]
     fn usage_counts_referenced_not_cached_blocks() {
         let mut p = pool(4, 10);
-        let a = p.cache_prompt(&toks(8)); // 2 blocks, pinned by this request
+        let a = p.cache_prompt(&toks(8), None); // 2 blocks, pinned by this request
         assert_eq!(p.referenced_blocks(), 2);
         assert!((p.usage() - 0.2).abs() < 1e-9, "2 pinned / 10 capacity");
 
@@ -517,14 +538,69 @@ mod tests {
     }
 
     #[test]
+    fn different_cache_salts_do_not_share_a_prefix() {
+        let mut p = pool(4, 16);
+        // Same prompt under salt "a" then salt "b": the second must NOT hit the first's blocks.
+        let first = p.cache_prompt(&toks(8), Some("a"));
+        p.unpin(&first.block_ids);
+        let second = p.cache_prompt(&toks(8), Some("b"));
+        assert_eq!(
+            second.num_cached_tokens, 0,
+            "different salt -> no prefix reuse"
+        );
+        assert_ne!(
+            first.block_ids, second.block_ids,
+            "salted prompts land in disjoint slots"
+        );
+    }
+
+    #[test]
+    fn same_cache_salt_shares_a_prefix() {
+        let mut p = pool(4, 16);
+        let first = p.cache_prompt(&toks(8), Some("tenant-x"));
+        p.unpin(&first.block_ids);
+        let second = p.cache_prompt(&toks(8), Some("tenant-x"));
+        assert_eq!(
+            second.num_cached_tokens, 8,
+            "same salt + tokens -> full hit"
+        );
+        assert_eq!(first.block_ids, second.block_ids, "reuses the same slots");
+    }
+
+    #[test]
+    fn salted_prompt_does_not_hit_unsalted_one() {
+        let mut p = pool(4, 16);
+        let plain = p.cache_prompt(&toks(8), None);
+        p.unpin(&plain.block_ids);
+        let salted = p.cache_prompt(&toks(8), Some("s"));
+        assert_eq!(
+            salted.num_cached_tokens, 0,
+            "a salt isolates from the unsalted cache too"
+        );
+    }
+
+    #[test]
+    fn empty_salt_is_treated_as_no_salt() {
+        let mut p = pool(4, 16);
+        let plain = p.cache_prompt(&toks(8), None);
+        p.unpin(&plain.block_ids);
+        // An empty-string salt must not fragment the cache away from the unsalted entry.
+        let empty = p.cache_prompt(&toks(8), Some(""));
+        assert_eq!(
+            empty.num_cached_tokens, 8,
+            "empty salt == no salt -> full hit"
+        );
+    }
+
+    #[test]
     fn hashes_are_deterministic_across_pools() {
         let mut p1 = pool(4, 16);
         let mut p2 = pool(4, 16);
-        let h1 = match &p1.cache_prompt(&toks(8)).events[0] {
+        let h1 = match &p1.cache_prompt(&toks(8), None).events[0] {
             KvCacheEvent::Stored { block_hashes, .. } => block_hashes.clone(),
             _ => unreachable!(),
         };
-        let h2 = match &p2.cache_prompt(&toks(8)).events[0] {
+        let h2 = match &p2.cache_prompt(&toks(8), None).events[0] {
             KvCacheEvent::Stored { block_hashes, .. } => block_hashes.clone(),
             _ => unreachable!(),
         };

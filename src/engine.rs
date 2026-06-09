@@ -694,7 +694,9 @@ impl Engine {
         // Measure the local prefix hit, allocate slots for the new blocks, pin them all, and
         // emit BlockStored/BlockRemoved for the router. The slot ids are what the data plane
         // pages over NIXL and what we advertise as remote_block_ids.
-        let outcome = self.pool.cache_prompt(&prompt_tokens);
+        let outcome = self
+            .pool
+            .cache_prompt(&prompt_tokens, request.cache_salt.as_deref());
         if let Some(events) = &self.events {
             events.publish(outcome.events);
         }
@@ -1290,6 +1292,42 @@ mod tests {
         );
         assert_eq!(s2.num_computed_tokens, 0);
         assert_eq!(s2.num_cached_tokens, 8);
+    }
+
+    #[test]
+    fn cache_salt_isolates_otherwise_identical_prompts() {
+        let mut opt = test_opt();
+        opt.tokens_per_block = 4; // 8-token prompt = 2 full blocks
+        let mut engine = test_engine(opt);
+
+        let salted = |id: &str, salt: &str| EngineCoreRequest {
+            cache_salt: Some(salt.to_string()),
+            ..request(id, 8, 1)
+        };
+
+        // r1 warms the cache under salt "a".
+        add(&mut engine, salted("r1", "a"));
+        let _ = drain(&mut engine);
+
+        // Same prompt under a different salt must recompute, not hit r1's blocks.
+        add(&mut engine, salted("r2", "b"));
+        let s2 = drain(&mut engine)
+            .iter()
+            .find_map(|o| o.prefill_stats.as_ref().cloned())
+            .expect("prefill stats");
+        assert_eq!(
+            s2.num_local_cached_tokens, 0,
+            "different salt -> no prefix hit"
+        );
+        assert_eq!(s2.num_computed_tokens, 8);
+
+        // Same prompt under the same salt "a" hits fully.
+        add(&mut engine, salted("r3", "a"));
+        let s3 = drain(&mut engine)
+            .iter()
+            .find_map(|o| o.prefill_stats.as_ref().cloned())
+            .expect("prefill stats");
+        assert_eq!(s3.num_local_cached_tokens, 8, "same salt -> full hit");
     }
 
     #[test]

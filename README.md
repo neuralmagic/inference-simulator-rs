@@ -131,6 +131,33 @@ cargo run --features nixl -- --pd-role prefill ...
 cargo run --features nixl -- --pd-role decode  ...
 ```
 
+## Hacking the engine
+
+The engine is split along a trait boundary so you can swap behaviors without
+touching the core loop or the ZMQ transport.
+
+**`EngineCore` (src/engine_core.rs)** is the top-level contract. The generic
+`run_loop` owns the tokio `select!` over inputs, internal events, and deadline
+ticks. Any struct implementing `EngineCore` plugs in unchanged. `SimEngine` is
+the production implementation; `ConstantEngine` (test-only, same file) proves a
+from-scratch engine reuses the loop with zero duplication.
+
+**Three strategy traits on `SimEngine`** control its behavior without subclassing:
+
+| Trait | File | Default | What it controls |
+|---|---|---|---|
+| `TokenSource` | `src/tokens.rs` | `RandomTokens` | Which token ids each request emits. `EchoTokens` replays the prompt. |
+| `LatencyModel` | `src/latency.rs` | `KnobLatency` | TTFT and inter-token pacing. `FixedLatency` gives constant delays with no rng draws. |
+| `Scheduler` | `src/sched.rs` | `Fcfs` | Waiting-queue admission order. `Priority` uses `(priority, arrival_time)`. `ShortestPromptFirst` picks the smallest prompt. |
+
+Defaults are wired in `SimEngine::new` (from CLI flags) and in `run()`, so
+nothing changes without opting in.
+
+**The contract tests** live in `tests/engine_core_e2e.rs`. They drive the full
+stack (real ZMQ, real protocol framing, real channels) and assert wire-level
+behavior. If your change breaks those tests, the wire protocol regressed.
+Unit tests in `src/engine.rs` cover engine internals at a finer grain.
+
 ## Dependencies of note
 
 - `vllm-engine-core-client` — pinned git dep on `vllm-project/vllm` (`rev` in

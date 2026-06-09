@@ -24,13 +24,16 @@ use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 pub mod blockpool;
 pub mod dataplane;
 mod engine;
+mod engine_core;
 mod io;
 pub mod kvevents;
 pub mod latency;
 pub mod lora;
+mod sched;
+mod tokens;
 
 use dataplane::PdRole;
-use latency::LatencyModel;
+use latency::KnobLatency;
 
 /// A failure the engine can inject at the configured rate (Phase 5). Maps to the engine-core
 /// finish reason a real vLLM engine would return for that class of failure.
@@ -291,8 +294,8 @@ impl Opt {
     }
 
     /// Build the latency model from the configured timing knobs.
-    pub fn latency_model(&self) -> LatencyModel {
-        LatencyModel {
+    pub fn latency_model(&self) -> KnobLatency {
+        KnobLatency {
             time_to_first_token: self.time_to_first_token,
             time_to_first_token_std_dev: self.time_to_first_token_std_dev,
             inter_token_latency: self.inter_token_latency,
@@ -331,9 +334,15 @@ async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) ->
         output_rx,
         shutdown.clone(),
     ));
-    let mut engine_loop = tokio::spawn(engine::run_engine_loop(
-        engine_index,
-        opt,
+    let events = kvevents::spawn(opt.kv_events_config(engine_index), shutdown.clone())
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "kv-event publisher failed to start; continuing without events");
+            None
+        });
+    let sim_engine = engine::SimEngine::new(engine_index, opt, events).await;
+    let mut engine_loop = tokio::spawn(engine_core::run_loop(
+        sim_engine,
         input_rx,
         output_tx,
         shutdown.clone(),

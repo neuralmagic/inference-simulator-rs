@@ -22,10 +22,25 @@ use std::time::Duration;
 use rand::Rng as _;
 use rand::rngs::StdRng;
 
+/// Context for computing the first-token delay of a request.
+pub struct FirstTokenCtx {
+    pub num_prompt_tokens: usize,
+    pub num_cached_tokens: usize,
+    pub do_remote_prefill: bool,
+    pub num_running: u64,
+}
+
+/// Strategy for pacing token emission (TTFT and inter-token delays).
+pub trait LatencyModel: Send {
+    fn first_token_delay(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration;
+    fn inter_token_delay(&self, rng: &mut StdRng, num_running: u64) -> Duration;
+}
+
 /// All timing knobs, in milliseconds (except the unitless `time_factor_under_load`).
-/// Mirrors the `llm-d-inference-sim` configuration one-for-one.
+/// Mirrors the `llm-d-inference-sim` configuration one-for-one. The default
+/// [`LatencyModel`] behind every CLI-configured engine.
 #[derive(Debug, Clone)]
-pub struct LatencyModel {
+pub struct KnobLatency {
     /// Fixed time-to-first-token. When this and its std-dev are both 0, the token-count
     /// prefill model (`prefill_overhead` + per-token) is used instead.
     pub time_to_first_token: u64,
@@ -49,7 +64,7 @@ pub struct LatencyModel {
     pub max_num_seqs: u64,
 }
 
-impl LatencyModel {
+impl KnobLatency {
     /// Multiplier in `[1.0, time_factor_under_load]` that grows linearly with the number of
     /// running requests, reaching `time_factor_under_load` at `max_num_seqs` concurrent
     /// requests. With one request in flight (or `max_num_seqs <= 1`) it is exactly `1.0`.
@@ -60,26 +75,15 @@ impl LatencyModel {
         let extra = num_running.saturating_sub(1) as f64;
         1.0 + (self.time_factor_under_load - 1.0) * extra / (self.max_num_seqs - 1) as f64
     }
+}
 
-    /// Delay before the first output token of a request.
-    ///
-    /// `num_cached_tokens` are prompt tokens served from the local prefix cache (always 0
-    /// until the prefix-cache model lands); `do_remote_prefill` marks a disaggregated decode
-    /// request whose KV is pulled from a remote prefill, so its first-token cost is the
-    /// transfer time rather than local prefill compute.
-    pub fn first_token_delay(
-        &self,
-        rng: &mut StdRng,
-        num_prompt_tokens: usize,
-        num_cached_tokens: usize,
-        do_remote_prefill: bool,
-        num_running: u64,
-    ) -> Duration {
-        let load = self.load_factor(num_running);
+impl LatencyModel for KnobLatency {
+    fn first_token_delay(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration {
+        let load = self.load_factor(ctx.num_running);
 
-        let millis = if do_remote_prefill {
+        let millis = if ctx.do_remote_prefill {
             if self.kv_cache_transfer_latency == 0 && self.kv_cache_transfer_latency_std_dev == 0 {
-                let mean = self.kv_cache_transfer_time_per_token * num_prompt_tokens as u64;
+                let mean = self.kv_cache_transfer_time_per_token * ctx.num_prompt_tokens as u64;
                 random_norm_truncated(rng, mean, self.kv_cache_transfer_time_std_dev)
             } else {
                 random_norm_truncated(
@@ -89,7 +93,7 @@ impl LatencyModel {
                 )
             }
         } else if self.time_to_first_token == 0 && self.time_to_first_token_std_dev == 0 {
-            let uncached = num_prompt_tokens.saturating_sub(num_cached_tokens) as u64;
+            let uncached = ctx.num_prompt_tokens.saturating_sub(ctx.num_cached_tokens) as u64;
             let mean = scale(self.prefill_overhead, load)
                 + uncached * scale(self.prefill_time_per_token, load);
             random_norm_truncated(rng, mean, self.prefill_time_std_dev)
@@ -104,8 +108,7 @@ impl LatencyModel {
         Duration::from_millis(millis)
     }
 
-    /// Delay between subsequent output tokens (decode step).
-    pub fn inter_token_delay(&self, rng: &mut StdRng, num_running: u64) -> Duration {
+    fn inter_token_delay(&self, rng: &mut StdRng, num_running: u64) -> Duration {
         let load = self.load_factor(num_running);
         let millis = random_norm_truncated(
             rng,
@@ -143,14 +146,31 @@ fn random_norm_truncated(rng: &mut StdRng, mean: u64, stddev: u64) -> u64 {
     clamped as u64
 }
 
+/// Constant first-token and inter-token delays. No rng draws, no load scaling.
+/// Useful for deterministic timing tests where you want exact control.
+pub struct FixedLatency {
+    pub first_token: Duration,
+    pub inter_token: Duration,
+}
+
+impl LatencyModel for FixedLatency {
+    fn first_token_delay(&self, _rng: &mut StdRng, _ctx: &FirstTokenCtx) -> Duration {
+        self.first_token
+    }
+
+    fn inter_token_delay(&self, _rng: &mut StdRng, _num_running: u64) -> Duration {
+        self.inter_token
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rand::SeedableRng as _;
 
-    use super::*;
+    use crate::latency::{FirstTokenCtx, KnobLatency, LatencyModel, random_norm_truncated};
 
-    fn model() -> LatencyModel {
-        LatencyModel {
+    fn model() -> KnobLatency {
+        KnobLatency {
             time_to_first_token: 0,
             time_to_first_token_std_dev: 0,
             inter_token_latency: 0,
@@ -167,68 +187,75 @@ mod tests {
         }
     }
 
+    fn ctx(prompt: usize, cached: usize, remote: bool, running: u64) -> FirstTokenCtx {
+        FirstTokenCtx {
+            num_prompt_tokens: prompt,
+            num_cached_tokens: cached,
+            do_remote_prefill: remote,
+            num_running: running,
+        }
+    }
+
     #[test]
     fn zero_config_is_instant() {
-        let mut rng = StdRng::seed_from_u64(1);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         let m = model();
         assert_eq!(
-            m.first_token_delay(&mut rng, 100, 0, false, 1),
-            Duration::ZERO
+            m.first_token_delay(&mut rng, &ctx(100, 0, false, 1)),
+            std::time::Duration::ZERO
         );
-        assert_eq!(m.inter_token_delay(&mut rng, 1), Duration::ZERO);
+        assert_eq!(m.inter_token_delay(&mut rng, 1), std::time::Duration::ZERO);
         assert_eq!(
-            m.first_token_delay(&mut rng, 100, 0, true, 1),
-            Duration::ZERO
+            m.first_token_delay(&mut rng, &ctx(100, 0, true, 1)),
+            std::time::Duration::ZERO
         );
     }
 
     #[test]
     fn fixed_ttft_no_stddev_is_exact() {
-        let mut rng = StdRng::seed_from_u64(1);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         let mut m = model();
         m.time_to_first_token = 200;
-        // No std-dev and load factor 1.0 -> exactly the configured value.
         assert_eq!(
-            m.first_token_delay(&mut rng, 50, 0, false, 1),
-            Duration::from_millis(200)
+            m.first_token_delay(&mut rng, &ctx(50, 0, false, 1)),
+            std::time::Duration::from_millis(200)
         );
     }
 
     #[test]
     fn token_count_prefill_model() {
-        let mut rng = StdRng::seed_from_u64(1);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         let mut m = model();
         m.prefill_overhead = 100;
         m.prefill_time_per_token = 2;
         // overhead + (prompt - cached) * per_token = 100 + (50 - 10) * 2 = 180.
         assert_eq!(
-            m.first_token_delay(&mut rng, 50, 10, false, 1),
-            Duration::from_millis(180)
+            m.first_token_delay(&mut rng, &ctx(50, 10, false, 1)),
+            std::time::Duration::from_millis(180)
         );
     }
 
     #[test]
     fn remote_prefill_uses_transfer_per_token() {
-        let mut rng = StdRng::seed_from_u64(1);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         let mut m = model();
         m.kv_cache_transfer_time_per_token = 3;
-        // Prefill knobs are ignored on the remote-prefill path.
         m.prefill_overhead = 999;
         assert_eq!(
-            m.first_token_delay(&mut rng, 20, 0, true, 1),
-            Duration::from_millis(60)
+            m.first_token_delay(&mut rng, &ctx(20, 0, true, 1)),
+            std::time::Duration::from_millis(60)
         );
     }
 
     #[test]
     fn fixed_transfer_latency_overrides_per_token() {
-        let mut rng = StdRng::seed_from_u64(1);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         let mut m = model();
         m.kv_cache_transfer_latency = 500;
         m.kv_cache_transfer_time_per_token = 3;
         assert_eq!(
-            m.first_token_delay(&mut rng, 20, 0, true, 1),
-            Duration::from_millis(500)
+            m.first_token_delay(&mut rng, &ctx(20, 0, true, 1)),
+            std::time::Duration::from_millis(500)
         );
     }
 
@@ -239,7 +266,6 @@ mod tests {
         m.max_num_seqs = 5;
         assert_eq!(m.load_factor(1), 1.0);
         assert_eq!(m.load_factor(5), 3.0);
-        // Halfway: 1 + (3-1) * (3-1)/(5-1) = 1 + 2*0.5 = 2.0.
         assert_eq!(m.load_factor(3), 2.0);
     }
 
@@ -253,24 +279,52 @@ mod tests {
 
     #[test]
     fn fixed_ttft_scales_with_load() {
-        let mut rng = StdRng::seed_from_u64(1);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         let mut m = model();
         m.time_to_first_token = 100;
         m.time_factor_under_load = 2.0;
         m.max_num_seqs = 5;
-        // At full load the 100ms mean doubles to 200ms (no std-dev -> exact).
         assert_eq!(
-            m.first_token_delay(&mut rng, 10, 0, false, 5),
-            Duration::from_millis(200)
+            m.first_token_delay(&mut rng, &ctx(10, 0, false, 5)),
+            std::time::Duration::from_millis(200)
         );
     }
 
     #[test]
     fn truncated_normal_stays_within_bounds() {
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         for _ in 0..10_000 {
             let v = random_norm_truncated(&mut rng, 100, 50);
             assert!((30..=170).contains(&v), "out of truncation bounds: {v}");
+        }
+    }
+
+    #[test]
+    fn fixed_latency_ignores_context_and_rng() {
+        use crate::latency::FixedLatency;
+
+        let fixed = FixedLatency {
+            first_token: std::time::Duration::from_millis(42),
+            inter_token: std::time::Duration::from_millis(7),
+        };
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+
+        // TTFT is constant regardless of prompt size, cache, remote, or concurrency.
+        for &(prompt, cached, remote, running) in
+            &[(100, 0, false, 1), (1, 1, true, 999), (0, 0, false, 0)]
+        {
+            assert_eq!(
+                fixed.first_token_delay(&mut rng, &ctx(prompt, cached, remote, running)),
+                std::time::Duration::from_millis(42),
+            );
+        }
+
+        // Inter-token is constant regardless of concurrency.
+        for &num_running in &[1, 10, 1000] {
+            assert_eq!(
+                fixed.inter_token_delay(&mut rng, num_running),
+                std::time::Duration::from_millis(7),
+            );
         }
     }
 }

@@ -14,7 +14,7 @@ use vllm_engine_core_client::protocol::{
 };
 use zeromq::{DealerSocket, PushSocket, SocketRecv as _, SocketSend as _, ZmqMessage};
 
-use crate::engine::{EngineInput, EngineOutput};
+use crate::engine_core::{EngineInput, EngineOutput};
 
 /// Send one engine output batch to the client over the appropriate push socket.
 async fn send_engine_outputs_to_client(

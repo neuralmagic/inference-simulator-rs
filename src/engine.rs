@@ -5,7 +5,6 @@
 //! Everything wire-facing comes from the `vllm-engine-core-client` crate, so this
 //! stays correct as the protocol evolves upstream.
 
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,8 +16,7 @@ use rmpv::Value as MsgpackValue;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
-use tokio::time::{Instant, sleep_until};
-use tokio_util::sync::CancellationToken;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::stats::{
@@ -33,9 +31,11 @@ use vllm_engine_core_client::protocol::{
 
 use crate::blockpool::BlockPool;
 use crate::dataplane::{KvDataPlane, NixlConfig, RemoteKv, RequestKv, make_data_plane};
-use crate::kvevents::{self, KvEventTx};
-use crate::latency::LatencyModel;
+use crate::kvevents::KvEventTx;
+use crate::latency::{FirstTokenCtx, LatencyModel};
 use crate::lora::LoraRegistry;
+use crate::sched::{self, Scheduler};
+use crate::tokens::{RandomTokens, TokenCtx, TokenSource};
 use crate::{Opt, SchedulingPolicy};
 
 /// Per-step token demand of a single prefilling request: a (possibly chunked) slice of its
@@ -233,19 +233,7 @@ fn build_prefill_kv_params(
     })
 }
 
-/// Message sent from the IO loop to the engine task to drive the engine loop.
-pub(crate) enum EngineInput {
-    Request(Box<EngineCoreRequest>),
-    Abort(Vec<String>),
-    Utility(EngineCoreUtilityRequest),
-    StartDpWave,
-}
-
-/// Message sent from the engine task to the IO loop for one engine output batch.
-pub(crate) struct EngineOutput {
-    pub client_index: u32,
-    pub outputs: EngineCoreOutputs,
-}
+use crate::engine_core::{EngineCore, EngineInput, EngineOutput};
 
 /// Per-request decode state owned by one engine.
 #[derive(Debug)]
@@ -253,6 +241,8 @@ struct ActiveRequest {
     request_id: String,
     client_index: u32,
     prompt_len: usize,
+    /// The original prompt token ids, retained so the `TokenSource` can condition on them.
+    prompt_token_ids: Vec<u32>,
     max_tokens: usize,
     generated: usize,
     rng: StdRng,
@@ -286,7 +276,7 @@ impl ActiveRequest {
         engine_index: u32,
         request: Box<EngineCoreRequest>,
         opt: &Opt,
-        latency: &LatencyModel,
+        latency: &dyn LatencyModel,
         num_running: u64,
         num_local_cached_tokens: usize,
         block_ids: Vec<usize>,
@@ -303,11 +293,8 @@ impl ActiveRequest {
         let lora_name = request.lora_request.as_ref().map(|l| l.lora_name.clone());
         let request_id = request.request_id;
         let client_index = request.client_index;
-        let prompt_len = request
-            .prompt_token_ids
-            .as_ref()
-            .map(Vec::len)
-            .unwrap_or_default();
+        let prompt_token_ids = request.prompt_token_ids.unwrap_or_default();
+        let prompt_len = prompt_token_ids.len();
 
         let Some(sampling_params) = request.sampling_params else {
             warn!(
@@ -341,10 +328,12 @@ impl ActiveRequest {
         // shorten the prefill (TTFT). The block pool measured the hit at admission.
         let first_delay = latency.first_token_delay(
             &mut rng,
-            prompt_len,
-            num_local_cached_tokens,
-            remote_prefill,
-            num_running,
+            &FirstTokenCtx {
+                num_prompt_tokens: prompt_len,
+                num_cached_tokens: num_local_cached_tokens,
+                do_remote_prefill: remote_prefill,
+                num_running,
+            },
         );
 
         Ok(ActiveRequest {
@@ -352,6 +341,7 @@ impl ActiveRequest {
             request_id,
             client_index,
             prompt_len,
+            prompt_token_ids,
             max_tokens,
             generated: 0,
             prefill_advertise,
@@ -363,15 +353,17 @@ impl ActiveRequest {
         })
     }
 
-    /// Advance this request by one engine step.
-    fn step(&mut self, opt: &Opt) -> EngineCoreOutput {
+    /// The number of tokens this request should emit on the next step.
+    fn chunk_len(&self, output_token_chunk_size: usize) -> usize {
         let remaining = self.max_tokens - self.generated;
-        let chunk_len = remaining.min(opt.output_token_chunk_size);
-        let mut new_token_ids = Vec::with_capacity(chunk_len);
-        for _ in 0..chunk_len {
-            new_token_ids.push(self.rng.random_range(0..opt.vocab_size));
-        }
-        self.generated += chunk_len;
+        remaining.min(output_token_chunk_size)
+    }
+
+    /// Advance this request by one engine step, using externally-generated tokens.
+    /// The caller is responsible for drawing tokens from the `TokenSource` (using
+    /// `self.rng`) before calling this, so the rng draw order is preserved.
+    fn step(&mut self, new_token_ids: Vec<u32>) -> EngineCoreOutput {
+        self.generated += new_token_ids.len();
 
         let finished = self.generated >= self.max_tokens;
         request_output(
@@ -431,10 +423,12 @@ struct PendingPull {
 type PullCompletion = (String, Result<u64>);
 
 /// Internal state for one engine instance, owned by the engine loop task.
-struct Engine {
+pub(crate) struct SimEngine {
     engine_index: u32,
     opt: Opt,
-    latency: LatencyModel,
+    latency: Box<dyn LatencyModel>,
+    token_source: Box<dyn TokenSource>,
+    scheduler: Box<dyn Scheduler>,
     /// Wrapped in `Arc<Mutex>` so `spawn_blocking` pull tasks can call `pull_prefilled` off
     /// the engine loop. The mutex is effectively uncontended: `advertise_prefilled` and
     /// `release` run inline on the engine task (which only does prefill or decode, never both
@@ -462,11 +456,11 @@ struct Engine {
     pending_pulls: HashMap<String, PendingPull>,
     /// Sender half for pull completion results. Cloned into each `spawn_blocking` task.
     pull_completion_tx: mpsc::UnboundedSender<PullCompletion>,
-    /// Receiver half; polled in the engine loop's `select!`.
-    pull_completion_rx: mpsc::UnboundedReceiver<PullCompletion>,
+    /// Receiver half; wrapped in Option so `take_internal_rx` can hand it to the loop once.
+    pull_completion_rx: Option<mpsc::UnboundedReceiver<PullCompletion>>,
 }
 
-impl Engine {
+impl SimEngine {
     /// Decide whether to fail a request on arrival (Phase 5). First the deterministic
     /// context-length check (`prompt + max_tokens > max_model_len`), then the random
     /// injection at `failure_injection_rate`. Returns the finish reason to fail with, if any.
@@ -676,8 +670,8 @@ impl Engine {
                     // A request is running, pending-pull, or waiting; abort whichever.
                     let client_index =
                         if let Some(request) = self.active_requests.remove(&request_id) {
-                            // Free its prefix-cache pins so the blocks can be evicted later.
                             self.pool.unpin(&request.block_ids);
+                            self.token_source.on_request_finished(&request.request_id);
                             Some(request.client_index)
                         } else if let Some(pending) = self.pending_pulls.remove(&request_id) {
                             // Pull is in flight on a background thread; unpin blocks and let
@@ -887,7 +881,7 @@ impl Engine {
             self.engine_index,
             request,
             &self.opt,
-            &self.latency,
+            &*self.latency,
             num_running,
             num_local_cached,
             block_ids.clone(),
@@ -960,29 +954,13 @@ impl Engine {
         active + pending
     }
 
-    /// Index of the next waiting request to admit, honoring the scheduling policy (FIFO for
-    /// `fcfs`, smallest `(priority, arrival_time)` for `priority`) but considering only
-    /// requests that currently pass the LoRA slot cap. LoRA-blocked requests are skipped over
-    /// (they stay queued and surface as `num_skipped_waiting_reqs`), matching vLLM rather than
-    /// head-of-line blocking the whole queue on one stuck adapter. `None` if nothing is
-    /// admissible right now.
+    /// Index of the next waiting request to admit, delegating to the plugged `Scheduler`
+    /// strategy and filtering through the LoRA slot cap. LoRA-blocked requests are skipped
+    /// over (they stay queued and show up as `num_skipped_waiting_reqs`), matching vLLM
+    /// rather than head-of-line blocking the whole queue on one stuck adapter.
     fn next_admissible_index(&self) -> Option<usize> {
-        match self.opt.scheduling_policy {
-            SchedulingPolicy::Fcfs => self.waiting.iter().position(|r| self.lora_admits(r)),
-            SchedulingPolicy::Priority => self
-                .waiting
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| self.lora_admits(r))
-                .min_by(|(_, a), (_, b)| {
-                    a.priority.cmp(&b.priority).then_with(|| {
-                        a.arrival_time
-                            .partial_cmp(&b.arrival_time)
-                            .unwrap_or(Ordering::Equal)
-                    })
-                })
-                .map(|(i, _)| i),
-        }
+        self.scheduler
+            .next_admissible(&self.waiting, &|r| self.lora_admits(r))
     }
 
     /// Number of waiting requests the LoRA slot cap is currently blocking (vLLM's skipped
@@ -1009,13 +987,14 @@ impl Engine {
             && demand < budget
         {
             // Next admissible request in policy order, skipping any the LoRA slot cap blocks.
-            let Some(idx) = self.next_admissible_index() else {
+            // The index comes from a scan of `waiting` under the same borrow, so remove()
+            // only returns None on a buggy Scheduler impl; treat that as nothing admissible.
+            let Some(request) = self
+                .next_admissible_index()
+                .and_then(|idx| self.waiting.remove(idx))
+            else {
                 break;
             };
-            let request = self
-                .waiting
-                .remove(idx)
-                .expect("index from next_admissible_index is valid");
             // The token demand this request adds once admitted (it starts by prefilling).
             let prompt_len = request
                 .prompt_token_ids
@@ -1051,18 +1030,35 @@ impl Engine {
         // requests so we can advertise their KV after the borrow on active_requests ends.
         let mut to_advertise: Vec<(u32, String, usize, Vec<usize>)> = Vec::new();
 
+        // Split the token_source out of self so we can borrow active_requests mutably
+        // while also calling the source. Swapped back after the loop.
+        let mut token_source = std::mem::replace(
+            &mut self.token_source,
+            Box::new(RandomTokens { vocab_size: 0 }),
+        );
+
         for request in self.active_requests.values_mut() {
             if request.next_at > now {
-                // Not due yet; its deadline keeps the engine loop's sleep honest.
                 continue;
             }
             let client_index = request.client_index;
             let is_first = request.generated == 0;
-            let mut output = request.step(&self.opt);
+
+            // Token generation: draw from the request rng via the token source FIRST,
+            // then draw the inter-token delay from the same rng. This preserves the
+            // original rng draw order exactly.
+            let chunk_len = request.chunk_len(self.opt.output_token_chunk_size);
+            let ctx = TokenCtx {
+                request_id: &request.request_id,
+                prompt_token_ids: &request.prompt_token_ids,
+                num_generated: request.generated,
+            };
+            let new_token_ids = token_source.next_tokens(&ctx, chunk_len, &mut request.rng);
+
+            let mut output = request.step(new_token_ids);
             let request_id = request.request_id.clone();
             let finished = output.finished();
 
-            // The first output of a request carries its prefill breakdown for metrics.
             if is_first {
                 output.prefill_stats = Some(request.prefill_stats());
             }
@@ -1087,7 +1083,6 @@ impl Engine {
                     );
                 }
             } else {
-                // Schedule the next decode token.
                 request.next_at = now
                     + self
                         .latency
@@ -1100,16 +1095,16 @@ impl Engine {
             if finished {
                 finished_set.insert(request_id);
             }
-            // Hold the output so we can attach kv_transfer_params below if advertised.
             outs.push(std::mem::take(&mut output));
         }
 
+        // Swap the token source back.
+        self.token_source = token_source;
+
         for request_id in &finished_ids {
             if let Some(request) = self.active_requests.remove(request_id) {
-                // Release the prefix-cache pins; the blocks stay cached (evictable) for hits.
-                // (A prefill-advertised block could in principle be evicted before its decode
-                // peer pulls it under heavy cache pressure; size the pool to avoid that.)
                 self.pool.unpin(&request.block_ids);
+                self.token_source.on_request_finished(&request.request_id);
             }
         }
 
@@ -1211,91 +1206,86 @@ impl Engine {
     }
 }
 
-/// Run the main loop for one engine, receiving `EngineInput` and sending `EngineOutput`
-/// until `shutdown` is cancelled.
-pub(crate) async fn run_engine_loop(
-    engine_index: u32,
-    opt: Opt,
-    mut input_rx: mpsc::UnboundedReceiver<EngineInput>,
-    output_tx: mpsc::Sender<EngineOutput>,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    let role = opt.pd_role;
-    // Offset the side-channel port by engine index, matching the kv-events endpoint offset,
-    // so multiple engines in one process bind distinct ports.
-    let cfg = NixlConfig {
-        kv_block_bytes: opt.kv_block_bytes,
-        tokens_per_block: opt.tokens_per_block,
-        kv_cache_blocks: opt.kv_cache_size as usize,
-        engine_id: opt.engine_id.clone(),
-        side_channel_host: opt.side_channel_host.clone(),
-        side_channel_port: opt.side_channel_port + engine_index,
-    };
-    let latency = opt.latency_model();
-    let opt_seed = opt.seed;
-    let max_loras = opt.max_loras as usize;
-    let pool = BlockPool::new(
-        opt.tokens_per_block,
-        opt.kv_cache_size as usize,
-        opt.kv_cache_none_seed,
-    );
-    let events = kvevents::spawn(opt.kv_events_config(engine_index), shutdown.clone())
-        .await
-        .unwrap_or_else(|error| {
-            warn!(%error, "kv-event publisher failed to start; continuing without events");
-            None
-        });
-    let (pull_completion_tx, pull_completion_rx) = mpsc::unbounded_channel();
-    let mut engine = Engine {
-        engine_index,
-        opt,
-        latency,
-        data_plane: Arc::new(StdMutex::new(make_data_plane(role, cfg))),
-        pool,
-        events,
-        failure_rng: StdRng::seed_from_u64(
-            opt_seed ^ (engine_index as u64).wrapping_mul(0x9e3779b9),
-        ),
-        loras: LoraRegistry::new(max_loras),
-        active_requests: HashMap::new(),
-        waiting: VecDeque::new(),
-        pending_pulls: HashMap::new(),
-        pull_completion_tx,
-        pull_completion_rx,
-    };
-
-    loop {
-        // Wake at the soonest token deadline; disabled (no timer branch) when idle.
-        let next_deadline = engine.earliest_deadline();
-        let outputs = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => break,
-
-            input = input_rx.recv() => {
-                let input = input.ok_or_else(|| anyhow!("engine input channel closed"))?;
-                engine.handle_input(input)?
-            }
-
-            Some((request_id, result)) = engine.pull_completion_rx.recv() => {
-                engine.finish_pull(request_id, result)
-            }
-
-            _ = async { sleep_until(next_deadline.unwrap_or_else(Instant::now)).await },
-                if next_deadline.is_some() =>
-            {
-                engine.step()
-            }
+impl SimEngine {
+    /// Build a fully-initialized engine. KV-event publishing is async (ZMQ bind), so
+    /// construction is async too. The caller owns the loop; see `core::run_loop`.
+    pub(crate) async fn new(engine_index: u32, opt: Opt, events: Option<KvEventTx>) -> SimEngine {
+        let role = opt.pd_role;
+        let cfg = NixlConfig {
+            kv_block_bytes: opt.kv_block_bytes,
+            tokens_per_block: opt.tokens_per_block,
+            kv_cache_blocks: opt.kv_cache_size as usize,
+            engine_id: opt.engine_id.clone(),
+            side_channel_host: opt.side_channel_host.clone(),
+            side_channel_port: opt.side_channel_port + engine_index,
         };
+        let latency: Box<dyn LatencyModel> = Box::new(opt.latency_model());
+        let token_source: Box<dyn TokenSource> = Box::new(RandomTokens {
+            vocab_size: opt.vocab_size,
+        });
+        let scheduler: Box<dyn Scheduler> = match opt.scheduling_policy {
+            SchedulingPolicy::Fcfs => Box::new(sched::Fcfs),
+            SchedulingPolicy::Priority => Box::new(sched::Priority),
+        };
+        let opt_seed = opt.seed;
+        let max_loras = opt.max_loras as usize;
+        let pool = BlockPool::new(
+            opt.tokens_per_block,
+            opt.kv_cache_size as usize,
+            opt.kv_cache_none_seed,
+        );
+        let (pull_completion_tx, pull_completion_rx) = mpsc::unbounded_channel();
+        SimEngine {
+            engine_index,
+            opt,
+            latency,
+            token_source,
+            scheduler,
+            data_plane: Arc::new(StdMutex::new(make_data_plane(role, cfg))),
+            pool,
+            events,
+            failure_rng: StdRng::seed_from_u64(
+                opt_seed ^ (engine_index as u64).wrapping_mul(0x9e3779b9),
+            ),
+            loras: LoraRegistry::new(max_loras),
+            active_requests: HashMap::new(),
+            waiting: VecDeque::new(),
+            pending_pulls: HashMap::new(),
+            pull_completion_tx,
+            pull_completion_rx: Some(pull_completion_rx),
+        }
+    }
+}
 
-        for output in outputs {
-            output_tx
-                .send(output)
-                .await
-                .map_err(|_| anyhow!("engine IO task shut down"))?;
+impl EngineCore for SimEngine {
+    type Internal = PullCompletion;
+
+    fn handle_input(&mut self, input: EngineInput) -> Result<Vec<EngineOutput>> {
+        SimEngine::handle_input(self, input)
+    }
+
+    fn take_internal_rx(&mut self) -> mpsc::UnboundedReceiver<Self::Internal> {
+        match self.pull_completion_rx.take() {
+            Some(rx) => rx,
+            None => {
+                warn!("take_internal_rx called more than once; returning a dummy channel");
+                let (_tx, rx) = mpsc::unbounded_channel();
+                rx
+            }
         }
     }
 
-    Ok(())
+    fn on_internal(&mut self, (request_id, result): Self::Internal) -> Vec<EngineOutput> {
+        self.finish_pull(request_id, result)
+    }
+
+    fn earliest_deadline(&self) -> Option<Instant> {
+        SimEngine::earliest_deadline(self)
+    }
+
+    fn step(&mut self) -> Vec<EngineOutput> {
+        SimEngine::step(self)
+    }
 }
 
 #[cfg(test)]
@@ -1308,13 +1298,16 @@ mod tests {
 
     use super::*;
     use crate::dataplane::{NixlConfig, PdRole, make_data_plane};
+    use crate::engine_core::{EngineInput, EngineOutput};
 
     fn test_opt() -> Opt {
         // clap fills every field with its declared default (all latency knobs = 0 / instant).
         Opt::parse_from(["inference-sim"])
     }
 
-    fn test_engine(opt: Opt) -> Engine {
+    /// Build a test engine with a pre-taken internal rx for sync test usage. Returns the
+    /// engine and the pull completion receiver (tests that need it can recv directly).
+    fn test_engine(opt: Opt) -> (SimEngine, mpsc::UnboundedReceiver<PullCompletion>) {
         let cfg = NixlConfig {
             kv_block_bytes: opt.kv_block_bytes,
             tokens_per_block: opt.tokens_per_block,
@@ -1328,10 +1321,21 @@ mod tests {
             opt.kv_cache_size as usize,
             opt.kv_cache_none_seed,
         );
+        let latency: Box<dyn crate::latency::LatencyModel> = Box::new(opt.latency_model());
+        let token_source: Box<dyn crate::tokens::TokenSource> =
+            Box::new(crate::tokens::RandomTokens {
+                vocab_size: opt.vocab_size,
+            });
+        let scheduler: Box<dyn crate::sched::Scheduler> = match opt.scheduling_policy {
+            SchedulingPolicy::Fcfs => Box::new(crate::sched::Fcfs),
+            SchedulingPolicy::Priority => Box::new(crate::sched::Priority),
+        };
         let (pull_completion_tx, pull_completion_rx) = mpsc::unbounded_channel();
-        Engine {
+        let mut engine = SimEngine {
             engine_index: 0,
-            latency: opt.latency_model(),
+            latency,
+            token_source,
+            scheduler,
             data_plane: Arc::new(StdMutex::new(make_data_plane(PdRole::Both, cfg))),
             pool,
             events: None,
@@ -1341,9 +1345,11 @@ mod tests {
             waiting: VecDeque::new(),
             pending_pulls: HashMap::new(),
             pull_completion_tx,
-            pull_completion_rx,
+            pull_completion_rx: Some(pull_completion_rx),
             opt,
-        }
+        };
+        let rx = engine.pull_completion_rx.take().unwrap();
+        (engine, rx)
     }
 
     fn request(id: &str, prompt_len: usize, max_tokens: u32) -> EngineCoreRequest {
@@ -1363,11 +1369,13 @@ mod tests {
     /// blocking on the channel is deterministic, no sleeps needed. A no-op for requests
     /// without remote KV. Stray completions for already-aborted requests are consumed along
     /// the way (finish_pull drops them).
-    fn settle_pulls(engine: &mut Engine) -> Vec<EngineOutput> {
+    fn settle_pulls(
+        engine: &mut SimEngine,
+        rx: &mut mpsc::UnboundedReceiver<PullCompletion>,
+    ) -> Vec<EngineOutput> {
         let mut outputs = Vec::new();
         while !engine.pending_pulls.is_empty() {
-            let (request_id, result) = engine
-                .pull_completion_rx
+            let (request_id, result) = rx
                 .blocking_recv()
                 .expect("engine holds a completion sender");
             outputs.extend(engine.finish_pull(request_id, result));
@@ -1375,19 +1383,26 @@ mod tests {
         outputs
     }
 
-    fn add(engine: &mut Engine, req: EngineCoreRequest) {
+    fn add(
+        engine: &mut SimEngine,
+        rx: &mut mpsc::UnboundedReceiver<PullCompletion>,
+        req: EngineCoreRequest,
+    ) {
         engine
             .handle_input(EngineInput::Request(Box::new(req)))
             .expect("handle_input");
-        settle_pulls(engine);
+        settle_pulls(engine, rx);
     }
 
     /// Drain steps until the engine is idle, returning the flat output list. Safe only when
     /// the latency model is instant (deadlines never in the future), as in these tests.
-    fn drain(engine: &mut Engine) -> Vec<EngineCoreOutput> {
+    fn drain(
+        engine: &mut SimEngine,
+        rx: &mut mpsc::UnboundedReceiver<PullCompletion>,
+    ) -> Vec<EngineCoreOutput> {
         let mut all = Vec::new();
         while !engine.active_requests.is_empty() || !engine.pending_pulls.is_empty() {
-            for out in settle_pulls(engine) {
+            for out in settle_pulls(engine, rx) {
                 all.extend(out.outputs.outputs);
             }
             // settle_pulls emptied pending_pulls, so the batch is non-empty whenever the
@@ -1406,11 +1421,11 @@ mod tests {
 
     #[test]
     fn unconfigured_engine_is_instant() {
-        let mut engine = test_engine(test_opt());
-        add(&mut engine, request("r1", 4, 3));
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, request("r1", 4, 3));
         // Instant model: the first token is due immediately.
         assert!(engine.earliest_deadline().unwrap() <= Instant::now());
-        let outputs = drain(&mut engine);
+        let outputs = drain(&mut engine, &mut rx);
         let tokens: usize = outputs.iter().map(|o| o.new_token_ids.len()).sum();
         assert_eq!(tokens, 3);
         assert!(outputs.last().unwrap().finished());
@@ -1420,10 +1435,10 @@ mod tests {
     fn ttft_delays_the_first_token() {
         let mut opt = test_opt();
         opt.time_to_first_token = 10_000; // 10s, no std-dev -> exact, comfortably in the future
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         let before = Instant::now();
-        add(&mut engine, request("r1", 4, 2));
+        add(&mut engine, &mut rx, request("r1", 4, 2));
         let deadline = engine.earliest_deadline().expect("a deadline");
         assert!(deadline >= before + Duration::from_millis(9_000));
 
@@ -1434,9 +1449,9 @@ mod tests {
 
     #[test]
     fn prefill_stats_only_on_first_output() {
-        let mut engine = test_engine(test_opt());
-        add(&mut engine, request("r1", 7, 4));
-        let outputs = drain(&mut engine);
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, request("r1", 7, 4));
+        let outputs = drain(&mut engine, &mut rx);
 
         let with_prefill: Vec<_> = outputs
             .iter()
@@ -1458,10 +1473,10 @@ mod tests {
         let mut opt = test_opt();
         opt.tokens_per_block = 16;
         opt.kv_cache_size = 100; // blocks
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         // One request, 32 prompt tokens -> ceil(32/16) = 2 blocks while running.
-        add(&mut engine, request("r1", 32, 5));
+        add(&mut engine, &mut rx, request("r1", 32, 5));
         let stats = engine.scheduler_stats();
         assert_eq!(stats.num_running_reqs, 1);
         assert_eq!(stats.num_waiting_reqs, 0);
@@ -1472,7 +1487,7 @@ mod tests {
         );
 
         // Drain to completion; the engine is empty so usage is back to zero.
-        let _ = drain(&mut engine);
+        let _ = drain(&mut engine, &mut rx);
         let idle = engine.scheduler_stats();
         assert_eq!(idle.num_running_reqs, 0);
         assert_eq!(idle.kv_cache_usage, 0.0);
@@ -1480,8 +1495,8 @@ mod tests {
 
     #[test]
     fn final_batch_reports_zero_running() {
-        let mut engine = test_engine(test_opt());
-        add(&mut engine, request("r1", 4, 1)); // single output token, finishes in one step
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, request("r1", 4, 1)); // single output token, finishes in one step
         let batch = engine.step();
         let stats = batch[0]
             .outputs
@@ -1495,7 +1510,7 @@ mod tests {
 
     #[test]
     fn remote_prefill_request_counts_prompt_as_external_cached() {
-        let mut engine = test_engine(test_opt());
+        let (mut engine, mut rx) = test_engine(test_opt());
         let mut req = request("r1", 9, 2);
         let mut extra = HashMap::new();
         extra.insert(
@@ -1503,9 +1518,9 @@ mod tests {
             serde_json::json!({ "do_remote_prefill": true }),
         );
         req.sampling_params.as_mut().unwrap().extra_args = Some(extra);
-        add(&mut engine, req);
+        add(&mut engine, &mut rx, req);
 
-        let outputs = drain(&mut engine);
+        let outputs = drain(&mut engine, &mut rx);
         let stats = outputs
             .iter()
             .find_map(|o| o.prefill_stats.as_ref())
@@ -1518,11 +1533,11 @@ mod tests {
     fn shared_prompt_prefix_counts_as_local_cached() {
         let mut opt = test_opt();
         opt.tokens_per_block = 4; // small blocks so an 8-token prompt is 2 full blocks
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         // First request is cold: both blocks are computed, none cached.
-        add(&mut engine, request("r1", 8, 1));
-        let first = drain(&mut engine);
+        add(&mut engine, &mut rx, request("r1", 8, 1));
+        let first = drain(&mut engine, &mut rx);
         let s1 = first
             .iter()
             .find_map(|o| o.prefill_stats.as_ref())
@@ -1531,8 +1546,8 @@ mod tests {
         assert_eq!(s1.num_computed_tokens, 8);
 
         // r1's blocks stay cached after it finishes. The identical prompt now fully hits.
-        add(&mut engine, request("r2", 8, 1));
-        let second = drain(&mut engine);
+        add(&mut engine, &mut rx, request("r2", 8, 1));
+        let second = drain(&mut engine, &mut rx);
         let s2 = second
             .iter()
             .find_map(|o| o.prefill_stats.as_ref())
@@ -1549,7 +1564,7 @@ mod tests {
     fn cache_salt_isolates_otherwise_identical_prompts() {
         let mut opt = test_opt();
         opt.tokens_per_block = 4; // 8-token prompt = 2 full blocks
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         let salted = |id: &str, salt: &str| EngineCoreRequest {
             cache_salt: Some(salt.to_string()),
@@ -1557,12 +1572,12 @@ mod tests {
         };
 
         // r1 warms the cache under salt "a".
-        add(&mut engine, salted("r1", "a"));
-        let _ = drain(&mut engine);
+        add(&mut engine, &mut rx, salted("r1", "a"));
+        let _ = drain(&mut engine, &mut rx);
 
         // Same prompt under a different salt must recompute, not hit r1's blocks.
-        add(&mut engine, salted("r2", "b"));
-        let s2 = drain(&mut engine)
+        add(&mut engine, &mut rx, salted("r2", "b"));
+        let s2 = drain(&mut engine, &mut rx)
             .iter()
             .find_map(|o| o.prefill_stats.as_ref().cloned())
             .expect("prefill stats");
@@ -1573,8 +1588,8 @@ mod tests {
         assert_eq!(s2.num_computed_tokens, 8);
 
         // Same prompt under the same salt "a" hits fully.
-        add(&mut engine, salted("r3", "a"));
-        let s3 = drain(&mut engine)
+        add(&mut engine, &mut rx, salted("r3", "a"));
+        let s3 = drain(&mut engine, &mut rx)
             .iter()
             .find_map(|o| o.prefill_stats.as_ref().cloned())
             .expect("prefill stats");
@@ -1585,7 +1600,7 @@ mod tests {
     fn lora_isolates_prefix_cache_across_adapters() {
         let mut opt = test_opt();
         opt.tokens_per_block = 4; // 8-token prompt = 2 full blocks
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         // request() builds an all-zero 8-token prompt; only the adapter differs. max_tokens 1
         // so each finishes in one step.
@@ -1601,10 +1616,10 @@ mod tests {
         };
 
         // r1 (adapter A) warms the cache; a different adapter must recompute, not hit A's blocks.
-        add(&mut engine, with_lora("r1", "A"));
-        let _ = drain(&mut engine);
-        add(&mut engine, with_lora("r2", "B"));
-        let s2 = drain(&mut engine)
+        add(&mut engine, &mut rx, with_lora("r1", "A"));
+        let _ = drain(&mut engine, &mut rx);
+        add(&mut engine, &mut rx, with_lora("r2", "B"));
+        let s2 = drain(&mut engine, &mut rx)
             .iter()
             .find_map(|o| o.prefill_stats.as_ref().cloned())
             .expect("prefill stats");
@@ -1614,8 +1629,8 @@ mod tests {
         );
 
         // Same adapter A, same prompt -> full hit.
-        add(&mut engine, with_lora("r3", "A"));
-        let s3 = drain(&mut engine)
+        add(&mut engine, &mut rx, with_lora("r3", "A"));
+        let s3 = drain(&mut engine, &mut rx)
             .iter()
             .find_map(|o| o.prefill_stats.as_ref().cloned())
             .expect("prefill stats");
@@ -1626,10 +1641,10 @@ mod tests {
     fn scheduler_stats_carry_prefix_cache_counters() {
         let mut opt = test_opt();
         opt.tokens_per_block = 4;
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         // Cold request: its single step reports 2 queries and 0 hits (delta since last drain).
-        add(&mut engine, request("r1", 8, 1));
+        add(&mut engine, &mut rx, request("r1", 8, 1));
         let batch = engine.step();
         let stats = batch[0]
             .outputs
@@ -1645,10 +1660,10 @@ mod tests {
     fn max_model_len_fails_oversized_request_with_length() {
         let mut opt = test_opt();
         opt.max_model_len = 10;
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         // prompt 8 + max_tokens 5 = 13 > 10: context-length error, never queued.
-        let out = submit(&mut engine, request("big", 8, 5));
+        let out = submit(&mut engine, &mut rx, request("big", 8, 5));
         assert_eq!(finish_reason(&out[0]), Some(EngineCoreFinishReason::Length));
         assert!(engine.active_requests.is_empty());
         assert!(engine.waiting.is_empty());
@@ -1658,8 +1673,8 @@ mod tests {
     fn max_model_len_admits_a_fitting_request() {
         let mut opt = test_opt();
         opt.max_model_len = 100;
-        let mut engine = test_engine(opt);
-        submit(&mut engine, request("ok", 8, 5)); // 13 <= 100
+        let (mut engine, mut rx) = test_engine(opt);
+        submit(&mut engine, &mut rx, request("ok", 8, 5)); // 13 <= 100
         assert_eq!(engine.active_requests.len(), 1);
     }
 
@@ -1668,9 +1683,9 @@ mod tests {
         let mut opt = test_opt();
         opt.failure_injection_rate = 1.0;
         opt.failure_types = vec![crate::FailureType::Error];
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
-        let out = submit(&mut engine, request("doomed", 4, 5));
+        let out = submit(&mut engine, &mut rx, request("doomed", 4, 5));
         assert_eq!(finish_reason(&out[0]), Some(EngineCoreFinishReason::Error));
         assert!(engine.active_requests.is_empty());
     }
@@ -1678,8 +1693,8 @@ mod tests {
     #[test]
     fn failure_injection_at_rate_zero_never_fails() {
         let opt = test_opt(); // rate defaults to 0.0
-        let mut engine = test_engine(opt);
-        let out = submit(&mut engine, request("safe", 4, 5));
+        let (mut engine, mut rx) = test_engine(opt);
+        let out = submit(&mut engine, &mut rx, request("safe", 4, 5));
         assert!(
             out.iter()
                 .all(|o| finish_reason(o) != Some(EngineCoreFinishReason::Error))
@@ -1687,21 +1702,29 @@ mod tests {
         assert_eq!(engine.active_requests.len(), 1);
     }
 
-    fn submit(engine: &mut Engine, req: EngineCoreRequest) -> Vec<EngineOutput> {
+    fn submit(
+        engine: &mut SimEngine,
+        rx: &mut mpsc::UnboundedReceiver<PullCompletion>,
+        req: EngineCoreRequest,
+    ) -> Vec<EngineOutput> {
         let mut out = engine
             .handle_input(EngineInput::Request(Box::new(req)))
             .expect("handle_input");
-        out.extend(settle_pulls(engine));
+        out.extend(settle_pulls(engine, rx));
         out
     }
 
-    fn abort(engine: &mut Engine, ids: &[&str]) -> Vec<EngineOutput> {
+    fn abort(
+        engine: &mut SimEngine,
+        rx: &mut mpsc::UnboundedReceiver<PullCompletion>,
+        ids: &[&str],
+    ) -> Vec<EngineOutput> {
         let ids = ids.iter().map(|s| s.to_string()).collect();
         let mut out = engine
             .handle_input(EngineInput::Abort(ids))
             .expect("handle_input");
         // Aborting may free batch slots and admit queued remote-KV requests; settle their pulls.
-        out.extend(settle_pulls(engine));
+        out.extend(settle_pulls(engine, rx));
         out
     }
 
@@ -1714,11 +1737,11 @@ mod tests {
     fn batch_capped_at_max_num_seqs_rest_wait() {
         let mut opt = test_opt();
         opt.max_num_seqs = 2;
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         // Five long requests, batch holds 2; the other three wait.
         for i in 0..5 {
-            submit(&mut engine, request(&format!("r{i}"), 4, 50));
+            submit(&mut engine, &mut rx, request(&format!("r{i}"), 4, 50));
         }
         assert_eq!(engine.active_requests.len(), 2);
         assert_eq!(engine.waiting.len(), 3);
@@ -1732,17 +1755,17 @@ mod tests {
     fn queue_drains_fifo_as_running_finish() {
         let mut opt = test_opt();
         opt.max_num_seqs = 1;
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         // Three single-token requests through a batch of 1: each step finishes one and admits
         // the next, in arrival order.
         for i in 0..3 {
-            submit(&mut engine, request(&format!("r{i}"), 4, 1));
+            submit(&mut engine, &mut rx, request(&format!("r{i}"), 4, 1));
         }
         assert_eq!(engine.active_requests.len(), 1);
         assert_eq!(engine.waiting.len(), 2);
 
-        let finished_order: Vec<String> = drain(&mut engine)
+        let finished_order: Vec<String> = drain(&mut engine, &mut rx)
             .into_iter()
             .filter(|o| o.finished())
             .map(|o| o.request_id)
@@ -1755,13 +1778,13 @@ mod tests {
     fn aborting_a_waiting_request_removes_it_from_the_queue() {
         let mut opt = test_opt();
         opt.max_num_seqs = 1;
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
-        submit(&mut engine, request("running", 4, 50));
-        submit(&mut engine, request("queued", 4, 50));
+        submit(&mut engine, &mut rx, request("running", 4, 50));
+        submit(&mut engine, &mut rx, request("queued", 4, 50));
         assert_eq!(engine.waiting.len(), 1);
 
-        let out = abort(&mut engine, &["queued"]);
+        let out = abort(&mut engine, &mut rx, &["queued"]);
         assert_eq!(finish_reason(&out[0]), Some(EngineCoreFinishReason::Abort));
         assert!(engine.waiting.is_empty());
         assert!(engine.active_requests.contains_key("running"));
@@ -1771,15 +1794,15 @@ mod tests {
     fn aborting_a_running_request_admits_a_waiting_one() {
         let mut opt = test_opt();
         opt.max_num_seqs = 1;
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
-        submit(&mut engine, request("running", 4, 50));
-        submit(&mut engine, request("queued", 4, 50));
+        submit(&mut engine, &mut rx, request("running", 4, 50));
+        submit(&mut engine, &mut rx, request("queued", 4, 50));
         assert!(engine.active_requests.contains_key("running"));
         assert_eq!(engine.waiting.len(), 1);
 
         // Freeing the only batch slot pulls the queued request into the batch.
-        abort(&mut engine, &["running"]);
+        abort(&mut engine, &mut rx, &["running"]);
         assert!(engine.active_requests.contains_key("queued"));
         assert!(engine.waiting.is_empty());
     }
@@ -1788,10 +1811,10 @@ mod tests {
     fn unbounded_queue_never_rejects() {
         let mut opt = test_opt();
         opt.max_num_seqs = 1; // vLLM never rejects on queue length; neither do we
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         for i in 0..10 {
-            let out = submit(&mut engine, request(&format!("r{i}"), 4, 50));
+            let out = submit(&mut engine, &mut rx, request(&format!("r{i}"), 4, 50));
             assert!(
                 out.iter()
                     .all(|o| finish_reason(o) != Some(EngineCoreFinishReason::Error)),
@@ -1807,12 +1830,12 @@ mod tests {
         let mut opt = test_opt();
         opt.max_num_seqs = 100; // plenty of seq slots; the token budget is the binding limit
         opt.max_num_batched_tokens = 20;
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         // Each prefilling request demands its 10 prompt tokens. Budget 20 admits two (demand
         // 0 -> 10 -> 20), then 20 < 20 is false so the rest wait, despite 98 free seq slots.
         for i in 0..5 {
-            submit(&mut engine, request(&format!("r{i}"), 10, 50));
+            submit(&mut engine, &mut rx, request(&format!("r{i}"), 10, 50));
         }
         assert_eq!(engine.active_requests.len(), 2);
         assert_eq!(engine.waiting.len(), 3);
@@ -1824,10 +1847,10 @@ mod tests {
         let mut opt = test_opt();
         opt.max_num_seqs = 100;
         opt.max_num_batched_tokens = 20;
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         for i in 0..5 {
-            submit(&mut engine, request(&format!("r{i}"), 10, 50));
+            submit(&mut engine, &mut rx, request(&format!("r{i}"), 10, 50));
         }
         assert_eq!(engine.active_requests.len(), 2);
 
@@ -1855,7 +1878,7 @@ mod tests {
 
     /// Send a utility call and decode its typed result, the way the frontend's client does.
     fn call_utility<T: serde::de::DeserializeOwned, A: serde::Serialize + std::fmt::Debug>(
-        engine: &mut Engine,
+        engine: &mut SimEngine,
         method: &str,
         args: A,
     ) -> T {
@@ -1873,7 +1896,7 @@ mod tests {
 
     #[test]
     fn add_and_remove_lora_utilities_report_bool() {
-        let mut engine = test_engine(test_opt());
+        let (mut engine, _rx) = test_engine(test_opt());
         let lora = LoraRequest::new(
             "adapterA".to_string(),
             7,
@@ -1893,13 +1916,13 @@ mod tests {
 
     #[test]
     fn running_request_counts_into_lora_adapters() {
-        let mut engine = test_engine(test_opt());
-        add(&mut engine, lora_request("r1", "adapterA", 1));
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, lora_request("r1", "adapterA", 1));
         let stats = engine.scheduler_stats();
         assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
         assert!(stats.waiting_lora_adapters.is_empty());
         // A base-model request adds nothing to the adapter maps.
-        add(&mut engine, request("base", 4, 50));
+        add(&mut engine, &mut rx, request("base", 4, 50));
         let stats = engine.scheduler_stats();
         assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
         assert_eq!(stats.running_lora_adapters.len(), 1);
@@ -1909,11 +1932,11 @@ mod tests {
     fn waiting_requests_count_into_waiting_lora_adapters() {
         let mut opt = test_opt();
         opt.max_num_seqs = 1; // one slot, so the rest queue behind it
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
-        add(&mut engine, lora_request("run", "adapterA", 1));
-        add(&mut engine, lora_request("wait1", "adapterB", 2));
-        add(&mut engine, lora_request("wait2", "adapterB", 2));
+        add(&mut engine, &mut rx, lora_request("run", "adapterA", 1));
+        add(&mut engine, &mut rx, lora_request("wait1", "adapterB", 2));
+        add(&mut engine, &mut rx, lora_request("wait2", "adapterB", 2));
         let stats = engine.scheduler_stats();
         assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
         assert_eq!(
@@ -1928,12 +1951,12 @@ mod tests {
         let mut opt = test_opt();
         opt.max_loras = 1; // only one distinct adapter may run at a time
         opt.max_num_seqs = 8; // seq slots are not the binding limit here
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         // adapterA takes the single LoRA slot; adapterB can't be admitted and waits, even
         // though seq slots are free.
-        add(&mut engine, lora_request("a", "adapterA", 1));
-        add(&mut engine, lora_request("b", "adapterB", 2));
+        add(&mut engine, &mut rx, lora_request("a", "adapterA", 1));
+        add(&mut engine, &mut rx, lora_request("b", "adapterB", 2));
         assert_eq!(engine.active_requests.len(), 1);
         assert!(engine.active_requests.contains_key("a"));
         assert_eq!(engine.waiting.len(), 1);
@@ -1943,7 +1966,7 @@ mod tests {
 
         // A second adapterA request shares the resident slot, so it's admitted even though it
         // arrived behind the blocked adapterB request (skip-and-continue, not head-of-line).
-        add(&mut engine, lora_request("a2", "adapterA", 1));
+        add(&mut engine, &mut rx, lora_request("a2", "adapterA", 1));
         assert!(
             engine.active_requests.contains_key("a2"),
             "same adapter needs no new slot, skips past the blocked one"
@@ -1959,11 +1982,11 @@ mod tests {
         let mut opt = test_opt();
         opt.max_loras = 0; // cap disabled
         opt.max_num_seqs = 8;
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
-        add(&mut engine, lora_request("a", "adapterA", 1));
-        add(&mut engine, lora_request("b", "adapterB", 2));
-        add(&mut engine, lora_request("c", "adapterC", 3));
+        add(&mut engine, &mut rx, lora_request("a", "adapterA", 1));
+        add(&mut engine, &mut rx, lora_request("b", "adapterB", 2));
+        add(&mut engine, &mut rx, lora_request("c", "adapterC", 3));
         assert_eq!(engine.active_requests.len(), 3, "all distinct adapters run");
         assert!(engine.waiting.is_empty());
     }
@@ -1972,10 +1995,10 @@ mod tests {
     fn reset_prefix_cache_refused_while_requests_running() {
         let mut opt = test_opt();
         opt.tokens_per_block = 4; // 8-token prompt = 2 full blocks
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         // Submit a long-running request so the engine is busy.
-        submit(&mut engine, request("busy", 8, 100));
+        submit(&mut engine, &mut rx, request("busy", 8, 100));
         assert_eq!(engine.active_requests.len(), 1);
 
         // Attempting to reset while busy must return false.
@@ -1985,8 +2008,8 @@ mod tests {
         // The cache must survive: an identical prompt should still get a full prefix hit.
         // (The busy request still holds pins, but a second request sharing the same prompt
         // also gets hits on the already-cached blocks.)
-        submit(&mut engine, request("r2", 8, 1));
-        let r2_stats = drain(&mut engine)
+        submit(&mut engine, &mut rx, request("r2", 8, 1));
+        let r2_stats = drain(&mut engine, &mut rx)
             .iter()
             .find(|o| o.request_id == "r2")
             .and_then(|o| o.prefill_stats.as_ref().cloned())
@@ -2001,11 +2024,11 @@ mod tests {
     fn reset_prefix_cache_succeeds_when_idle() {
         let mut opt = test_opt();
         opt.tokens_per_block = 4;
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         // Warm the cache, then drain so the engine is idle.
-        add(&mut engine, request("warm", 8, 1));
-        let _ = drain(&mut engine);
+        add(&mut engine, &mut rx, request("warm", 8, 1));
+        let _ = drain(&mut engine, &mut rx);
         assert!(engine.active_requests.is_empty());
 
         // Reset should succeed and return true.
@@ -2013,8 +2036,8 @@ mod tests {
         assert!(ok, "reset must succeed when no requests are running");
 
         // The same prompt should now be a complete miss (cache was cleared).
-        add(&mut engine, request("cold", 8, 1));
-        let cold_stats = drain(&mut engine)
+        add(&mut engine, &mut rx, request("cold", 8, 1));
+        let cold_stats = drain(&mut engine, &mut rx)
             .iter()
             .find_map(|o| o.prefill_stats.as_ref().cloned())
             .expect("prefill stats");
@@ -2047,7 +2070,7 @@ mod tests {
     fn pending_pull_abort_unpins_blocks_and_emits_abort() {
         let mut opt = test_opt();
         opt.tokens_per_block = 4; // 8-token prompt = 2 blocks
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         // Submit a do_remote_prefill request. Don't drain completions yet, so it
         // stays in pending_pulls (the noop pull thread may or may not have finished,
@@ -2096,8 +2119,7 @@ mod tests {
 
         // The pull thread still sends its completion; receive it deterministically and
         // verify finish_pull drops the orphan (request already gone) without outputs.
-        let (orphan_id, orphan_result) = engine
-            .pull_completion_rx
+        let (orphan_id, orphan_result) = rx
             .blocking_recv()
             .expect("pull thread always sends a completion");
         assert_eq!(orphan_id, "rpull");
@@ -2108,9 +2130,9 @@ mod tests {
         );
 
         // Verify the same prompt can be submitted again (blocks are reusable).
-        add(&mut engine, request("fresh", 8, 2));
+        add(&mut engine, &mut rx, request("fresh", 8, 2));
         assert!(engine.active_requests.contains_key("fresh"));
-        let outputs = drain(&mut engine);
+        let outputs = drain(&mut engine, &mut rx);
         assert!(
             outputs.iter().any(|o| o.finished()),
             "fresh request completes"
@@ -2121,7 +2143,7 @@ mod tests {
     fn reset_prefix_cache_refused_while_pending_pulls_exist() {
         let mut opt = test_opt();
         opt.tokens_per_block = 4;
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         // Submit a do_remote_prefill request, don't drain completions.
         let req = remote_prefill_request("rpull", 8, 5);
@@ -2139,10 +2161,80 @@ mod tests {
         );
 
         // Once the pull settles and the request runs to completion, reset succeeds.
-        settle_pulls(&mut engine);
-        let _ = drain(&mut engine);
+        settle_pulls(&mut engine, &mut rx);
+        let _ = drain(&mut engine, &mut rx);
         let ok: bool = call_utility(&mut engine, "reset_prefix_cache", ());
         assert!(ok, "reset succeeds once nothing holds pins");
+    }
+
+    #[test]
+    fn echo_tokens_at_engine_level() {
+        let opt = test_opt();
+        let (mut engine, mut rx) = test_engine(opt);
+        engine.token_source = Box::new(crate::tokens::EchoTokens);
+
+        let prompt: Vec<u32> = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let req = EngineCoreRequest {
+            request_id: "echo".to_string(),
+            prompt_token_ids: Some(prompt.clone()),
+            sampling_params: Some(EngineCoreSamplingParams {
+                max_tokens: 8,
+                ..EngineCoreSamplingParams::for_test()
+            }),
+            ..Default::default()
+        };
+        add(&mut engine, &mut rx, req);
+        let outputs = drain(&mut engine, &mut rx);
+        let all_tokens: Vec<u32> = outputs.into_iter().flat_map(|o| o.new_token_ids).collect();
+        assert_eq!(
+            all_tokens, prompt,
+            "engine with EchoTokens echoes prompt ids exactly"
+        );
+    }
+
+    #[test]
+    fn shortest_prompt_first_completes_shortest_first() {
+        let mut opt = test_opt();
+        opt.max_num_seqs = 1;
+        let (mut engine, mut rx) = test_engine(opt);
+        engine.scheduler = Box::new(crate::sched::ShortestPromptFirst);
+
+        // Submit three requests with decreasing prompt lengths. With max_num_seqs=1 and
+        // FCFS the first submitted would run first, but ShortestPromptFirst should pick
+        // the shortest prompt from the waiting queue once the blocker finishes.
+        let blocker = EngineCoreRequest {
+            request_id: "blocker".to_string(),
+            prompt_token_ids: Some(vec![0; 4]),
+            sampling_params: Some(EngineCoreSamplingParams {
+                max_tokens: 1,
+                ..EngineCoreSamplingParams::for_test()
+            }),
+            ..Default::default()
+        };
+        add(&mut engine, &mut rx, blocker);
+
+        // Queue three requests: 100, 50, 10 prompt tokens. All produce 1 output token.
+        for (id, plen) in [("long", 100), ("mid", 50), ("short", 10)] {
+            let req = EngineCoreRequest {
+                request_id: id.to_string(),
+                prompt_token_ids: Some(vec![0u32; plen]),
+                sampling_params: Some(EngineCoreSamplingParams {
+                    max_tokens: 1,
+                    ..EngineCoreSamplingParams::for_test()
+                }),
+                ..Default::default()
+            };
+            add(&mut engine, &mut rx, req);
+        }
+        assert_eq!(engine.waiting.len(), 3);
+
+        let finished_order: Vec<String> = drain(&mut engine, &mut rx)
+            .into_iter()
+            .filter(|o| o.finished())
+            .map(|o| o.request_id)
+            .collect();
+        // blocker finishes first (already running), then shortest-first from queue.
+        assert_eq!(finished_order, vec!["blocker", "short", "mid", "long"]);
     }
 
     #[test]
@@ -2150,7 +2242,7 @@ mod tests {
         let mut opt = test_opt();
         opt.max_num_seqs = 1;
         opt.scheduling_policy = SchedulingPolicy::Priority;
-        let mut engine = test_engine(opt);
+        let (mut engine, mut rx) = test_engine(opt);
 
         let with_priority = |id: &str, p: i32| {
             let mut req = request(id, 4, 50);
@@ -2158,18 +2250,18 @@ mod tests {
             req
         };
 
-        submit(&mut engine, with_priority("blocker", 0)); // admitted immediately
-        submit(&mut engine, with_priority("p10", 10));
-        submit(&mut engine, with_priority("p1", 1));
-        submit(&mut engine, with_priority("p5", 5));
+        submit(&mut engine, &mut rx, with_priority("blocker", 0)); // admitted immediately
+        submit(&mut engine, &mut rx, with_priority("p10", 10));
+        submit(&mut engine, &mut rx, with_priority("p1", 1));
+        submit(&mut engine, &mut rx, with_priority("p5", 5));
         assert_eq!(engine.waiting.len(), 3);
 
         // Each freed slot admits the smallest remaining priority value, not arrival order.
-        abort(&mut engine, &["blocker"]);
+        abort(&mut engine, &mut rx, &["blocker"]);
         assert!(engine.active_requests.contains_key("p1"));
-        abort(&mut engine, &["p1"]);
+        abort(&mut engine, &mut rx, &["p1"]);
         assert!(engine.active_requests.contains_key("p5"));
-        abort(&mut engine, &["p5"]);
+        abort(&mut engine, &mut rx, &["p5"]);
         assert!(engine.active_requests.contains_key("p10"));
     }
 }

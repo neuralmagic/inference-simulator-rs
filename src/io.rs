@@ -24,8 +24,19 @@ async fn send_engine_outputs_to_client(
         outputs,
     }: EngineOutput,
 ) -> Result<()> {
+    let socket = match push_sockets.get_mut(client_index as usize) {
+        Some(s) => s,
+        None => {
+            warn!(
+                client_index,
+                socket_count = push_sockets.len(),
+                "client_index out of range, dropping output batch"
+            );
+            return Ok(());
+        }
+    };
     let message = ZmqMessage::from(encode_msgpack(&outputs)?);
-    push_sockets[client_index as usize].send(message).await?;
+    socket.send(message).await?;
     Ok(())
 }
 

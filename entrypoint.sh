@@ -42,6 +42,9 @@ SCHEDULER_ARGS=(
     --scheduling-policy "${MOCK_SCHEDULING_POLICY:-fcfs}"
     --kv-cache-size "${MOCK_KV_CACHE_SIZE:-1024}"
     --tokens-per-block "${MOCK_TOKENS_PER_BLOCK:-16}"
+    # Distinct LoRA adapters allowed in the running batch (vLLM --max-loras). 0 = no cap; the
+    # running/waiting_lora_adapters stats (vllm:lora_requests_info) report regardless.
+    --max-loras "${MOCK_MAX_LORAS:-0}"
 )
 
 # KV-cache events for the cache-aware router (Phase 4). Off unless MOCK_ENABLE_KV_EVENTS=1.

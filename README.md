@@ -75,12 +75,25 @@ upstream:
 ## Test
 
 ```bash
-./scripts/e2e.sh   # boots vllm-rs + this engine, asserts streaming + non-streaming flows
+./scripts/e2e.sh        # boots vllm-rs + this engine, asserts streaming + non-streaming flows
+./scripts/e2e_lora.sh   # loads a LoRA adapter, asserts vllm:lora_requests_info names it
 ```
 
 Needs the `vllm-rs` frontend built once (`cargo build --bin vllm-rs` in the vLLM
 `rust/` workspace); override its path with `FRONTEND_BIN=...`. First run fetches the
 tokenizer from HF.
+
+`e2e_lora.sh` needs a `vllm-rs` built from the LoRA-gauge fork (`wseaton/vllm@lora-info-gauge`):
+the upstream Rust frontend at `ba94a3b` does not export `vllm:lora_requests_info`, though the
+engine and the Python frontend both speak it. The container image already builds `vllm-rs` from
+that fork by default (`VLLM_REPO`/`VLLM_REF` Docker build args); point them back at
+`vllm-project/vllm` once the gauge is upstream.
+
+### LoRA simulation
+
+The engine tracks LoRA adapters the frontend loads (`add_lora`/`remove_lora`), counts per-adapter
+running/waiting requests for `vllm:lora_requests_info`, and honors `--max-loras` (distinct
+adapters allowed in the running batch; `0` = no cap). In the image, set `MOCK_MAX_LORAS`.
 
 ## Build & run
 

@@ -46,6 +46,7 @@ async fn events_decode_over_a_real_zmq_sub_socket() {
         parent_hash: Some(7),
         token_ids: vec![1, 2, 3, 4, 5, 6, 7, 8],
         block_size: 4,
+        lora_name: None,
     };
 
     // PUB/SUB is a slow joiner: re-publish until the SUB actually receives one (or give up).

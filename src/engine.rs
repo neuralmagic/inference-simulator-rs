@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
@@ -19,11 +20,12 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::stats::{
     BaseCacheStats, PrefillStats, PrefixCacheStats, SchedulerStats,
 };
 use vllm_engine_core_client::protocol::utility::{
-    EngineCoreUtilityRequest, UtilityOutput, UtilityResultEnvelope,
+    EngineCoreUtilityRequest, UtilityCallId, UtilityOutput, UtilityResultEnvelope,
 };
 use vllm_engine_core_client::protocol::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
@@ -33,6 +35,7 @@ use crate::blockpool::BlockPool;
 use crate::dataplane::{KvDataPlane, NixlConfig, RemoteKv, RequestKv, make_data_plane};
 use crate::kvevents::{self, KvEventTx};
 use crate::latency::LatencyModel;
+use crate::lora::LoraRegistry;
 use crate::{Opt, SchedulingPolicy};
 
 /// Per-step token demand of a single prefilling request: a (possibly chunked) slice of its
@@ -111,7 +114,26 @@ where
     ))
 }
 
-/// Produce the minimal utility responses needed by a real frontend.
+/// Wrap a utility result envelope in the `EngineCoreOutputs` the frontend awaits for `call_id`.
+fn utility_result_outputs(
+    engine_index: u32,
+    call_id: UtilityCallId,
+    result: UtilityResultEnvelope,
+) -> EngineCoreOutputs {
+    EngineCoreOutputs {
+        engine_index,
+        utility_output: Some(UtilityOutput {
+            call_id,
+            failure_message: None,
+            result: Some(result),
+        }),
+        timestamp: now_secs(),
+        ..Default::default()
+    }
+}
+
+/// Produce the minimal utility responses needed by a real frontend. Stateful utilities
+/// (`add_lora`/`remove_lora`, `reset_prefix_cache`) are handled on `Engine` instead.
 fn utility_response(
     engine_index: u32,
     request: EngineCoreUtilityRequest,
@@ -119,26 +141,27 @@ fn utility_response(
     let result = match request.method_name.as_str() {
         "get_supported_tasks" => utility_envelope(vec!["generate"]),
         "is_sleeping" => utility_envelope(false),
-        "reset_prefix_cache" => utility_envelope(true),
         "reset_mm_cache"
         | "reset_encoder_cache"
         | "profile"
         | "sleep"
         | "wake_up"
         | "execute_dummy_batch" => utility_envelope(()),
-        _ => utility_envelope(MsgpackValue::Nil),
+        other => {
+            warn!(
+                engine_index,
+                method = other,
+                "unknown utility method; returning Nil"
+            );
+            utility_envelope(MsgpackValue::Nil)
+        }
     }?;
 
-    Ok(EngineCoreOutputs {
+    Ok(utility_result_outputs(
         engine_index,
-        utility_output: Some(UtilityOutput {
-            call_id: request.call_id,
-            failure_message: None,
-            result: Some(result),
-        }),
-        timestamp: now_secs(),
-        ..Default::default()
-    })
+        request.call_id,
+        result,
+    ))
 }
 
 /// The `kv_transfer_params` the frontend ferries down from the OpenAI request. The
@@ -245,6 +268,9 @@ struct ActiveRequest {
     /// Physical block-pool slot ids this request pins (prompt blocks). Unpinned on finish or
     /// abort so they become evictable; also the `remote_block_ids` the data plane pages.
     block_ids: Vec<usize>,
+    /// The LoRA adapter this request runs against, if any (from `EngineCoreRequest.lora_request`).
+    /// Drives the per-adapter running count and the LoRA slot cap. `None` is the base model.
+    lora_name: Option<String>,
     /// When the next output token is due. Set to `now + first-token delay` at admission, then
     /// advanced by the inter-token delay after each emitted token. The engine loop sleeps
     /// until the earliest deadline across all active requests, so this is the timing model.
@@ -274,6 +300,7 @@ impl ActiveRequest {
             .as_ref()
             .map(|kv| kv_flag(kv, "do_remote_prefill"))
             .unwrap_or(false);
+        let lora_name = request.lora_request.as_ref().map(|l| l.lora_name.clone());
         let request_id = request.request_id;
         let client_index = request.client_index;
         let prompt_len = request
@@ -331,6 +358,7 @@ impl ActiveRequest {
             remote_prefill,
             num_local_cached_tokens,
             block_ids,
+            lora_name,
             next_at: Instant::now() + first_delay,
         })
     }
@@ -387,12 +415,32 @@ impl ActiveRequest {
     }
 }
 
+/// A request that has been admitted (blocks pinned, batch slot reserved) but whose
+/// remote KV pull is still in flight on a background thread. The pull result arrives
+/// via `pull_completion_rx`; on completion `finish_pull` promotes it to an `ActiveRequest`.
+struct PendingPull {
+    request: Box<EngineCoreRequest>,
+    block_ids: Vec<usize>,
+    num_local_cached_tokens: usize,
+    client_index: u32,
+    prompt_len: usize,
+    lora_name: Option<String>,
+}
+
+/// Result sent from a `spawn_blocking` pull task back to the engine loop.
+type PullCompletion = (String, Result<u64>);
+
 /// Internal state for one engine instance, owned by the engine loop task.
 struct Engine {
     engine_index: u32,
     opt: Opt,
     latency: LatencyModel,
-    data_plane: Box<dyn KvDataPlane>,
+    /// Wrapped in `Arc<Mutex>` so `spawn_blocking` pull tasks can call `pull_prefilled` off
+    /// the engine loop. The mutex is effectively uncontended: `advertise_prefilled` and
+    /// `release` run inline on the engine task (which only does prefill or decode, never both
+    /// on the same engine), and the blocking pull runs on a thread pool, so the two callers
+    /// never overlap on the same engine instance.
+    data_plane: Arc<StdMutex<Box<dyn KvDataPlane>>>,
     /// Prefix-cache + block-slot pool. Drives local cache hits, `kv_cache_usage`,
     /// `prefix_cache_stats`, and the KV-cache events the cache-aware router consumes.
     pool: BlockPool,
@@ -400,11 +448,22 @@ struct Engine {
     events: Option<KvEventTx>,
     /// RNG for failure injection (Phase 5), seeded per engine for reproducibility.
     failure_rng: StdRng,
+    /// Loaded LoRA adapters + the running-batch slot cap. Adapters arrive via `add_lora`
+    /// utility calls; per-request usage drives the `running/waiting_lora_adapters` stats.
+    loras: LoraRegistry,
     /// The running batch: requests being actively decoded. Capped at `max_num_seqs`.
     active_requests: HashMap<String, ActiveRequest>,
     /// Admitted-but-not-yet-running requests, in arrival order. Drained into `active_requests`
     /// as slots free up; its length is `vllm:num_requests_waiting`.
     waiting: VecDeque<Box<EngineCoreRequest>>,
+    /// Requests whose blocks are pinned and batch slot reserved, but whose remote KV pull
+    /// is still in flight. These count toward `running_capacity` and `scheduled_token_demand`
+    /// to prevent over-admission while pulls are outstanding.
+    pending_pulls: HashMap<String, PendingPull>,
+    /// Sender half for pull completion results. Cloned into each `spawn_blocking` task.
+    pull_completion_tx: mpsc::UnboundedSender<PullCompletion>,
+    /// Receiver half; polled in the engine loop's `select!`.
+    pull_completion_rx: mpsc::UnboundedReceiver<PullCompletion>,
 }
 
 impl Engine {
@@ -437,6 +496,121 @@ impl Engine {
         None
     }
 
+    /// Handle a LoRA load/unload utility call, mutating the adapter registry. Returns the
+    /// `bool`-carrying response the frontend awaits, or `None` if this isn't a LoRA method (so
+    /// the caller falls back to the generic `utility_response`). The frontend encodes both
+    /// methods' args as a one-element tuple: `(LoraRequest,)` for `add_lora`, `(lora_int_id,)`
+    /// for `remove_lora`.
+    fn lora_utility_outputs(
+        &mut self,
+        request: &EngineCoreUtilityRequest,
+    ) -> Result<Option<EngineCoreOutputs>> {
+        let ok = match request.method_name.as_str() {
+            "add_lora" => {
+                let (lora,): (LoraRequest,) = rmpv::ext::from_value(request.args.clone())
+                    .map_err(|error| anyhow!("decoding add_lora args: {error}"))?;
+                let name = lora.lora_name.clone();
+                let id = lora.lora_int_id;
+                let ok = self.loras.add(lora);
+                info!(engine_index = self.engine_index, lora = %name, id, "add_lora");
+                ok
+            }
+            "remove_lora" => {
+                let (lora_int_id,): (u64,) = rmpv::ext::from_value(request.args.clone())
+                    .map_err(|error| anyhow!("decoding remove_lora args: {error}"))?;
+                let ok = self.loras.remove(lora_int_id);
+                info!(
+                    engine_index = self.engine_index,
+                    id = lora_int_id,
+                    ok,
+                    "remove_lora"
+                );
+                ok
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(utility_result_outputs(
+            self.engine_index,
+            request.call_id,
+            utility_envelope(ok)?,
+        )))
+    }
+
+    /// Handle the `reset_prefix_cache` utility. Real vLLM refuses the reset when any blocks
+    /// are pinned (requests running) and returns false. Waiting-queue requests hold no pins
+    /// (pinning happens at admission), so they do not block a reset.
+    fn reset_prefix_cache_outputs(
+        &mut self,
+        request: &EngineCoreUtilityRequest,
+    ) -> Result<Option<EngineCoreOutputs>> {
+        if request.method_name != "reset_prefix_cache" {
+            return Ok(None);
+        }
+        let ok = if self.active_requests.is_empty() && self.pending_pulls.is_empty() {
+            if let Some(event) = self.pool.reset()
+                && let Some(events) = &self.events
+            {
+                events.publish(vec![event]);
+            }
+            true
+        } else {
+            warn!(
+                engine_index = self.engine_index,
+                num_running = self.active_requests.len(),
+                num_pending_pulls = self.pending_pulls.len(),
+                "refusing reset_prefix_cache: requests are still running or pulls pending"
+            );
+            false
+        };
+        Ok(Some(utility_result_outputs(
+            self.engine_index,
+            request.call_id,
+            utility_envelope(ok)?,
+        )))
+    }
+
+    /// Count running requests per LoRA adapter (from the batch) and waiting requests per
+    /// adapter (from the queue) for the `running_lora_adapters`/`waiting_lora_adapters`
+    /// scheduler stats. Base-model requests carry no adapter and are not counted.
+    fn lora_counts(&self) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
+        let mut running = BTreeMap::new();
+        for request in self.active_requests.values() {
+            if let Some(name) = &request.lora_name {
+                *running.entry(name.clone()).or_insert(0) += 1;
+            }
+        }
+        // Pending pulls hold batch slots and count as running for LoRA accounting.
+        for pending in self.pending_pulls.values() {
+            if let Some(name) = &pending.lora_name {
+                *running.entry(name.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut waiting = BTreeMap::new();
+        for request in &self.waiting {
+            if let Some(lora) = &request.lora_request {
+                *waiting.entry(lora.lora_name.clone()).or_insert(0) += 1;
+            }
+        }
+        (running, waiting)
+    }
+
+    /// Whether the LoRA slot cap lets this request join the running batch right now (see
+    /// `LoraRegistry::admits`). The running batch's distinct adapters are read live.
+    fn lora_admits(&self, request: &EngineCoreRequest) -> bool {
+        let lora_name = request.lora_request.as_ref().map(|l| l.lora_name.as_str());
+        self.loras.admits(
+            lora_name,
+            self.active_requests
+                .values()
+                .filter_map(|r| r.lora_name.as_deref())
+                .chain(
+                    self.pending_pulls
+                        .values()
+                        .filter_map(|p| p.lora_name.as_deref()),
+                ),
+        )
+    }
+
     /// Drain one frontend request message.
     fn handle_input(&mut self, input: EngineInput) -> Result<Vec<EngineOutput>> {
         let mut outputs = Vec::new();
@@ -446,8 +620,9 @@ impl Engine {
                 let request_id = request.request_id.clone();
                 let client_index = request.client_index;
 
-                // Dedup against both the running batch and the waiting queue.
+                // Dedup against the running batch, pending pulls, and the waiting queue.
                 if self.active_requests.contains_key(&request_id)
+                    || self.pending_pulls.contains_key(&request_id)
                     || self.waiting.iter().any(|r| r.request_id == request_id)
                 {
                     warn!(
@@ -494,13 +669,21 @@ impl Engine {
                 let mut by_client =
                     BTreeMap::<u32, (Vec<EngineCoreOutput>, BTreeSet<String>)>::new();
                 for request_id in request_ids {
-                    self.data_plane.release(&request_id);
-                    // A request is either running or waiting (never both); abort whichever.
+                    // Release is cheap (a memset or no-op), lock inline.
+                    if let Ok(mut plane) = self.data_plane.lock() {
+                        plane.release(&request_id);
+                    }
+                    // A request is running, pending-pull, or waiting; abort whichever.
                     let client_index =
                         if let Some(request) = self.active_requests.remove(&request_id) {
                             // Free its prefix-cache pins so the blocks can be evicted later.
                             self.pool.unpin(&request.block_ids);
                             Some(request.client_index)
+                        } else if let Some(pending) = self.pending_pulls.remove(&request_id) {
+                            // Pull is in flight on a background thread; unpin blocks and let
+                            // the orphaned task's completion be dropped in finish_pull.
+                            self.pool.unpin(&pending.block_ids);
+                            Some(pending.client_index)
                         } else if let Some(pos) =
                             self.waiting.iter().position(|r| r.request_id == request_id)
                         {
@@ -548,18 +731,19 @@ impl Engine {
                     method = request.method_name,
                     "utility request"
                 );
-                // Mirror vLLM: resetting the prefix cache clears the block pool and emits a
-                // single AllBlocksCleared so the router drops this engine's whole index.
-                if request.method_name == "reset_prefix_cache"
-                    && let Some(event) = self.pool.reset()
-                    && let Some(events) = &self.events
-                {
-                    events.publish(vec![event]);
-                }
                 let client_index = request.client_index;
+                // Stateful utilities (LoRA, prefix-cache reset) mutate engine state; try them
+                // first, then fall back to the stateless generic responder.
+                let outputs_msg = if let Some(out) = self.reset_prefix_cache_outputs(&request)? {
+                    out
+                } else if let Some(out) = self.lora_utility_outputs(&request)? {
+                    out
+                } else {
+                    utility_response(self.engine_index, request)?
+                };
                 outputs.push(EngineOutput {
                     client_index,
-                    outputs: utility_response(self.engine_index, request)?,
+                    outputs: outputs_msg,
                 });
             }
 
@@ -577,9 +761,16 @@ impl Engine {
         self.opt.max_num_seqs.max(1) as usize
     }
 
-    /// Move a request from the waiting queue into the running batch: run the decode-side KV
-    /// pull (its TTFT models the transfer, so the pull belongs at admission, not arrival),
-    /// then build its `ActiveRequest` (which starts the first-token clock). Returns an
+    /// Move a request from the waiting queue into the running batch. For requests with a
+    /// remote KV descriptor (`do_remote_prefill`), the pull is spawned on a blocking thread
+    /// and the request is parked in `pending_pulls` until completion. The first-token clock
+    /// starts when the pull finishes (in `finish_pull`), so real NIXL users should leave the
+    /// `kv_cache_transfer` latency knobs at 0 to avoid double-counting the transfer time
+    /// (the actual transfer wall time is the delay). Sim-timing users running the noop plane
+    /// still get the modeled transfer delay from the latency knobs.
+    ///
+    /// Requests without remote KV go through single-phase admission: `ActiveRequest::new`
+    /// is called inline and the request enters `active_requests` immediately. Returns an
     /// immediate-finish output if the request is invalid (e.g. `max_tokens == 0`).
     fn admit(&mut self, request: Box<EngineCoreRequest>) -> Option<EngineOutput> {
         let request_id = request.request_id.clone();
@@ -587,41 +778,111 @@ impl Engine {
         let remote = extract_kv_params(&request)
             .as_ref()
             .and_then(parse_remote_kv);
-        let prompt_tokens: Vec<u32> = request.prompt_token_ids.clone().unwrap_or_default();
+        let prompt_len = request
+            .prompt_token_ids
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or_default();
 
         // === BLOCK POOL: cache this prompt locally ===
         // Measure the local prefix hit, allocate slots for the new blocks, pin them all, and
         // emit BlockStored/BlockRemoved for the router. The slot ids are what the data plane
         // pages over NIXL and what we advertise as remote_block_ids.
-        let outcome = self.pool.cache_prompt(&prompt_tokens);
+        let lora_name = request.lora_request.as_ref().map(|l| l.lora_name.as_str());
+        let prompt_slice = request.prompt_token_ids.as_deref().unwrap_or_default();
+        let outcome =
+            self.pool
+                .cache_prompt(prompt_slice, lora_name, request.cache_salt.as_deref());
         if let Some(events) = &self.events {
             events.publish(outcome.events);
         }
         let num_local_cached = outcome.num_cached_tokens;
         let block_ids = outcome.block_ids;
 
-        // === DATA PLANE: decode-side pull ===
-        // A do_remote_prefill request carries the prefill engine's remote_* descriptor; pull
-        // its KV over NIXL into our slots before we start generating.
+        // === DATA PLANE: two-phase decode-side pull ===
+        // A do_remote_prefill request carries the prefill engine's remote_* descriptor. Instead
+        // of pulling inline (which blocks the engine loop for the entire TCP connect + transfer),
+        // park the request and spawn the pull on a blocking thread. The completion arrives via
+        // `pull_completion_rx` and `finish_pull` promotes it to an ActiveRequest.
         if let Some(remote) = remote {
-            let kv = RequestKv {
-                request_id: &request_id,
-                num_tokens: prompt_tokens.len(),
-                block_ids: &block_ids,
-            };
-            match self.data_plane.pull_prefilled(kv, &remote) {
-                Ok(bytes) => info!(
-                    request_id,
-                    bytes,
-                    engine_id = remote.engine_id,
-                    "pulled remote KV before decode"
-                ),
-                Err(error) => warn!(request_id, %error, "remote KV pull failed"),
+            let lora_name_owned = request.lora_request.as_ref().map(|l| l.lora_name.clone());
+            self.pending_pulls.insert(
+                request_id.clone(),
+                PendingPull {
+                    request,
+                    block_ids: block_ids.clone(),
+                    num_local_cached_tokens: num_local_cached,
+                    client_index,
+                    prompt_len,
+                    lora_name: lora_name_owned,
+                },
+            );
+
+            let dp = Arc::clone(&self.data_plane);
+            let tx = self.pull_completion_tx.clone();
+            let rid = request_id.clone();
+            let block_ids_for_pull = block_ids;
+            // Use a plain OS thread rather than tokio::spawn_blocking so the pull works
+            // both in the async engine loop and in sync #[test] contexts (which have no
+            // tokio runtime). The thread does blocking IO (TCP connect + poll loop for
+            // real NIXL), sends the result on the tokio mpsc (safe from any thread), and
+            // exits. The thread is detached; its result is consumed via pull_completion_rx.
+            if let Err(e) = std::thread::Builder::new()
+                .name(format!("kv-pull-{}", rid))
+                .spawn(move || {
+                    let kv = RequestKv {
+                        request_id: &rid,
+                        num_tokens: prompt_len,
+                        block_ids: &block_ids_for_pull,
+                    };
+                    let result = match dp.lock() {
+                        Ok(mut plane) => plane.pull_prefilled(kv, &remote),
+                        Err(poisoned) => {
+                            // Mutex poisoned (a prior pull panicked). Treat as pull failure
+                            // rather than propagating the panic; the engine keeps running.
+                            let mut plane = poisoned.into_inner();
+                            plane
+                                .pull_prefilled(kv, &remote)
+                                .map_err(|e| anyhow!("pull after mutex poison recovery: {e}"))
+                        }
+                    };
+                    // If the receiver is dropped (engine shut down), this send failing is fine.
+                    let _ = tx.send((rid, result));
+                })
+            {
+                // Thread spawn failed (extremely rare, resource exhaustion). Send a failure
+                // completion so finish_pull handles it on the next loop turn.
+                warn!(request_id, %e, "failed to spawn pull thread; reporting pull failure");
+                let _ = self
+                    .pull_completion_tx
+                    .send((request_id, Err(anyhow!("failed to spawn pull thread: {e}"))));
             }
+            return None;
         }
 
+        // Single-phase admission: no remote KV, admit directly.
+        self.admit_direct(
+            request_id,
+            client_index,
+            request,
+            block_ids,
+            num_local_cached,
+        )
+    }
+
+    /// Complete single-phase admission by building the `ActiveRequest` and inserting it into
+    /// the running batch. Also used by `finish_pull` after a two-phase pull completes.
+    fn admit_direct(
+        &mut self,
+        request_id: String,
+        client_index: u32,
+        request: Box<EngineCoreRequest>,
+        block_ids: Vec<usize>,
+        num_local_cached: usize,
+    ) -> Option<EngineOutput> {
         // Count this request among the running set for its own load-factor scaling.
-        let num_running = self.active_requests.len() as u64 + 1;
+        // Include pending pulls in the count since they occupy batch slots.
+        let num_running = (self.active_requests.len() + self.pending_pulls.len()) as u64 + 1;
         match ActiveRequest::new(
             self.engine_index,
             request,
@@ -646,38 +907,88 @@ impl Engine {
         }
     }
 
-    /// Current per-step token demand of the running batch (sum of each request's `token_demand`),
-    /// charged against `max_num_batched_tokens`.
+    /// Handle a completed pull from the background thread. Promotes the pending request to
+    /// an `ActiveRequest` (starting its first-token clock now, after the transfer) and runs
+    /// `schedule()` since batch budget may have changed. Returns any outputs produced.
+    fn finish_pull(&mut self, request_id: String, result: Result<u64>) -> Vec<EngineOutput> {
+        let Some(pending) = self.pending_pulls.remove(&request_id) else {
+            // The request was aborted while the pull was in flight; its blocks are already
+            // unpinned and its abort output already sent. Drop the orphaned result.
+            debug!(
+                request_id,
+                "pull completed for unknown/aborted request; dropping"
+            );
+            return Vec::new();
+        };
+
+        match &result {
+            Ok(bytes) => info!(request_id, bytes, "pulled remote KV before decode"),
+            Err(error) => warn!(request_id, %error, "remote KV pull failed (admitting anyway)"),
+        }
+
+        let mut outputs = Vec::new();
+        if let Some(out) = self.admit_direct(
+            request_id,
+            pending.client_index,
+            pending.request,
+            pending.block_ids,
+            pending.num_local_cached_tokens,
+        ) {
+            outputs.push(out);
+        }
+        // Completing a pull may free budget if the request was invalid; try to admit more.
+        outputs.extend(self.schedule());
+        outputs
+    }
+
+    /// Current per-step token demand of the running batch plus pending pulls, charged against
+    /// `max_num_batched_tokens`. Pending pulls count as prefilling requests (their prompt chunk)
+    /// so the scheduler cannot over-admit while pulls are in flight.
     fn scheduled_token_demand(&self) -> usize {
         let threshold = self.opt.long_prefill_token_threshold as usize;
         let budget = self.opt.max_num_batched_tokens as usize;
-        self.active_requests
+        let active: usize = self
+            .active_requests
             .values()
             .map(|request| request.token_demand(threshold, budget))
-            .sum()
+            .sum();
+        let pending: usize = self
+            .pending_pulls
+            .values()
+            .map(|p| prefill_token_demand(p.prompt_len, threshold, budget))
+            .sum();
+        active + pending
     }
 
-    /// Pop the next request to admit, honoring the scheduling policy: FIFO for `fcfs`, or the
-    /// smallest `(priority, arrival_time)` for `priority` (matching vLLM's priority queue).
-    fn pop_next_waiting(&mut self) -> Option<Box<EngineCoreRequest>> {
+    /// Index of the next waiting request to admit, honoring the scheduling policy (FIFO for
+    /// `fcfs`, smallest `(priority, arrival_time)` for `priority`) but considering only
+    /// requests that currently pass the LoRA slot cap. LoRA-blocked requests are skipped over
+    /// (they stay queued and surface as `num_skipped_waiting_reqs`), matching vLLM rather than
+    /// head-of-line blocking the whole queue on one stuck adapter. `None` if nothing is
+    /// admissible right now.
+    fn next_admissible_index(&self) -> Option<usize> {
         match self.opt.scheduling_policy {
-            SchedulingPolicy::Fcfs => self.waiting.pop_front(),
-            SchedulingPolicy::Priority => {
-                let idx = self
-                    .waiting
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, a), (_, b)| {
-                        a.priority.cmp(&b.priority).then_with(|| {
-                            a.arrival_time
-                                .partial_cmp(&b.arrival_time)
-                                .unwrap_or(Ordering::Equal)
-                        })
+            SchedulingPolicy::Fcfs => self.waiting.iter().position(|r| self.lora_admits(r)),
+            SchedulingPolicy::Priority => self
+                .waiting
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| self.lora_admits(r))
+                .min_by(|(_, a), (_, b)| {
+                    a.priority.cmp(&b.priority).then_with(|| {
+                        a.arrival_time
+                            .partial_cmp(&b.arrival_time)
+                            .unwrap_or(Ordering::Equal)
                     })
-                    .map(|(i, _)| i)?;
-                self.waiting.remove(idx)
-            }
+                })
+                .map(|(i, _)| i),
         }
+    }
+
+    /// Number of waiting requests the LoRA slot cap is currently blocking (vLLM's skipped
+    /// waiting queue). Computed against the running batch's resident adapters.
+    fn num_lora_skipped(&self) -> u64 {
+        self.waiting.iter().filter(|r| !self.lora_admits(r)).count() as u64
     }
 
     /// Admit waiting requests into the running batch (in policy order) until the seq cap
@@ -690,10 +1001,21 @@ impl Engine {
         let threshold = self.opt.long_prefill_token_threshold as usize;
         let mut demand = self.scheduled_token_demand();
 
-        while self.active_requests.len() < self.running_capacity() && demand < budget {
-            let Some(request) = self.pop_next_waiting() else {
+        // The `demand < budget` check admits the last request even when its prefill chunk
+        // would overshoot. This matches vLLM's chunked-prefill semantics: vLLM admits that
+        // request too and simply shrinks its chunk to the remaining budget. The admission
+        // COUNT is identical; only per-step token accounting differs.
+        while self.active_requests.len() + self.pending_pulls.len() < self.running_capacity()
+            && demand < budget
+        {
+            // Next admissible request in policy order, skipping any the LoRA slot cap blocks.
+            let Some(idx) = self.next_admissible_index() else {
                 break;
             };
+            let request = self
+                .waiting
+                .remove(idx)
+                .expect("index from next_admissible_index is valid");
             // The token demand this request adds once admitted (it starts by prefilling).
             let prompt_len = request
                 .prompt_token_ids
@@ -800,7 +1122,12 @@ impl Engine {
                 num_tokens,
                 block_ids: &block_ids,
             };
-            match self.data_plane.advertise_prefilled(kv) {
+            // Advertise is a memset, lock inline (fast and uncontended, see data_plane doc).
+            let adv_result = match self.data_plane.lock() {
+                Ok(mut plane) => plane.advertise_prefilled(kv),
+                Err(poisoned) => poisoned.into_inner().advertise_prefilled(kv),
+            };
+            match adv_result {
                 Ok(remote) => {
                     if let Some((outs, _)) = by_client.get_mut(&client_index)
                         && let Some(out) = outs.iter_mut().find(|o| o.request_id == request_id)
@@ -850,9 +1177,14 @@ impl Engine {
     /// does `inc_by` on them), so each snapshot drains them.
     fn scheduler_stats(&mut self) -> SchedulerStats {
         let prefix = self.pool.take_stats();
+        let (running_lora_adapters, waiting_lora_adapters) = self.lora_counts();
+        // Pending pulls count as running: the request has left the waiting queue, holds pinned
+        // blocks, and occupies a batch slot. This matches vLLM's WAITING_FOR_REMOTE_KVS
+        // accounting, which is grouped under num_running_reqs in the stats surface.
         SchedulerStats {
-            num_running_reqs: self.active_requests.len() as u64,
+            num_running_reqs: (self.active_requests.len() + self.pending_pulls.len()) as u64,
             num_waiting_reqs: self.waiting.len() as u64,
+            num_skipped_waiting_reqs: self.num_lora_skipped(),
             kv_cache_usage: self.pool.usage(),
             prefix_cache_stats: PrefixCacheStats {
                 base: BaseCacheStats {
@@ -863,6 +1195,8 @@ impl Engine {
                 },
                 ..Default::default()
             },
+            running_lora_adapters,
+            waiting_lora_adapters,
             ..Default::default()
         }
     }
@@ -887,16 +1221,19 @@ pub(crate) async fn run_engine_loop(
     shutdown: CancellationToken,
 ) -> Result<()> {
     let role = opt.pd_role;
+    // Offset the side-channel port by engine index, matching the kv-events endpoint offset,
+    // so multiple engines in one process bind distinct ports.
     let cfg = NixlConfig {
         kv_block_bytes: opt.kv_block_bytes,
         tokens_per_block: opt.tokens_per_block,
         kv_cache_blocks: opt.kv_cache_size as usize,
         engine_id: opt.engine_id.clone(),
         side_channel_host: opt.side_channel_host.clone(),
-        side_channel_port: opt.side_channel_port,
+        side_channel_port: opt.side_channel_port + engine_index,
     };
     let latency = opt.latency_model();
     let opt_seed = opt.seed;
+    let max_loras = opt.max_loras as usize;
     let pool = BlockPool::new(
         opt.tokens_per_block,
         opt.kv_cache_size as usize,
@@ -908,18 +1245,23 @@ pub(crate) async fn run_engine_loop(
             warn!(%error, "kv-event publisher failed to start; continuing without events");
             None
         });
+    let (pull_completion_tx, pull_completion_rx) = mpsc::unbounded_channel();
     let mut engine = Engine {
         engine_index,
         opt,
         latency,
-        data_plane: make_data_plane(role, cfg),
+        data_plane: Arc::new(StdMutex::new(make_data_plane(role, cfg))),
         pool,
         events,
         failure_rng: StdRng::seed_from_u64(
             opt_seed ^ (engine_index as u64).wrapping_mul(0x9e3779b9),
         ),
+        loras: LoraRegistry::new(max_loras),
         active_requests: HashMap::new(),
         waiting: VecDeque::new(),
+        pending_pulls: HashMap::new(),
+        pull_completion_tx,
+        pull_completion_rx,
     };
 
     loop {
@@ -932,6 +1274,10 @@ pub(crate) async fn run_engine_loop(
             input = input_rx.recv() => {
                 let input = input.ok_or_else(|| anyhow!("engine input channel closed"))?;
                 engine.handle_input(input)?
+            }
+
+            Some((request_id, result)) = engine.pull_completion_rx.recv() => {
+                engine.finish_pull(request_id, result)
             }
 
             _ = async { sleep_until(next_deadline.unwrap_or_else(Instant::now)).await },
@@ -982,15 +1328,20 @@ mod tests {
             opt.kv_cache_size as usize,
             opt.kv_cache_none_seed,
         );
+        let (pull_completion_tx, pull_completion_rx) = mpsc::unbounded_channel();
         Engine {
             engine_index: 0,
             latency: opt.latency_model(),
-            data_plane: make_data_plane(PdRole::Both, cfg),
+            data_plane: Arc::new(StdMutex::new(make_data_plane(PdRole::Both, cfg))),
             pool,
             events: None,
             failure_rng: StdRng::seed_from_u64(opt.seed),
+            loras: LoraRegistry::new(opt.max_loras as usize),
             active_requests: HashMap::new(),
             waiting: VecDeque::new(),
+            pending_pulls: HashMap::new(),
+            pull_completion_tx,
+            pull_completion_rx,
             opt,
         }
     }
@@ -1007,17 +1358,40 @@ mod tests {
         }
     }
 
+    /// Apply pull completions until no pulls are pending. Every spawned pull thread sends
+    /// exactly one completion and the engine holds a sender (the channel can't close), so
+    /// blocking on the channel is deterministic, no sleeps needed. A no-op for requests
+    /// without remote KV. Stray completions for already-aborted requests are consumed along
+    /// the way (finish_pull drops them).
+    fn settle_pulls(engine: &mut Engine) -> Vec<EngineOutput> {
+        let mut outputs = Vec::new();
+        while !engine.pending_pulls.is_empty() {
+            let (request_id, result) = engine
+                .pull_completion_rx
+                .blocking_recv()
+                .expect("engine holds a completion sender");
+            outputs.extend(engine.finish_pull(request_id, result));
+        }
+        outputs
+    }
+
     fn add(engine: &mut Engine, req: EngineCoreRequest) {
         engine
             .handle_input(EngineInput::Request(Box::new(req)))
             .expect("handle_input");
+        settle_pulls(engine);
     }
 
     /// Drain steps until the engine is idle, returning the flat output list. Safe only when
     /// the latency model is instant (deadlines never in the future), as in these tests.
     fn drain(engine: &mut Engine) -> Vec<EngineCoreOutput> {
         let mut all = Vec::new();
-        while !engine.active_requests.is_empty() {
+        while !engine.active_requests.is_empty() || !engine.pending_pulls.is_empty() {
+            for out in settle_pulls(engine) {
+                all.extend(out.outputs.outputs);
+            }
+            // settle_pulls emptied pending_pulls, so the batch is non-empty whenever the
+            // loop condition held: an empty batch here means a stall.
             let batch = engine.step();
             assert!(
                 !batch.is_empty(),
@@ -1172,6 +1546,83 @@ mod tests {
     }
 
     #[test]
+    fn cache_salt_isolates_otherwise_identical_prompts() {
+        let mut opt = test_opt();
+        opt.tokens_per_block = 4; // 8-token prompt = 2 full blocks
+        let mut engine = test_engine(opt);
+
+        let salted = |id: &str, salt: &str| EngineCoreRequest {
+            cache_salt: Some(salt.to_string()),
+            ..request(id, 8, 1)
+        };
+
+        // r1 warms the cache under salt "a".
+        add(&mut engine, salted("r1", "a"));
+        let _ = drain(&mut engine);
+
+        // Same prompt under a different salt must recompute, not hit r1's blocks.
+        add(&mut engine, salted("r2", "b"));
+        let s2 = drain(&mut engine)
+            .iter()
+            .find_map(|o| o.prefill_stats.as_ref().cloned())
+            .expect("prefill stats");
+        assert_eq!(
+            s2.num_local_cached_tokens, 0,
+            "different salt -> no prefix hit"
+        );
+        assert_eq!(s2.num_computed_tokens, 8);
+
+        // Same prompt under the same salt "a" hits fully.
+        add(&mut engine, salted("r3", "a"));
+        let s3 = drain(&mut engine)
+            .iter()
+            .find_map(|o| o.prefill_stats.as_ref().cloned())
+            .expect("prefill stats");
+        assert_eq!(s3.num_local_cached_tokens, 8, "same salt -> full hit");
+    }
+
+    #[test]
+    fn lora_isolates_prefix_cache_across_adapters() {
+        let mut opt = test_opt();
+        opt.tokens_per_block = 4; // 8-token prompt = 2 full blocks
+        let mut engine = test_engine(opt);
+
+        // request() builds an all-zero 8-token prompt; only the adapter differs. max_tokens 1
+        // so each finishes in one step.
+        let with_lora = |id: &str, name: &str| EngineCoreRequest {
+            lora_request: Some(LoraRequest::new(
+                name.to_string(),
+                1,
+                format!("/loras/{name}"),
+                false,
+                false,
+            )),
+            ..request(id, 8, 1)
+        };
+
+        // r1 (adapter A) warms the cache; a different adapter must recompute, not hit A's blocks.
+        add(&mut engine, with_lora("r1", "A"));
+        let _ = drain(&mut engine);
+        add(&mut engine, with_lora("r2", "B"));
+        let s2 = drain(&mut engine)
+            .iter()
+            .find_map(|o| o.prefill_stats.as_ref().cloned())
+            .expect("prefill stats");
+        assert_eq!(
+            s2.num_local_cached_tokens, 0,
+            "different adapter -> no prefix hit"
+        );
+
+        // Same adapter A, same prompt -> full hit.
+        add(&mut engine, with_lora("r3", "A"));
+        let s3 = drain(&mut engine)
+            .iter()
+            .find_map(|o| o.prefill_stats.as_ref().cloned())
+            .expect("prefill stats");
+        assert_eq!(s3.num_local_cached_tokens, 8, "same adapter -> full hit");
+    }
+
+    #[test]
     fn scheduler_stats_carry_prefix_cache_counters() {
         let mut opt = test_opt();
         opt.tokens_per_block = 4;
@@ -1237,16 +1688,21 @@ mod tests {
     }
 
     fn submit(engine: &mut Engine, req: EngineCoreRequest) -> Vec<EngineOutput> {
-        engine
+        let mut out = engine
             .handle_input(EngineInput::Request(Box::new(req)))
-            .expect("handle_input")
+            .expect("handle_input");
+        out.extend(settle_pulls(engine));
+        out
     }
 
     fn abort(engine: &mut Engine, ids: &[&str]) -> Vec<EngineOutput> {
         let ids = ids.iter().map(|s| s.to_string()).collect();
-        engine
+        let mut out = engine
             .handle_input(EngineInput::Abort(ids))
-            .expect("handle_input")
+            .expect("handle_input");
+        // Aborting may free batch slots and admit queued remote-KV requests; settle their pulls.
+        out.extend(settle_pulls(engine));
+        out
     }
 
     /// The finish reason on a single-output engine batch (used to inspect rejections/aborts).
@@ -1380,6 +1836,313 @@ mod tests {
         engine.step();
         assert!(engine.active_requests.len() > 2);
         assert!(engine.waiting.len() < 3);
+    }
+
+    /// Build a request bound to a LoRA adapter (as the frontend would after the model name
+    /// resolved to a loaded adapter).
+    fn lora_request(id: &str, lora_name: &str, lora_int_id: u64) -> EngineCoreRequest {
+        EngineCoreRequest {
+            lora_request: Some(LoraRequest::new(
+                lora_name.to_string(),
+                lora_int_id,
+                format!("/loras/{lora_name}"),
+                false,
+                false,
+            )),
+            ..request(id, 4, 50)
+        }
+    }
+
+    /// Send a utility call and decode its typed result, the way the frontend's client does.
+    fn call_utility<T: serde::de::DeserializeOwned, A: serde::Serialize + std::fmt::Debug>(
+        engine: &mut Engine,
+        method: &str,
+        args: A,
+    ) -> T {
+        let request = EngineCoreUtilityRequest::new(0, 1, method, args).expect("build utility");
+        let mut out = engine
+            .handle_input(EngineInput::Utility(request))
+            .expect("handle_input");
+        out.remove(0)
+            .outputs
+            .utility_output
+            .expect("utility output")
+            .into_typed_result::<T>(method)
+            .expect("typed result")
+    }
+
+    #[test]
+    fn add_and_remove_lora_utilities_report_bool() {
+        let mut engine = test_engine(test_opt());
+        let lora = LoraRequest::new(
+            "adapterA".to_string(),
+            7,
+            "/loras/a".to_string(),
+            false,
+            false,
+        );
+        assert!(call_utility::<bool, _>(&mut engine, "add_lora", (lora,)));
+        // First remove finds it; second reports it gone.
+        assert!(call_utility::<bool, _>(&mut engine, "remove_lora", (7u64,)));
+        assert!(!call_utility::<bool, _>(
+            &mut engine,
+            "remove_lora",
+            (7u64,)
+        ));
+    }
+
+    #[test]
+    fn running_request_counts_into_lora_adapters() {
+        let mut engine = test_engine(test_opt());
+        add(&mut engine, lora_request("r1", "adapterA", 1));
+        let stats = engine.scheduler_stats();
+        assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
+        assert!(stats.waiting_lora_adapters.is_empty());
+        // A base-model request adds nothing to the adapter maps.
+        add(&mut engine, request("base", 4, 50));
+        let stats = engine.scheduler_stats();
+        assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
+        assert_eq!(stats.running_lora_adapters.len(), 1);
+    }
+
+    #[test]
+    fn waiting_requests_count_into_waiting_lora_adapters() {
+        let mut opt = test_opt();
+        opt.max_num_seqs = 1; // one slot, so the rest queue behind it
+        let mut engine = test_engine(opt);
+
+        add(&mut engine, lora_request("run", "adapterA", 1));
+        add(&mut engine, lora_request("wait1", "adapterB", 2));
+        add(&mut engine, lora_request("wait2", "adapterB", 2));
+        let stats = engine.scheduler_stats();
+        assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
+        assert_eq!(
+            stats.waiting_lora_adapters.get("adapterB"),
+            Some(&2),
+            "both queued requests for adapterB counted"
+        );
+    }
+
+    #[test]
+    fn max_loras_blocks_a_new_adapter_until_a_slot_frees() {
+        let mut opt = test_opt();
+        opt.max_loras = 1; // only one distinct adapter may run at a time
+        opt.max_num_seqs = 8; // seq slots are not the binding limit here
+        let mut engine = test_engine(opt);
+
+        // adapterA takes the single LoRA slot; adapterB can't be admitted and waits, even
+        // though seq slots are free.
+        add(&mut engine, lora_request("a", "adapterA", 1));
+        add(&mut engine, lora_request("b", "adapterB", 2));
+        assert_eq!(engine.active_requests.len(), 1);
+        assert!(engine.active_requests.contains_key("a"));
+        assert_eq!(engine.waiting.len(), 1);
+
+        // The blocked adapterB request surfaces as skipped, not just waiting.
+        assert_eq!(engine.scheduler_stats().num_skipped_waiting_reqs, 1);
+
+        // A second adapterA request shares the resident slot, so it's admitted even though it
+        // arrived behind the blocked adapterB request (skip-and-continue, not head-of-line).
+        add(&mut engine, lora_request("a2", "adapterA", 1));
+        assert!(
+            engine.active_requests.contains_key("a2"),
+            "same adapter needs no new slot, skips past the blocked one"
+        );
+        assert!(
+            engine.waiting.iter().any(|r| r.request_id == "b"),
+            "adapterB still waits"
+        );
+    }
+
+    #[test]
+    fn max_loras_zero_never_blocks_on_adapter_diversity() {
+        let mut opt = test_opt();
+        opt.max_loras = 0; // cap disabled
+        opt.max_num_seqs = 8;
+        let mut engine = test_engine(opt);
+
+        add(&mut engine, lora_request("a", "adapterA", 1));
+        add(&mut engine, lora_request("b", "adapterB", 2));
+        add(&mut engine, lora_request("c", "adapterC", 3));
+        assert_eq!(engine.active_requests.len(), 3, "all distinct adapters run");
+        assert!(engine.waiting.is_empty());
+    }
+
+    #[test]
+    fn reset_prefix_cache_refused_while_requests_running() {
+        let mut opt = test_opt();
+        opt.tokens_per_block = 4; // 8-token prompt = 2 full blocks
+        let mut engine = test_engine(opt);
+
+        // Submit a long-running request so the engine is busy.
+        submit(&mut engine, request("busy", 8, 100));
+        assert_eq!(engine.active_requests.len(), 1);
+
+        // Attempting to reset while busy must return false.
+        let ok: bool = call_utility(&mut engine, "reset_prefix_cache", ());
+        assert!(!ok, "reset must be refused while requests are running");
+
+        // The cache must survive: an identical prompt should still get a full prefix hit.
+        // (The busy request still holds pins, but a second request sharing the same prompt
+        // also gets hits on the already-cached blocks.)
+        submit(&mut engine, request("r2", 8, 1));
+        let r2_stats = drain(&mut engine)
+            .iter()
+            .find(|o| o.request_id == "r2")
+            .and_then(|o| o.prefill_stats.as_ref().cloned())
+            .expect("prefill stats for r2");
+        assert_eq!(
+            r2_stats.num_local_cached_tokens, 8,
+            "cache survived the refused reset"
+        );
+    }
+
+    #[test]
+    fn reset_prefix_cache_succeeds_when_idle() {
+        let mut opt = test_opt();
+        opt.tokens_per_block = 4;
+        let mut engine = test_engine(opt);
+
+        // Warm the cache, then drain so the engine is idle.
+        add(&mut engine, request("warm", 8, 1));
+        let _ = drain(&mut engine);
+        assert!(engine.active_requests.is_empty());
+
+        // Reset should succeed and return true.
+        let ok: bool = call_utility(&mut engine, "reset_prefix_cache", ());
+        assert!(ok, "reset must succeed when no requests are running");
+
+        // The same prompt should now be a complete miss (cache was cleared).
+        add(&mut engine, request("cold", 8, 1));
+        let cold_stats = drain(&mut engine)
+            .iter()
+            .find_map(|o| o.prefill_stats.as_ref().cloned())
+            .expect("prefill stats");
+        assert_eq!(
+            cold_stats.num_local_cached_tokens, 0,
+            "cache was cleared by the reset"
+        );
+    }
+
+    /// Build a do_remote_prefill request (decode side pulling from a remote prefill).
+    fn remote_prefill_request(id: &str, prompt_len: usize, max_tokens: u32) -> EngineCoreRequest {
+        let mut req = request(id, prompt_len, max_tokens);
+        let mut extra = HashMap::new();
+        extra.insert(
+            "kv_transfer_params".to_string(),
+            serde_json::json!({
+                "do_remote_prefill": true,
+                "remote_engine_id": "prefill-0",
+                "remote_host": "127.0.0.1",
+                "remote_port": 9999,
+                "remote_block_ids": [0, 1],
+                "remote_request_id": "prefill-req-1"
+            }),
+        );
+        req.sampling_params.as_mut().unwrap().extra_args = Some(extra);
+        req
+    }
+
+    #[test]
+    fn pending_pull_abort_unpins_blocks_and_emits_abort() {
+        let mut opt = test_opt();
+        opt.tokens_per_block = 4; // 8-token prompt = 2 blocks
+        let mut engine = test_engine(opt);
+
+        // Submit a do_remote_prefill request. Don't drain completions yet, so it
+        // stays in pending_pulls (the noop pull thread may or may not have finished,
+        // but either way, the abort must be safe).
+        let req = remote_prefill_request("rpull", 8, 5);
+        engine
+            .handle_input(EngineInput::Request(Box::new(req)))
+            .expect("handle_input");
+
+        // The request sits in pending_pulls (it has a remote KV descriptor) and its blocks
+        // are pinned. We deliberately do NOT apply the completion before aborting.
+        assert!(engine.pending_pulls.contains_key("rpull"));
+        assert!(
+            engine.pool.usage() > 0.0,
+            "pending-pull request pins its blocks"
+        );
+
+        // Abort the request while it is pending (or already completed but not drained).
+        let abort_out = engine
+            .handle_input(EngineInput::Abort(vec!["rpull".to_string()]))
+            .expect("handle_input");
+
+        // The abort output must carry the abort finish reason.
+        let has_abort = abort_out.iter().any(|o| {
+            o.outputs
+                .outputs
+                .iter()
+                .any(|out| out.finish_reason == Some(EngineCoreFinishReason::Abort))
+        });
+        assert!(
+            has_abort,
+            "abort output must be emitted for pending-pull request"
+        );
+
+        // The request must not be in pending_pulls or active_requests.
+        assert!(!engine.pending_pulls.contains_key("rpull"));
+        assert!(!engine.active_requests.contains_key("rpull"));
+
+        // Blocks must be unpinned: pool usage should be back to 0 (blocks are cached
+        // but unpinned, so usage is 0).
+        assert_eq!(
+            engine.pool.usage(),
+            0.0,
+            "blocks must be unpinned after abort"
+        );
+
+        // The pull thread still sends its completion; receive it deterministically and
+        // verify finish_pull drops the orphan (request already gone) without outputs.
+        let (orphan_id, orphan_result) = engine
+            .pull_completion_rx
+            .blocking_recv()
+            .expect("pull thread always sends a completion");
+        assert_eq!(orphan_id, "rpull");
+        let orphan_outputs = engine.finish_pull(orphan_id, orphan_result);
+        assert!(
+            orphan_outputs.is_empty(),
+            "orphaned pull completion must not produce outputs for aborted request"
+        );
+
+        // Verify the same prompt can be submitted again (blocks are reusable).
+        add(&mut engine, request("fresh", 8, 2));
+        assert!(engine.active_requests.contains_key("fresh"));
+        let outputs = drain(&mut engine);
+        assert!(
+            outputs.iter().any(|o| o.finished()),
+            "fresh request completes"
+        );
+    }
+
+    #[test]
+    fn reset_prefix_cache_refused_while_pending_pulls_exist() {
+        let mut opt = test_opt();
+        opt.tokens_per_block = 4;
+        let mut engine = test_engine(opt);
+
+        // Submit a do_remote_prefill request, don't drain completions.
+        let req = remote_prefill_request("rpull", 8, 5);
+        engine
+            .handle_input(EngineInput::Request(Box::new(req)))
+            .expect("handle_input");
+
+        // No active_requests yet, but the pending pull holds pins, so reset must be refused.
+        // (The completion may already sit on the channel; it is not applied until settled.)
+        assert!(!engine.pending_pulls.is_empty());
+        let ok: bool = call_utility(&mut engine, "reset_prefix_cache", ());
+        assert!(
+            !ok,
+            "reset must be refused while pending pulls or active requests exist"
+        );
+
+        // Once the pull settles and the request runs to completion, reset succeeds.
+        settle_pulls(&mut engine);
+        let _ = drain(&mut engine);
+        let ok: bool = call_utility(&mut engine, "reset_prefix_cache", ());
+        assert!(ok, "reset succeeds once nothing holds pins");
     }
 
     #[test]

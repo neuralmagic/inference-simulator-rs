@@ -116,7 +116,7 @@ impl LatencyModel {
     }
 }
 
-/// Apply the load factor to a millisecond mean, rounding to the nearest millisecond.
+/// Apply the load factor to a millisecond mean, truncating toward zero.
 fn scale(millis: u64, load: f64) -> u64 {
     (millis as f64 * load) as u64
 }

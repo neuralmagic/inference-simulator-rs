@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
                 parent_hash: None,
                 token_ids: token_ids.clone(),
                 block_size: BLOCK_SIZE,
+                lora_name: None,
             },
             KvCacheEvent::Removed {
                 block_hashes: vec![0xAA00 + ticks],

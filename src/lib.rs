@@ -27,6 +27,7 @@ mod engine;
 mod io;
 pub mod kvevents;
 pub mod latency;
+pub mod lora;
 
 use dataplane::PdRole;
 use latency::LatencyModel;
@@ -201,6 +202,14 @@ pub struct Opt {
     /// KV-cache capacity in blocks, used to report `vllm:kv_cache_usage_perc`.
     #[arg(long, default_value_t = 1024)]
     pub kv_cache_size: u64,
+
+    /// Maximum distinct LoRA adapters allowed in the running batch at once (vLLM
+    /// `--max-loras`). A request needing an adapter not already resident waits once the batch
+    /// holds this many distinct adapters. `0` (default) disables the cap; adapter accounting
+    /// (the `running_lora_adapters`/`waiting_lora_adapters` stats behind
+    /// `vllm:lora_requests_info`) is always on regardless.
+    #[arg(long, default_value_t = 0)]
+    pub max_loras: u64,
 
     // === KV-cache events (vLLM `--kv-events-config`) ===
     /// Publish KV-cache events (BlockStored/BlockRemoved/AllBlocksCleared) over ZMQ so the

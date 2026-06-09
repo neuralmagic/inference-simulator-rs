@@ -500,6 +500,9 @@ mod nixl {
 
             // Land the bytes in a fresh, registered contiguous buffer, one local descriptor
             // per block so the desc lists line up (matching count + sizes).
+            // Deregistration is automatic: SystemStorage owns a RegistrationHandle whose
+            // Drop impl calls nixl_capi_deregister_mem, so the registration is released
+            // when `dst` goes out of scope at the end of this function.
             let opt = self.opt_args()?;
             let mut dst = SystemStorage::new(total).map_err(ne)?;
             dst.register(&self.agent, Some(&opt)).map_err(ne)?;

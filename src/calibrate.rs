@@ -788,7 +788,15 @@ fn request_total_report(
         for _ in 0..reps {
             let mut pacing = DecodePacing::default();
             let total_ms: f64 = (0..n_gaps)
-                .map(|_| {
+                .map(|i| {
+                    // Model-level calibration has no scheduler to generate prefill
+                    // interference, so replay the record's own recorded event
+                    // sequence: stall exactly where the source stalled.
+                    if let Some(ctx) = &r.itl_ctx
+                        && ctx.prefill_tokens[i] > 0
+                    {
+                        pacing.note_prefill(ctx.prefill_tokens[i]);
+                    }
                     model
                         .paced_inter_token_delay(&mut rng, r.concurrency, &mut pacing)
                         .as_secs_f64()

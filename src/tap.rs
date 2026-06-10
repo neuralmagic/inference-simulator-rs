@@ -53,6 +53,9 @@ use crate::trace::{ItlContext, TraceMeta, TraceRecord, append_record};
 struct RequestState {
     arrival: Instant,
     prompt_tokens: usize,
+    /// `do_remote_prefill` request (P/D decode side): its first output reflects a
+    /// KV pull, not local prefill compute, so it never counts as interference.
+    remote_prefill: bool,
     /// Last output instant (for ITL computation).
     last_output: Option<Instant>,
     /// Accumulated output token count.
@@ -359,10 +362,17 @@ fn observe_request<F: AsRef<[u8]>>(
                 Ok(req) => {
                     let prompt_tokens = req.prompt_token_ids.as_ref().map(Vec::len).unwrap_or(0);
                     let concurrency = (requests.len() as u64) + 1;
+                    // P/D decode side: this request's prefill ran on another node,
+                    // so its first output here is a KV-pull completion, not local
+                    // prefill compute, and must not count as batch interference.
+                    let remote_prefill = crate::engine::extract_kv_params(&req)
+                        .map(|kv| crate::engine::kv_flag(&kv, "do_remote_prefill"))
+                        .unwrap_or(false);
                     debug!(
                         request_id = %req.request_id,
                         prompt_tokens,
                         concurrency,
+                        remote_prefill,
                         "tap: observed Add request"
                     );
                     requests.insert(
@@ -370,6 +380,7 @@ fn observe_request<F: AsRef<[u8]>>(
                         RequestState {
                             arrival,
                             prompt_tokens,
+                            remote_prefill,
                             last_output: None,
                             output_tokens: 0,
                             ttft_ms: None,
@@ -436,7 +447,7 @@ fn observe_output<W: Write, F: AsRef<[u8]>>(
         .iter()
         .filter(|o| !o.new_token_ids.is_empty())
         .filter_map(|o| requests.get(&o.request_id))
-        .filter(|s| s.ttft_ms.is_none())
+        .filter(|s| s.ttft_ms.is_none() && !s.remote_prefill)
         .map(|s| s.prompt_tokens as u32)
         .sum();
 

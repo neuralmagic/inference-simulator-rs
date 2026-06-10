@@ -169,7 +169,7 @@ fn utility_response(
 /// (mirroring Python vLLM), so that is where the P/D intent (`do_remote_prefill` /
 /// `do_remote_decode` / `remote_*`) arrives. In real vLLM the produce/consume logic
 /// lives in the NixlConnector inside the engine; here our data plane plays that role.
-fn extract_kv_params(request: &EngineCoreRequest) -> Option<JsonValue> {
+pub(crate) fn extract_kv_params(request: &EngineCoreRequest) -> Option<JsonValue> {
     request
         .sampling_params
         .as_ref()?
@@ -180,7 +180,7 @@ fn extract_kv_params(request: &EngineCoreRequest) -> Option<JsonValue> {
 }
 
 /// Read a boolean flag out of a `kv_transfer_params` object.
-fn kv_flag(kv: &JsonValue, key: &str) -> bool {
+pub(crate) fn kv_flag(kv: &JsonValue, key: &str) -> bool {
     kv.get(key).and_then(JsonValue::as_bool).unwrap_or(false)
 }
 
@@ -891,6 +891,21 @@ impl SimEngine {
             block_ids.clone(),
         ) {
             Ok(active) => {
+                // This admission starts a prefill that will interfere with the
+                // requests already decoding: note it on their pacing state so
+                // their next gap draws from the stall distribution. Remote-prefill
+                // requests (P/D decode side) burned their prefill on another node
+                // and merely join the batch, so they interfere with nothing.
+                let prefill_tokens = if active.remote_prefill {
+                    0
+                } else {
+                    active.prompt_len.saturating_sub(num_local_cached) as u32
+                };
+                if prefill_tokens > 0 {
+                    for running in self.active_requests.values_mut() {
+                        running.pacing.note_prefill(prefill_tokens);
+                    }
+                }
                 self.active_requests.insert(request_id, active);
                 None
             }

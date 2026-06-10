@@ -40,12 +40,27 @@ pub struct FirstTokenCtx {
 pub struct DecodePacing {
     /// Chosen donor index per concurrency bucket, lazily picked on first use.
     donors: [Option<u32>; NUM_CONCURRENCY_BUCKETS],
+    /// Prefill interference noted by the engine since this request's last gap
+    /// draw: prompt tokens of a request admitted to prefill. Consumed by the
+    /// next draw, which samples the stall distribution instead of the clean one.
+    pending_stall: Option<u32>,
+}
+
+impl DecodePacing {
+    /// Note that the engine admitted a prefill of `prompt_tokens` while this
+    /// request decodes. A real prefill blocks one engine step, spiking exactly
+    /// one gap per concurrent decode request, so the flag is consumed by a
+    /// single draw. Multiple admissions before the next draw keep the largest.
+    pub fn note_prefill(&mut self, prompt_tokens: u32) {
+        self.pending_stall = Some(self.pending_stall.unwrap_or(0).max(prompt_tokens));
+    }
 }
 
 impl Default for DecodePacing {
     fn default() -> Self {
         Self {
             donors: [None; NUM_CONCURRENCY_BUCKETS],
+            pending_stall: None,
         }
     }
 }
@@ -296,7 +311,13 @@ pub struct TraceLatency {
     /// Pooled ITL samples per concurrency bucket (union over all prompt buckets).
     itl_by_concurrency: Vec<Vec<f64>>,
     /// Per-request donor pools per concurrency bucket, for hierarchical pacing.
+    /// When the trace carries `itl_ctx`, donors hold only CLEAN gaps (no prefill
+    /// in the step); prefill-interfered gaps go to `stalls_by_concurrency`.
     donors_by_concurrency: Vec<DonorBucket>,
+    /// Sorted prefill-interfered gap samples per concurrency bucket, drawn when
+    /// the engine notes a prefill admission on the request's pacing state. Empty
+    /// for traces without `itl_ctx`.
+    stalls_by_concurrency: Vec<Vec<f64>>,
     /// Fallback for do_remote_prefill KV-transfer timing (the trace does not record
     /// transfer latencies from disaggregated decode pulls).
     kv_transfer_fallback: KnobLatency,
@@ -318,6 +339,7 @@ impl TraceLatency {
 
         let mut grid = vec![vec![Cell::default(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
         let mut donors_by_concurrency = vec![DonorBucket::default(); NUM_CONCURRENCY_BUCKETS];
+        let mut stalls_by_concurrency = vec![Vec::new(); NUM_CONCURRENCY_BUCKETS];
 
         for record in records {
             let uncached = record.prompt_tokens.saturating_sub(record.cached_tokens);
@@ -328,13 +350,27 @@ impl TraceLatency {
             cell.ttft_samples.push(record.ttft_ms);
 
             // Expand ITL: prefer the array, fall back to the summary. Each record
-            // also becomes a pacing donor weighted by its token count.
+            // also becomes a pacing donor weighted by its token count. With per-gap
+            // context, prefill-interfered gaps leave the donor pool and feed the
+            // stall distribution instead, so replay re-adds them only when the
+            // simulated scheduler actually creates the interference.
             if let Some(itls) = &record.itl_ms {
                 if !itls.is_empty() {
                     cell.itl_samples.extend(itls.iter().copied());
-                    let mut gaps = itls.clone();
-                    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    donors_by_concurrency[cb].push(Donor { gaps }, itls.len() as f64);
+                    let mut gaps: Vec<f64> = match &record.itl_ctx {
+                        Some(ctx) => {
+                            let (stalled, clean): (Vec<usize>, Vec<usize>) =
+                                (0..itls.len()).partition(|&i| ctx.prefill_tokens[i] > 0);
+                            stalls_by_concurrency[cb].extend(stalled.iter().map(|&i| itls[i]));
+                            clean.iter().map(|&i| itls[i]).collect()
+                        }
+                        None => itls.clone(),
+                    };
+                    if !gaps.is_empty() {
+                        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let weight = gaps.len() as f64;
+                        donors_by_concurrency[cb].push(Donor { gaps }, weight);
+                    }
                 }
             } else if let Some(summary) = &record.itl_summary
                 && summary.count > 0
@@ -349,6 +385,9 @@ impl TraceLatency {
                     summary.count as f64,
                 );
             }
+        }
+        for stalls in &mut stalls_by_concurrency {
+            stalls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         }
 
         // Sort TTFT samples for inverse-CDF sampling.
@@ -385,6 +424,7 @@ impl TraceLatency {
             grid,
             itl_by_concurrency,
             donors_by_concurrency,
+            stalls_by_concurrency,
             kv_transfer_fallback,
             meta,
         })
@@ -520,6 +560,18 @@ impl LatencyModel for TraceLatency {
         pacing: &mut DecodePacing,
     ) -> Duration {
         let cb = concurrency_bucket(num_running);
+
+        // A prefill admission noted by the engine spikes exactly one gap: draw it
+        // from the recorded prefill-interfered distribution when the trace has one.
+        // Without itl_ctx data the flag falls through to the clean path, whose
+        // donor gaps still contain the stalls (they were never separated out).
+        if pacing.pending_stall.take().is_some()
+            && let Some(stalls) = nearest_itl(&self.stalls_by_concurrency, cb)
+        {
+            let ms = sample_inverse_cdf(rng, stalls);
+            return Duration::from_secs_f64(ms / 1000.0);
+        }
+
         // The resolved bucket is deterministic for a given cb, so the cached donor
         // index below always refers to the same bucket's pool.
         let Some(bucket_idx) = nearest_donor_bucket(&self.donors_by_concurrency, cb) else {
@@ -860,6 +912,58 @@ mod tests {
             let itl = trace.inter_token_delay(&mut rng, 1);
             assert_eq!(itl, std::time::Duration::from_secs_f64(0.009));
         }
+    }
+
+    #[test]
+    fn stall_conditioning_draws_from_interfered_gaps_once() {
+        // One source request whose trace marks gaps 3 and 7 as prefill-interfered
+        // (150ms) among clean 10ms gaps.
+        let gaps = vec![10.0, 10.0, 10.0, 150.0, 10.0, 10.0, 10.0, 150.0, 10.0];
+        let prefill = vec![0u32, 0, 0, 800, 0, 0, 0, 800, 0];
+        let records = vec![TraceRecord {
+            prompt_tokens: 100,
+            cached_tokens: 0,
+            output_tokens: 10,
+            ttft_ms: 40.0,
+            itl_ms: Some(gaps),
+            itl_summary: None,
+            concurrency: 4,
+            arrival_ms: None,
+            itl_ctx: Some(crate::trace::ItlContext {
+                num_running: vec![4; 9],
+                prefill_tokens: prefill,
+            }),
+        }];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let mut pacing = DecodePacing::default();
+
+        let draw = |rng: &mut rand::rngs::StdRng, pacing: &mut DecodePacing| -> f64 {
+            trace.paced_inter_token_delay(rng, 4, pacing).as_secs_f64() * 1000.0
+        };
+
+        // Clean draws never produce stall gaps: those left the donor pool.
+        for _ in 0..30 {
+            let ms = draw(&mut rng, &mut pacing);
+            assert!(
+                (ms - 10.0).abs() < 1e-9,
+                "clean draw should be 10ms, got {ms}"
+            );
+        }
+
+        // A noted prefill spikes exactly the next draw, then the flag is spent.
+        pacing.note_prefill(800);
+        let stalled = draw(&mut rng, &mut pacing);
+        assert!(
+            (stalled - 150.0).abs() < 1e-9,
+            "stall draw should come from interfered gaps, got {stalled}"
+        );
+        let after = draw(&mut rng, &mut pacing);
+        assert!(
+            (after - 10.0).abs() < 1e-9,
+            "flag must be consumed, got {after}"
+        );
     }
 
     #[test]

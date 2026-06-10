@@ -39,8 +39,12 @@ use crate::tokens::{RandomTokens, TokenCtx, TokenSource};
 use crate::{Opt, SchedulingPolicy};
 
 /// Per-step token demand of a single prefilling request: a (possibly chunked) slice of its
-/// prompt, capped by the chunked-prefill threshold and the overall token budget. At least 1
-/// so a request always makes progress.
+/// prompt, capped by the chunked-prefill threshold and the overall token budget, then halved
+/// to model vLLM's chunk packing: the tail chunk of one prefill shares a step's budget with
+/// the head chunk of the next, so roughly two partial prefills are in flight at the rate the
+/// budget sustains. Without the halving, one budget-sized prefill serializes all admissions
+/// behind its whole park and the simulated queue grows ~10x past the real engine's (H200
+/// counterfactual validation). At least 1 so a request always makes progress.
 fn prefill_token_demand(
     prompt_len: usize,
     long_prefill_threshold: usize,
@@ -51,7 +55,7 @@ fn prefill_token_demand(
     } else {
         prompt_len
     };
-    chunk.min(max_batched_tokens).max(1)
+    chunk.min(max_batched_tokens).div_ceil(2).max(1)
 }
 
 /// Derive a stable per-request seed from the CLI seed, engine, and request id.
@@ -395,7 +399,10 @@ impl ActiveRequest {
         if self.generated > 0 {
             1
         } else {
-            prefill_token_demand(self.prompt_len, long_prefill_threshold, max_batched_tokens)
+            // Cached prompt tokens are never recomputed, so they consume no
+            // prefill budget; vLLM charges num_new_tokens (the uncached slice).
+            let uncached = self.prompt_len.saturating_sub(self.num_local_cached_tokens);
+            prefill_token_demand(uncached, long_prefill_threshold, max_batched_tokens)
         }
     }
 
@@ -1006,15 +1013,15 @@ impl SimEngine {
     fn schedule(&mut self) -> Vec<EngineOutput> {
         let mut outputs = Vec::new();
         let budget = self.opt.max_num_batched_tokens as usize;
-        let threshold = self.opt.long_prefill_token_threshold as usize;
-        let mut demand = self.scheduled_token_demand();
 
         // The `demand < budget` check admits the last request even when its prefill chunk
         // would overshoot. This matches vLLM's chunked-prefill semantics: vLLM admits that
         // request too and simply shrinks its chunk to the remaining budget. The admission
         // COUNT is identical; only per-step token accounting differs.
         while self.active_requests.len() + self.pending_pulls.len() < self.running_capacity()
-            && demand < budget
+            // Recomputed each admission: the freshly admitted request's demand
+            // depends on its prefix-cache hit, which only admit() can measure.
+            && self.scheduled_token_demand() < budget
         {
             // Next admissible request in policy order, skipping any the LoRA slot cap blocks.
             // The index comes from a scan of `waiting` under the same borrow, so remove()
@@ -1025,17 +1032,11 @@ impl SimEngine {
             else {
                 break;
             };
-            // The token demand this request adds once admitted (it starts by prefilling).
-            let prompt_len = request
-                .prompt_token_ids
-                .as_ref()
-                .map(Vec::len)
-                .unwrap_or_default();
-            match self.admit(request) {
-                // Admitted and now prefilling: it occupies budget until its first token.
-                None => demand += prefill_token_demand(prompt_len, threshold, budget),
-                // Invalid request finished immediately; it never entered the batch.
-                Some(output) => outputs.push(output),
+            // Invalid requests finish immediately and never enter the batch;
+            // admitted ones occupy budget (via scheduled_token_demand) until
+            // their first token.
+            if let Some(output) = self.admit(request) {
+                outputs.push(output);
             }
         }
         outputs
@@ -1868,14 +1869,15 @@ mod tests {
         opt.max_num_batched_tokens = 20;
         let (mut engine, mut rx) = test_engine(opt);
 
-        // Each prefilling request demands its 10 prompt tokens. Budget 20 admits two (demand
-        // 0 -> 10 -> 20), then 20 < 20 is false so the rest wait, despite 98 free seq slots.
+        // Each prefilling request demands half its 10 prompt tokens (chunk
+        // packing). Budget 20 admits four (demand 0 -> 5 -> 10 -> 15 -> 20),
+        // then 20 < 20 is false so the rest wait, despite 96 free seq slots.
         for i in 0..5 {
             submit(&mut engine, &mut rx, request(&format!("r{i}"), 10, 50));
         }
-        assert_eq!(engine.active_requests.len(), 2);
-        assert_eq!(engine.waiting.len(), 3);
-        assert_eq!(engine.scheduler_stats().num_waiting_reqs, 3);
+        assert_eq!(engine.active_requests.len(), 4);
+        assert_eq!(engine.waiting.len(), 1);
+        assert_eq!(engine.scheduler_stats().num_waiting_reqs, 1);
     }
 
     #[test]
@@ -1888,13 +1890,13 @@ mod tests {
         for i in 0..5 {
             submit(&mut engine, &mut rx, request(&format!("r{i}"), 10, 50));
         }
-        assert_eq!(engine.active_requests.len(), 2);
+        assert_eq!(engine.active_requests.len(), 4);
 
-        // One step: the two prefilling requests emit their first token (instant model) and
-        // become decoders (demand 1 each), freeing budget to admit more from the queue.
+        // One step: the four prefilling requests emit their first token (instant model) and
+        // become decoders (demand 1 each), freeing budget to admit the last from the queue.
         engine.step();
-        assert!(engine.active_requests.len() > 2);
-        assert!(engine.waiting.len() < 3);
+        assert!(engine.active_requests.len() > 4);
+        assert!(engine.waiting.is_empty());
     }
 
     /// Build a request bound to a LoRA adapter (as the frontend would after the model name

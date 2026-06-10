@@ -35,14 +35,14 @@ for phase in $PHASES; do
         # ~1.54 wire tokens per synthetic word: spans ~0.8k-12.3k tokens across
         # the latency model's prompt buckets, at idle and loaded concurrency.
         for words in ${SWEEP_WORDS:-512 1000 1500 3000 5500 8000}; do
-            echo "==> sweep prompt=$words words c1 (45s)"
-            loadgen --pattern constant --concurrency 1 --duration 45 \
-                --prompt-tokens "$words" --output-tokens 128 \
-                --out "/trace/sweep-p$words-c1.json"
-            echo "==> sweep prompt=$words words c8 (75s)"
-            loadgen --pattern constant --concurrency 8 --duration 75 \
-                --prompt-tokens "$words" --output-tokens 128 \
-                --out "/trace/sweep-p$words-c8.json"
+            for conc in ${SWEEP_CONC:-1 8}; do
+                secs=75
+                [ "$conc" = 1 ] && secs=45
+                echo "==> sweep prompt=$words words c$conc (${secs}s)"
+                loadgen --pattern constant --concurrency "$conc" --duration "$secs" \
+                    --prompt-tokens "$words" --output-tokens 128 \
+                    --out "/trace/sweep-p$words-c$conc.json"
+            done
         done
         ;;
     multiturn)

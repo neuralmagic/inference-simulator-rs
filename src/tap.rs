@@ -47,7 +47,7 @@ use vllm_engine_core_client::protocol::{
 use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::{PullSocket, RouterSocket, ZmqMessage};
 
-use crate::trace::{TraceMeta, TraceRecord, append_record};
+use crate::trace::{ItlContext, TraceMeta, TraceRecord, append_record};
 
 /// Per-request observation state maintained by the tap.
 struct RequestState {
@@ -61,6 +61,10 @@ struct RequestState {
     ttft_ms: Option<f64>,
     /// Inter-token latency gaps in milliseconds.
     itl_ms: Vec<f64>,
+    /// Engine-reported running count for the step closing each gap (parallel to itl_ms).
+    itl_running: Vec<u32>,
+    /// Prompt tokens that finished prefill in the step closing each gap (parallel to itl_ms).
+    itl_prefill: Vec<u32>,
     /// Cached token count from prefill_stats.
     cached_tokens: usize,
     /// Concurrency snapshot at arrival.
@@ -370,6 +374,8 @@ fn observe_request<F: AsRef<[u8]>>(
                             output_tokens: 0,
                             ttft_ms: None,
                             itl_ms: Vec::new(),
+                            itl_running: Vec::new(),
+                            itl_prefill: Vec::new(),
                             cached_tokens: 0,
                             concurrency,
                         },
@@ -416,6 +422,24 @@ fn observe_output<W: Write, F: AsRef<[u8]>>(
         }
     };
 
+    // Step-level batch context for every gap closed by this message: the engine's
+    // own running count when it attaches scheduler stats (tap in-flight count as
+    // fallback), and the prompt tokens that finished prefill in this step (the
+    // requests receiving their first tokens here).
+    let step_running = outputs
+        .scheduler_stats
+        .as_ref()
+        .map(|s| s.num_running_reqs as u32)
+        .unwrap_or(requests.len() as u32);
+    let step_prefill_tokens: u32 = outputs
+        .outputs
+        .iter()
+        .filter(|o| !o.new_token_ids.is_empty())
+        .filter_map(|o| requests.get(&o.request_id))
+        .filter(|s| s.ttft_ms.is_none())
+        .map(|s| s.prompt_tokens as u32)
+        .sum();
+
     for output in &outputs.outputs {
         let request_id = &output.request_id;
         let num_new_tokens = output.new_token_ids.len();
@@ -456,8 +480,14 @@ fn observe_output<W: Write, F: AsRef<[u8]>>(
             // The first token in the chunk gets one share, the remaining get one each.
             // This produces num_new_tokens ITL entries for this chunk.
             let per_token_gap = gap_ms / num_new_tokens as f64;
+            // scheduler_stats are post-step, so a step in which requests finish
+            // undercounts what ran during it (down to 0 on the last step). The
+            // request owning this gap was certainly running, so floor at 1.
+            let gap_running = step_running.max(1);
             for _ in 0..num_new_tokens {
                 state.itl_ms.push(per_token_gap);
+                state.itl_running.push(gap_running);
+                state.itl_prefill.push(step_prefill_tokens);
             }
 
             state.output_tokens += num_new_tokens;
@@ -474,21 +504,22 @@ fn observe_output<W: Write, F: AsRef<[u8]>>(
 
             let request_id_owned = request_id.clone();
             if let Some(state) = requests.remove(&request_id_owned) {
+                let has_gaps = !state.itl_ms.is_empty();
                 let record = TraceRecord {
                     prompt_tokens: state.prompt_tokens,
                     cached_tokens: state.cached_tokens,
                     output_tokens: state.output_tokens,
                     ttft_ms: state.ttft_ms.unwrap_or(0.0),
-                    itl_ms: if state.itl_ms.is_empty() {
-                        None
-                    } else {
-                        Some(state.itl_ms)
-                    },
+                    itl_ms: has_gaps.then_some(state.itl_ms),
                     itl_summary: None,
                     concurrency: state.concurrency,
                     arrival_ms: Some(
                         state.arrival.duration_since(capture_start).as_secs_f64() * 1000.0,
                     ),
+                    itl_ctx: has_gaps.then_some(ItlContext {
+                        num_running: state.itl_running,
+                        prefill_tokens: state.itl_prefill,
+                    }),
                 };
                 debug!(
                     request_id = %request_id_owned,

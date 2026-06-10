@@ -733,6 +733,7 @@ mod tests {
             itl_summary: None,
             concurrency: conc,
             arrival_ms: None,
+            itl_ctx: None,
         }
     }
 
@@ -848,6 +849,7 @@ mod tests {
             }),
             concurrency: 1,
             arrival_ms: None,
+            itl_ctx: None,
         }];
         let trace =
             TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();

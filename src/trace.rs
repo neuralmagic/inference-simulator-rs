@@ -47,6 +47,22 @@ pub struct ItlSummary {
     pub count: usize,
 }
 
+/// Per-gap batch context, parallel to `itl_ms`: the engine state under which each
+/// gap was measured. This is what lets a replay model separate clean decode steps
+/// from prefill-interfered ones and condition on the *simulated* scheduler state
+/// instead of replaying a steady-state marginal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ItlContext {
+    /// Engine-reported running-request count for the step that closed each gap
+    /// (falls back to the recorder's own in-flight count when the engine doesn't
+    /// attach scheduler stats).
+    pub num_running: Vec<u32>,
+    /// Prompt tokens that finished prefill in the step that closed each gap
+    /// (0 = clean decode step). Chunked prefill attributes the whole prompt to
+    /// the step that emitted the first token.
+    pub prefill_tokens: Vec<u32>,
+}
+
 /// One completed request's observed latency. At least one of `itl_ms` or `itl_summary`
 /// must be present when `output_tokens > 1`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -68,6 +84,9 @@ pub struct TraceRecord {
     /// what an open-loop workload replay needs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arrival_ms: Option<f64>,
+    /// Per-gap batch context, parallel to `itl_ms` when both are present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub itl_ctx: Option<ItlContext>,
 }
 
 fn default_concurrency() -> u64 {
@@ -135,13 +154,24 @@ pub fn read_trace(reader: impl BufRead) -> Result<(TraceMeta, Vec<TraceRecord>)>
     Ok((meta, records))
 }
 
-/// Validate that a record has ITL data when output_tokens > 1.
+/// Validate that a record has ITL data when output_tokens > 1, and that any
+/// per-gap context arrays line up with the gap array.
 fn validate_record(record: &TraceRecord, line_num: usize) -> Result<()> {
     if record.output_tokens > 1 && record.itl_ms.is_none() && record.itl_summary.is_none() {
         bail!(
             "line {line_num}: output_tokens={} but neither itl_ms nor itl_summary is present",
             record.output_tokens
         );
+    }
+    if let Some(ref ctx) = record.itl_ctx {
+        let gaps = record.itl_ms.as_ref().map(Vec::len).unwrap_or(0);
+        if ctx.num_running.len() != gaps || ctx.prefill_tokens.len() != gaps {
+            bail!(
+                "line {line_num}: itl_ctx arrays (running={}, prefill={}) must parallel itl_ms (len={gaps})",
+                ctx.num_running.len(),
+                ctx.prefill_tokens.len(),
+            );
+        }
     }
     Ok(())
 }
@@ -197,6 +227,7 @@ mod tests {
                 itl_summary: None,
                 concurrency: 3,
                 arrival_ms: Some(1234.5),
+                itl_ctx: None,
             },
             TraceRecord {
                 prompt_tokens: 200,
@@ -207,6 +238,7 @@ mod tests {
                 itl_summary: None,
                 concurrency: 1,
                 arrival_ms: None,
+                itl_ctx: None,
             },
             TraceRecord {
                 prompt_tokens: 50,
@@ -220,6 +252,7 @@ mod tests {
                 }),
                 concurrency: 5,
                 arrival_ms: None,
+                itl_ctx: None,
             },
         ]
     }
@@ -289,6 +322,20 @@ mod tests {
     }
 
     #[test]
+    fn itl_ctx_round_trips_and_validates_lengths() {
+        let input = br#"{"prompt_tokens":10,"output_tokens":3,"ttft_ms":10.0,"itl_ms":[5.0,6.0],"itl_ctx":{"num_running":[4,4],"prefill_tokens":[0,800]},"concurrency":4}"#;
+        let (_, records) = read_trace(io::BufReader::new(input.as_slice())).unwrap();
+        let ctx = records[0].itl_ctx.as_ref().unwrap();
+        assert_eq!(ctx.num_running, vec![4, 4]);
+        assert_eq!(ctx.prefill_tokens, vec![0, 800]);
+
+        // Context arrays that do not parallel itl_ms are rejected.
+        let bad = br#"{"prompt_tokens":10,"output_tokens":3,"ttft_ms":10.0,"itl_ms":[5.0,6.0],"itl_ctx":{"num_running":[4],"prefill_tokens":[0,800]},"concurrency":4}"#;
+        let err = read_trace(io::BufReader::new(bad.as_slice())).unwrap_err();
+        assert!(format!("{err:#}").contains("itl_ctx"));
+    }
+
+    #[test]
     fn single_output_token_needs_no_itl() {
         let input = br#"{"prompt_tokens":10,"output_tokens":1,"ttft_ms":10.0,"concurrency":1}"#;
         let (_, records) = read_trace(io::BufReader::new(input.as_slice())).unwrap();
@@ -332,6 +379,7 @@ mod tests {
             itl_summary: None,
             concurrency: 1,
             arrival_ms: None,
+            itl_ctx: None,
         };
         let mut buf = Vec::new();
         append_record(&mut buf, &record).unwrap();

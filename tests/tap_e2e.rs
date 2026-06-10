@@ -260,6 +260,17 @@ async fn tap_records_trace() {
     );
     assert!(r1.concurrency >= 1, "concurrency should be >= 1");
 
+    // Per-gap batch context parallels the gap array and carries a sane
+    // running count for every step.
+    let ctx1 = r1.itl_ctx.as_ref().expect("should have itl_ctx");
+    assert_eq!(ctx1.num_running.len(), itl1.len());
+    assert_eq!(ctx1.prefill_tokens.len(), itl1.len());
+    assert!(
+        ctx1.num_running.iter().all(|&n| n >= 1),
+        "running count should be >= 1 while this request decodes, got {:?}",
+        ctx1.num_running
+    );
+
     // Arrival times are recorded relative to capture start and must respect the
     // order the requests were sent in (10-prompt, then 20-prompt, then 15-prompt).
     let arrivals: Vec<f64> = [10usize, 20, 15]

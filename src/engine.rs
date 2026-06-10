@@ -32,7 +32,7 @@ use vllm_engine_core_client::protocol::{
 use crate::blockpool::BlockPool;
 use crate::dataplane::{KvDataPlane, NixlConfig, RemoteKv, RequestKv, make_data_plane};
 use crate::kvevents::KvEventTx;
-use crate::latency::{FirstTokenCtx, LatencyModel};
+use crate::latency::{DecodePacing, FirstTokenCtx, LatencyModel};
 use crate::lora::LoraRegistry;
 use crate::sched::{self, Scheduler};
 use crate::tokens::{RandomTokens, TokenCtx, TokenSource};
@@ -246,6 +246,9 @@ struct ActiveRequest {
     max_tokens: usize,
     generated: usize,
     rng: StdRng,
+    /// Per-request decode pacing state (hierarchical latency models pin a request
+    /// to one source request's gap distribution; stateless models ignore it).
+    pacing: DecodePacing,
     /// This request asked us to prefill for a remote decoder (`do_remote_decode`), so on
     /// finish we register its KV and stamp the `remote_*` descriptor onto its output.
     prefill_advertise: bool,
@@ -338,6 +341,7 @@ impl ActiveRequest {
 
         Ok(ActiveRequest {
             rng,
+            pacing: DecodePacing::default(),
             request_id,
             client_index,
             prompt_len,
@@ -1084,9 +1088,11 @@ impl SimEngine {
                 }
             } else {
                 request.next_at = now
-                    + self
-                        .latency
-                        .inter_token_delay(&mut request.rng, num_running);
+                    + self.latency.paced_inter_token_delay(
+                        &mut request.rng,
+                        num_running,
+                        &mut request.pacing,
+                    );
             }
 
             let (outs, finished_set) = by_client

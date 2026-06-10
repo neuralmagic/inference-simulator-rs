@@ -20,8 +20,8 @@ use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 
 use crate::latency::{
-    CONCURRENCY_RANGES, FirstTokenCtx, KnobLatency, LatencyModel, NUM_CONCURRENCY_BUCKETS,
-    TraceLatency, concurrency_bucket, random_norm,
+    CONCURRENCY_RANGES, DecodePacing, FirstTokenCtx, KnobLatency, LatencyModel,
+    NUM_CONCURRENCY_BUCKETS, TraceLatency, concurrency_bucket, random_norm,
 };
 use crate::trace::{TraceMeta, TraceRecord, read_trace, write_trace};
 
@@ -115,11 +115,11 @@ pub struct CalibrationReport {
 /// Per-request decode-total (sum of a request's ITL gaps) quantiles, pooled across
 /// all multi-token records.
 ///
-/// This metric is deliberately NOT folded into `replay_pass` yet: i.i.d. per-token
-/// sampling reproduces per-token quantiles while provably compressing per-request
-/// totals (a sum of n independent draws concentrates ~sqrt(n) tighter than n
-/// correlated gaps). It is reported so the gap is visible; hierarchical per-request
-/// sampling is the planned fix that turns it into a gate.
+/// Per-token quantiles alone cannot catch a model that loses within-request
+/// correlation: i.i.d. per-token sampling reproduces them while compressing
+/// per-request totals (a sum of n independent draws concentrates ~sqrt(n) tighter
+/// than n correlated gaps). Hierarchical donor-based pacing preserves the
+/// correlation; this metric gates `replay_pass` to keep it that way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestTotalReport {
     /// Number of multi-token requests contributing totals.
@@ -127,7 +127,7 @@ pub struct RequestTotalReport {
     pub source: Quantiles,
     pub replay: Quantiles,
     pub max_error: f64,
-    /// Whether `max_error` is within the run's tolerance (informational).
+    /// Whether `max_error` is within the run's tolerance (part of `replay_pass`).
     pub within_tolerance: bool,
 }
 
@@ -713,7 +713,9 @@ pub fn calibrate(
     let replay_ttft_err = src_ttft_q.max_relative_error(&rep_ttft_q);
     let replay_itl_err = src_itl_q.max_relative_error(&rep_itl_q);
 
-    let replay_pass = replay_ttft_err <= tolerance && replay_itl_err <= tolerance;
+    let replay_pass = replay_ttft_err <= tolerance
+        && replay_itl_err <= tolerance
+        && request_total.as_ref().is_none_or(|rt| rt.within_tolerance);
     let knobfit_tail_capped = knb_ttft_q.tail_ratio() <= 1.75 && src_ttft_q.tail_ratio() > 1.75;
 
     let verdict = Verdict {
@@ -780,10 +782,11 @@ fn request_total_report(
             continue;
         }
         for _ in 0..reps {
+            let mut pacing = DecodePacing::default();
             let total_ms: f64 = (0..n_gaps)
                 .map(|_| {
                     model
-                        .inter_token_delay(&mut rng, r.concurrency)
+                        .paced_inter_token_delay(&mut rng, r.concurrency, &mut pacing)
                         .as_secs_f64()
                         * 1000.0
                 })
@@ -926,9 +929,7 @@ pub fn write_report(writer: &mut impl Write, report: &CalibrationReport) -> Resu
     if let Some(ref rt) = report.request_total {
         writeln!(
             writer,
-            "Request-total max relative error: {:.4} ({}; informational, not gating: \
-             i.i.d. per-token sampling compresses request totals until hierarchical \
-             sampling lands)",
+            "Request-total max relative error: {:.4} ({})",
             rt.max_error,
             if rt.within_tolerance {
                 "within tolerance"
@@ -1267,14 +1268,14 @@ mod tests {
         );
     }
 
-    /// Documents the known i.i.d. compression: per-request decode totals from a
-    /// trace whose requests are internally consistent but bimodal ACROSS requests
-    /// (all-fast vs all-slow) cannot be reproduced by sampling gaps independently.
-    /// Per-token quantiles still pass; the request-total metric exposes the gap.
-    /// Hierarchical per-request sampling is the planned fix; when it lands this
-    /// test flips to asserting within_tolerance.
+    /// The trap this metric exists for: requests that are internally consistent
+    /// but bimodal ACROSS requests (all-fast vs all-slow). Per-token quantiles
+    /// pass under any sampling scheme; per-request totals only reproduce when
+    /// within-request correlation is preserved (hierarchical donor pacing).
+    /// i.i.d. totals would concentrate near 64 * 27.5 = 1760ms; the source is
+    /// bimodal at 320ms / 3200ms.
     #[test]
-    fn iid_sampling_compresses_request_totals() {
+    fn hierarchical_sampling_preserves_request_totals() {
         let mut records: Vec<TraceRecord> = Vec::new();
         for i in 0..100 {
             // Half the requests decode at 5ms/token, half at 50ms/token.
@@ -1296,25 +1297,19 @@ mod tests {
             .expect("request totals should be computed");
         assert_eq!(rt.count, 100);
 
-        // Source totals are bimodal: 320ms and 3200ms (p50 picks one mode, p99 the
-        // other). i.i.d. totals concentrate near 64 * 27.5 = 1760ms across the board.
         assert!(
-            !rt.within_tolerance,
-            "i.i.d. sampling should NOT reproduce bimodal request totals yet \
-             (max_error {:.3}); if this now passes, hierarchical sampling landed — \
-             flip this test to assert within_tolerance",
-            rt.max_error
+            rt.within_tolerance,
+            "donor pacing should reproduce bimodal request totals, got max_error {:.3} \
+             (src p50/p99 {:.0}/{:.0}, replay p50/p99 {:.0}/{:.0})",
+            rt.max_error, rt.source.p50, rt.source.p99, rt.replay.p50, rt.replay.p99,
         );
         assert!(
-            rt.max_error > 0.5,
-            "expected severe compression of request totals, got max_error {:.3}",
-            rt.max_error
+            report.verdict.replay_pass,
+            "request totals now gate replay_pass"
         );
-
-        // Meanwhile the per-token ITL quantiles DO pass — that's exactly the trap.
         assert!(
             report.verdict.replay_itl_max_error <= 0.10,
-            "per-token ITL quantiles should still replay fine, got {:.3}",
+            "per-token ITL quantiles must still pass, got {:.3}",
             report.verdict.replay_itl_max_error
         );
     }

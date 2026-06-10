@@ -30,10 +30,42 @@ pub struct FirstTokenCtx {
     pub num_running: u64,
 }
 
+/// Per-request decode pacing state, owned by the engine alongside the request.
+///
+/// For hierarchical models (trace replay) this pins the request to one source
+/// "donor" request per concurrency bucket, so consecutive gaps stay correlated
+/// the way real decode gaps are (a slow request is slow throughout). Stateless
+/// models ignore it.
+#[derive(Debug, Clone)]
+pub struct DecodePacing {
+    /// Chosen donor index per concurrency bucket, lazily picked on first use.
+    donors: [Option<u32>; NUM_CONCURRENCY_BUCKETS],
+}
+
+impl Default for DecodePacing {
+    fn default() -> Self {
+        Self {
+            donors: [None; NUM_CONCURRENCY_BUCKETS],
+        }
+    }
+}
+
 /// Strategy for pacing token emission (TTFT and inter-token delays).
 pub trait LatencyModel: Send {
     fn first_token_delay(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration;
     fn inter_token_delay(&self, rng: &mut StdRng, num_running: u64) -> Duration;
+
+    /// Inter-token delay with per-request pacing state. Stateless models fall
+    /// back to the marginal distribution; hierarchical models use `pacing` to
+    /// keep a request's gaps internally correlated.
+    fn paced_inter_token_delay(
+        &self,
+        rng: &mut StdRng,
+        num_running: u64,
+        _pacing: &mut DecodePacing,
+    ) -> Duration {
+        self.inter_token_delay(rng, num_running)
+    }
 }
 
 /// All timing knobs, in milliseconds (except the unitless `time_factor_under_load`).
@@ -219,6 +251,41 @@ struct Cell {
     itl_samples: Vec<f64>,
 }
 
+/// One source request's gap distribution, used as a pacing donor.
+#[derive(Debug, Clone)]
+struct Donor {
+    /// The request's own ITL gaps, sorted for inverse-CDF sampling. Summary-only
+    /// records collapse to a single repeated mean.
+    gaps: Vec<f64>,
+}
+
+/// Per-concurrency-bucket donor pool with token-count weighting, so the marginal
+/// per-token distribution of hierarchical sampling matches the pooled samples.
+#[derive(Debug, Clone, Default)]
+struct DonorBucket {
+    donors: Vec<Donor>,
+    /// Cumulative token-count weights aligned with `donors`.
+    cum_weights: Vec<f64>,
+}
+
+impl DonorBucket {
+    fn push(&mut self, donor: Donor, weight: f64) {
+        let total = self.cum_weights.last().copied().unwrap_or(0.0);
+        self.donors.push(donor);
+        self.cum_weights.push(total + weight);
+    }
+
+    /// Pick a donor index, weighted by token count.
+    fn pick(&self, rng: &mut StdRng) -> usize {
+        debug_assert!(!self.donors.is_empty());
+        let total = self.cum_weights.last().copied().unwrap_or(0.0);
+        let u: f64 = rng.random::<f64>() * total;
+        self.cum_weights
+            .partition_point(|&w| w <= u)
+            .min(self.donors.len() - 1)
+    }
+}
+
 /// Replay latency model: samples timing from a grid of recorded observations, bucketed
 /// by (uncached prompt tokens, concurrency). For `do_remote_prefill` requests where the
 /// trace has no transfer-time data, falls back to a wrapped `KnobLatency` for KV-transfer
@@ -228,6 +295,8 @@ pub struct TraceLatency {
     grid: Vec<Vec<Cell>>,
     /// Pooled ITL samples per concurrency bucket (union over all prompt buckets).
     itl_by_concurrency: Vec<Vec<f64>>,
+    /// Per-request donor pools per concurrency bucket, for hierarchical pacing.
+    donors_by_concurrency: Vec<DonorBucket>,
     /// Fallback for do_remote_prefill KV-transfer timing (the trace does not record
     /// transfer latencies from disaggregated decode pulls).
     kv_transfer_fallback: KnobLatency,
@@ -248,6 +317,7 @@ impl TraceLatency {
         }
 
         let mut grid = vec![vec![Cell::default(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
+        let mut donors_by_concurrency = vec![DonorBucket::default(); NUM_CONCURRENCY_BUCKETS];
 
         for record in records {
             let uncached = record.prompt_tokens.saturating_sub(record.cached_tokens);
@@ -257,13 +327,27 @@ impl TraceLatency {
 
             cell.ttft_samples.push(record.ttft_ms);
 
-            // Expand ITL: prefer the array, fall back to the summary.
+            // Expand ITL: prefer the array, fall back to the summary. Each record
+            // also becomes a pacing donor weighted by its token count.
             if let Some(itls) = &record.itl_ms {
-                cell.itl_samples.extend(itls.iter().copied());
-            } else if let Some(summary) = &record.itl_summary {
+                if !itls.is_empty() {
+                    cell.itl_samples.extend(itls.iter().copied());
+                    let mut gaps = itls.clone();
+                    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    donors_by_concurrency[cb].push(Donor { gaps }, itls.len() as f64);
+                }
+            } else if let Some(summary) = &record.itl_summary
+                && summary.count > 0
+            {
                 for _ in 0..summary.count {
                     cell.itl_samples.push(summary.mean_ms);
                 }
+                donors_by_concurrency[cb].push(
+                    Donor {
+                        gaps: vec![summary.mean_ms],
+                    },
+                    summary.count as f64,
+                );
             }
         }
 
@@ -300,6 +384,7 @@ impl TraceLatency {
         Ok(TraceLatency {
             grid,
             itl_by_concurrency,
+            donors_by_concurrency,
             kv_transfer_fallback,
             meta,
         })
@@ -353,6 +438,26 @@ fn nearest_ttft(grid: &[Vec<Cell>], pb: usize, cb: usize) -> Option<&[f64]> {
     })
 }
 
+/// Find the nearest concurrency bucket with at least one donor.
+fn nearest_donor_bucket(donors_by_concurrency: &[DonorBucket], cb: usize) -> Option<usize> {
+    if !donors_by_concurrency[cb].donors.is_empty() {
+        return Some(cb);
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for (ci, bucket) in donors_by_concurrency.iter().enumerate() {
+        if bucket.donors.is_empty() {
+            continue;
+        }
+        let dist = ci.abs_diff(cb);
+        match best {
+            None => best = Some((dist, ci)),
+            Some((bd, _)) if dist < bd => best = Some((dist, ci)),
+            _ => {}
+        }
+    }
+    best.map(|(_, ci)| ci)
+}
+
 /// Find nearest non-empty ITL concurrency bucket.
 fn nearest_itl(itl_by_concurrency: &[Vec<f64>], cb: usize) -> Option<&[f64]> {
     if !itl_by_concurrency[cb].is_empty() {
@@ -401,13 +506,46 @@ impl LatencyModel for TraceLatency {
         let ms = sample_inverse_cdf(rng, samples);
         Duration::from_secs_f64(ms / 1000.0)
     }
+
+    /// Hierarchical sampling: pin the request to one source request ("donor") per
+    /// concurrency bucket, picked token-count-weighted on first use, then draw
+    /// gaps from that donor's own distribution. Marginal per-token quantiles match
+    /// the pooled path (same token weighting); within-request correlation matches
+    /// the source (a slow request stays slow), so per-request decode totals
+    /// reproduce instead of concentrating around the grand mean.
+    fn paced_inter_token_delay(
+        &self,
+        rng: &mut StdRng,
+        num_running: u64,
+        pacing: &mut DecodePacing,
+    ) -> Duration {
+        let cb = concurrency_bucket(num_running);
+        // The resolved bucket is deterministic for a given cb, so the cached donor
+        // index below always refers to the same bucket's pool.
+        let Some(bucket_idx) = nearest_donor_bucket(&self.donors_by_concurrency, cb) else {
+            return self.inter_token_delay(rng, num_running);
+        };
+        let bucket = &self.donors_by_concurrency[bucket_idx];
+        let donor_idx = match pacing.donors[cb] {
+            Some(idx) => idx as usize,
+            None => {
+                let idx = bucket.pick(rng);
+                pacing.donors[cb] = Some(idx as u32);
+                idx
+            }
+        };
+        let ms = sample_inverse_cdf(rng, &bucket.donors[donor_idx].gaps);
+        Duration::from_secs_f64(ms / 1000.0)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use rand::SeedableRng as _;
 
-    use crate::latency::{FirstTokenCtx, KnobLatency, LatencyModel, random_norm_truncated};
+    use crate::latency::{
+        DecodePacing, FirstTokenCtx, KnobLatency, LatencyModel, random_norm_truncated,
+    };
 
     fn model() -> KnobLatency {
         KnobLatency {
@@ -718,6 +856,56 @@ mod tests {
             let itl = trace.inter_token_delay(&mut rng, 1);
             assert_eq!(itl, std::time::Duration::from_secs_f64(0.009));
         }
+    }
+
+    #[test]
+    fn paced_sampling_sticks_to_one_donor_per_request() {
+        // Two donor requests with disjoint gap levels. A single request's paced
+        // draws must all come from ONE donor (within-request correlation), while
+        // many requests must hit both donors (across-request variation).
+        let records = vec![
+            make_record(100, 10, 40.0, vec![5.0; 9], 4),
+            make_record(100, 10, 40.0, vec![50.0; 9], 4),
+        ];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+
+        let mut seen_fast_request = false;
+        let mut seen_slow_request = false;
+        for _ in 0..50 {
+            let mut pacing = DecodePacing::default();
+            let draws: Vec<f64> = (0..20)
+                .map(|_| {
+                    trace
+                        .paced_inter_token_delay(&mut rng, 4, &mut pacing)
+                        .as_secs_f64()
+                        * 1000.0
+                })
+                .collect();
+            let all_fast = draws.iter().all(|&d| (d - 5.0).abs() < 1e-9);
+            let all_slow = draws.iter().all(|&d| (d - 50.0).abs() < 1e-9);
+            assert!(
+                all_fast || all_slow,
+                "one request's draws must stay at one donor's level, got {draws:?}"
+            );
+            seen_fast_request |= all_fast;
+            seen_slow_request |= all_slow;
+        }
+        assert!(
+            seen_fast_request && seen_slow_request,
+            "across requests both donors must be picked"
+        );
+
+        // The stateless marginal path still mixes both levels.
+        let mut seen_fast_gap = false;
+        let mut seen_slow_gap = false;
+        for _ in 0..100 {
+            let ms = trace.inter_token_delay(&mut rng, 4).as_secs_f64() * 1000.0;
+            seen_fast_gap |= (ms - 5.0).abs() < 1.0;
+            seen_slow_gap |= (ms - 50.0).abs() < 1.0;
+        }
+        assert!(seen_fast_gap && seen_slow_gap);
     }
 
     #[test]

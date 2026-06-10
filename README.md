@@ -283,10 +283,11 @@ H200 capture (fixed-concurrency closed loop). `deploy/trace-capture/loadgen.py
 --pattern poisson|burst` drives arrival processes that capture never
 contained, the tap records ground truth, and the replay must reproduce it:
 
-| scenario           | requests | concurrency seen | TTFT max err | ITL max err | req-total err | gate (10%) |
-|--------------------|----------|------------------|--------------|-------------|---------------|------------|
-| poisson, 4 req/s   | 483      | 1-22, median 9   | 9.3%         | 1.4%        | 3.8%          | PASS       |
-| burst, 24 per 10s  | 288      | 0 -> 24 spikes   | 2.8%         | 3.8%        | 8.0%          | PASS       |
+| scenario                          | requests | concurrency seen | TTFT max err | ITL max err | req-total err | gate (10%) |
+|-----------------------------------|----------|------------------|--------------|-------------|---------------|------------|
+| poisson, 4 req/s                  | 483      | 1-22, median 9   | 9.3%         | 1.4%        | 3.8%          | PASS       |
+| burst, 24 per 10s                 | 288      | 0 -> 24 spikes   | 2.8%         | 3.8%        | 8.0%          | PASS       |
+| multiturn agentic (see below)     | 580      | 1-25             | 3.4%         | 0.5%        | 1.5%          | PASS       |
 
 The burst scenario is the harsher test: each burst floods an idle engine, so
 TTFT is dominated by queueing the latency model never saw as such (source p99
@@ -322,3 +323,68 @@ just replay tap-poisson.jsonl h200-qwen3-tap-trace-v2.jsonl
 # real-vs-replay survival curves (replay measurements via --dump-trace)
 just compare "real=tap-poisson.jsonl" "replay=replay-measured.jsonl"
 ```
+
+### Agentic multiturn and the prefix cache
+
+The agentic scenario (`loadgen.py --pattern multiturn`): sessions arrive
+poisson at `--rate`, each runs `--turns` closed-loop turns whose context grows
+by the turn's prompt plus the model's response, on top of one of
+`--prefix-count` shared `--prefix-tokens` prefixes. The validation run below
+is 116 sessions x 5 turns over two ~10k-token shared prefixes; 578 of 580
+requests were prefix-cache hits (warm median 10.6k of ~11k prompt tokens
+cached).
+
+Prefix caching is not a latency knob in this simulator. The engine runs a real
+block-pool prefix cache; admission computes each request's actual cached-token
+count, the trace-fitted TTFT model conditions on the *uncached* prompt size,
+and a prefill admission stalls concurrent decodes by its uncached tokens only.
+The perf gain emerges from workload structure, which is why replaying it needs
+the workload's sharing structure: the tap fingerprints every prompt with
+chained per-block hashes (`block_hashes`, mooncake-style), and the replay
+expands each distinct hash to one deterministic token block, so replayed
+prompts share prefixes exactly where the captured ones did and the sim's cache
+reacts the same way.
+
+Two replay modes matter here. Pure open-loop replay of this trace fails the
+TTFT gate (16% err, concentrated in ramp-up): the capture's intra-session
+closed loop backs off when the engine runs momentarily slow, open-loop
+arrivals do not, and the divergence compounds. `--replay-sessions` restores
+the generator's semantics (turn N+1 fires when turn N completes plus the
+recorded think gap; sessions are inferred from the hash chains) and passes at
+TTFT 3.4% / ITL 0.5% / request-totals 1.5%.
+
+The shape proof, per turn cohort rather than pooled (compensating errors
+would show here): real vs replay TTFT survival for turn-1 requests (shared
+prefix hit only) and turns 2+ (the session's growing context), plus the same
+schedule replayed with `--cold-prompts` (prefix reuse defeated, the cache-off
+what-if). Without the cache, re-prefilling ~11k tokens per turn collapses the
+queue: TTFT p50 goes from 0.37s to ~18s and p99 from 1.6s to ~29s.
+
+![Multiturn cache effect](docs/images/multiturn-cache-effect.png)
+
+```bash
+# capture an agentic workload (10k-token shared prefixes at ~1.5 tokens/word)
+uv run --with httpx deploy/trace-capture/loadgen.py --url http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-8B --pattern multiturn --rate 1 --turns 5 \
+  --prefix-tokens 6500 --prompt-tokens 128 --output-tokens 128 --duration 120 \
+  --out run.json
+
+# session-paced replay (the gate), then the cache-off what-if
+cargo run --release --bin inference-sim-trace -- calibrate-e2e tap-multiturn.jsonl \
+  --replay-arrivals --replay-sessions --latency-trace h200-qwen3-tap-trace-v2.jsonl \
+  --sim-arg=--kv-cache-size --sim-arg=65536 --dump-trace replay-measured.jsonl
+cargo run --release --bin inference-sim-trace -- calibrate-e2e tap-multiturn.jsonl \
+  --replay-arrivals --replay-sessions --cold-prompts ... --dump-trace nocache-measured.jsonl
+
+# the per-cohort figure
+uv run scripts/plot_calibration.py --cache-effect real=tap-multiturn.jsonl \
+  --cache-effect replay=replay-measured.jsonl --cache-effect nocache=nocache-measured.jsonl \
+  --out-dir docs/images
+```
+
+Caveat for absolute cold numbers: the H200 capture's prompts top out around
+800 uncached tokens, so a cold 11k prefill's park time extrapolates from the
+nearest bucket; the ~50x what-if delta is dominated by mechanically simulated
+queueing, but a prompt-length-sweep capture would pin it down. Mooncake-style
+workload traces (block-hash ids + lengths + timestamps) map directly onto this
+schema for replaying production workloads.

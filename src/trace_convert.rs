@@ -200,6 +200,7 @@ pub fn convert_guidellm(
                 itl_ms: None,
                 itl_summary,
                 concurrency,
+                arrival_ms: None,
             });
         }
     }

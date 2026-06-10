@@ -62,6 +62,12 @@ pub struct TraceRecord {
     pub itl_summary: Option<ItlSummary>,
     #[serde(default = "default_concurrency")]
     pub concurrency: u64,
+    /// Request arrival time in milliseconds since the start of the capture
+    /// (first observed request = ~0). Records are written at completion, so file
+    /// order is finish order; this field carries the arrival schedule, which is
+    /// what an open-loop workload replay needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrival_ms: Option<f64>,
 }
 
 fn default_concurrency() -> u64 {
@@ -190,6 +196,7 @@ mod tests {
                 itl_ms: Some(vec![10.0, 12.0, 11.0, 9.0]),
                 itl_summary: None,
                 concurrency: 3,
+                arrival_ms: Some(1234.5),
             },
             TraceRecord {
                 prompt_tokens: 200,
@@ -199,6 +206,7 @@ mod tests {
                 itl_ms: None,
                 itl_summary: None,
                 concurrency: 1,
+                arrival_ms: None,
             },
             TraceRecord {
                 prompt_tokens: 50,
@@ -211,6 +219,7 @@ mod tests {
                     count: 9,
                 }),
                 concurrency: 5,
+                arrival_ms: None,
             },
         ]
     }
@@ -322,6 +331,7 @@ mod tests {
             itl_ms: None,
             itl_summary: None,
             concurrency: 1,
+            arrival_ms: None,
         };
         let mut buf = Vec::new();
         append_record(&mut buf, &record).unwrap();

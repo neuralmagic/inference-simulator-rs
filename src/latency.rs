@@ -732,6 +732,7 @@ mod tests {
             itl_ms: if itl.is_empty() { None } else { Some(itl) },
             itl_summary: None,
             concurrency: conc,
+            arrival_ms: None,
         }
     }
 
@@ -846,6 +847,7 @@ mod tests {
                 count: 5,
             }),
             concurrency: 1,
+            arrival_ms: None,
         }];
         let trace =
             TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();

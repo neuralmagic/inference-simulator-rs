@@ -39,7 +39,7 @@ def make_prompt(rng: random.Random, n_tokens: int) -> str:
 
 
 async def one_request(
-    client: httpx.AsyncClient, args: argparse.Namespace, rng: random.Random
+    client: httpx.AsyncClient, args: argparse.Namespace, rng: random.Random, run_start: float
 ) -> dict | None:
     prompt = make_prompt(rng, args.prompt_tokens)
     body = {
@@ -73,6 +73,7 @@ async def one_request(
         "itl_mean_ms": ((last - first) / (chunks - 1)) * 1000.0 if chunks > 1 else None,
         "itl_ms": itl_ms,
         "concurrency": args.concurrency,
+        "arrival_ms": (start - run_start) * 1000.0,
     }
 
 
@@ -82,10 +83,11 @@ async def worker(
     deadline: float,
     results: list,
     seed: int,
+    run_start: float,
 ) -> None:
     rng = random.Random(seed)
     while time.perf_counter() < deadline:
-        res = await one_request(client, args, rng)
+        res = await one_request(client, args, rng, run_start)
         if res is not None:
             results.append(res)
 
@@ -107,12 +109,13 @@ async def main() -> None:
     args = p.parse_args()
 
     results: list[dict] = []
-    deadline = time.perf_counter() + args.duration
+    run_start = time.perf_counter()
+    deadline = run_start + args.duration
     limits = httpx.Limits(max_connections=args.concurrency + 4)
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0), limits=limits) as client:
         await asyncio.gather(
             *(
-                worker(client, args, deadline, results, seed)
+                worker(client, args, deadline, results, seed, run_start)
                 for seed in range(args.concurrency)
             )
         )
@@ -135,6 +138,8 @@ async def main() -> None:
                     "ttft_ms": r["ttft_ms"],
                     "itl_ms": r["itl_ms"],
                     "concurrency": r["concurrency"],
+                    # Relative to this invocation's start; appended runs restart at 0.
+                    "arrival_ms": r["arrival_ms"],
                 }
                 f.write(json.dumps(rec) + "\n")
     itls = sorted(r["itl_mean_ms"] for r in ok if r["itl_mean_ms"] is not None)

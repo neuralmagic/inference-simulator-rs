@@ -253,6 +253,7 @@ pub fn gen_demo(num_records: usize, seed: u64) -> (TraceMeta, Vec<TraceRecord>) 
                 },
                 itl_summary: None,
                 concurrency: group.concurrency,
+                arrival_ms: None,
             });
         }
     }
@@ -338,6 +339,7 @@ pub fn gen_demo_fast(num_records: usize, seed: u64) -> (TraceMeta, Vec<TraceReco
                 },
                 itl_summary: None,
                 concurrency: group.concurrency,
+                arrival_ms: None,
             });
         }
     }
@@ -1095,6 +1097,7 @@ mod tests {
                 itl_ms: Some(vec![10.0; 4]),
                 itl_summary: None,
                 concurrency: 1,
+                arrival_ms: None,
             })
             .collect();
 
@@ -1140,6 +1143,7 @@ mod tests {
                 itl_ms: Some(vec![10.0; 4]),
                 itl_summary: None,
                 concurrency: 1,
+                arrival_ms: None,
             })
             .collect();
 
@@ -1164,6 +1168,7 @@ mod tests {
                 itl_ms: Some(vec![10.0; 4]),
                 itl_summary: None,
                 concurrency: 1,
+                arrival_ms: None,
             })
             .collect();
 
@@ -1184,6 +1189,7 @@ mod tests {
                 itl_ms: Some(vec![40.0; 4]),
                 itl_summary: None,
                 concurrency: 1,
+                arrival_ms: None,
             })
             .collect();
 
@@ -1252,6 +1258,7 @@ mod tests {
                 itl_ms: Some(vec![10.0; 4]),
                 itl_summary: None,
                 concurrency: 1,
+                arrival_ms: None,
             })
             .collect();
 
@@ -1288,6 +1295,7 @@ mod tests {
                 itl_ms: Some(vec![gap; 64]),
                 itl_summary: None,
                 concurrency: 4,
+                arrival_ms: None,
             });
         }
 

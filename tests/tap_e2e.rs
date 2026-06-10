@@ -260,6 +260,21 @@ async fn tap_records_trace() {
     );
     assert!(r1.concurrency >= 1, "concurrency should be >= 1");
 
+    // Arrival times are recorded relative to capture start and must respect the
+    // order the requests were sent in (10-prompt, then 20-prompt, then 15-prompt).
+    let arrivals: Vec<f64> = [10usize, 20, 15]
+        .iter()
+        .map(|p| {
+            record_by_prompt[p]
+                .arrival_ms
+                .expect("tap records should carry arrival_ms")
+        })
+        .collect();
+    assert!(
+        arrivals[0] >= 0.0 && arrivals.windows(2).all(|w| w[0] <= w[1]),
+        "arrival_ms should be non-negative and ordered by send time, got {arrivals:?}"
+    );
+
     // Request 2: 20 prompt, 3 output.
     let r2 = record_by_prompt
         .get(&20)

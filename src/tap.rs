@@ -268,6 +268,9 @@ pub async fn run_tap<W: Write>(
     info!("tap proxy connected to both sides, forwarding frames");
 
     let mut requests: HashMap<String, RequestState> = HashMap::new();
+    // Zero point for the arrival_ms column: trace arrival times are relative to
+    // the moment the proxy went live.
+    let capture_start = Instant::now();
 
     loop {
         tokio::select! {
@@ -317,7 +320,7 @@ pub async fn run_tap<W: Write>(
 
                 // Decode a copy for observation; the trace write at request
                 // completion also lands here, after the frame is already out.
-                observe_output(&frames, &mut requests, writer, arrival);
+                observe_output(&frames, &mut requests, writer, arrival, capture_start);
             }
         }
     }
@@ -396,12 +399,14 @@ fn observe_request<F: AsRef<[u8]>>(
 
 /// Observe (decode a copy of) an engine output for recording. Finalized
 /// records are written to the trace writer. `arrival` is the instant the
-/// frames came off the wire, stamped before forwarding.
+/// frames came off the wire, stamped before forwarding; `capture_start` is the
+/// zero point for the trace's arrival_ms column.
 fn observe_output<W: Write, F: AsRef<[u8]>>(
     frames: &[F],
     requests: &mut HashMap<String, RequestState>,
     writer: &mut W,
     arrival: Instant,
+    capture_start: Instant,
 ) {
     let outputs = match decode_engine_core_outputs(frames) {
         Ok(outputs) => outputs,
@@ -481,6 +486,9 @@ fn observe_output<W: Write, F: AsRef<[u8]>>(
                     },
                     itl_summary: None,
                     concurrency: state.concurrency,
+                    arrival_ms: Some(
+                        state.arrival.duration_since(capture_start).as_secs_f64() * 1000.0,
+                    ),
                 };
                 debug!(
                     request_id = %request_id_owned,

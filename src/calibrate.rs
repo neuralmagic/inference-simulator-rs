@@ -106,7 +106,29 @@ pub struct CalibrationReport {
     pub source: Vec<BucketQuantiles>,
     pub replay: Vec<BucketQuantiles>,
     pub knobfit: Option<Vec<BucketQuantiles>>,
+    /// Per-request decode-total comparison (model-level calibration only).
+    #[serde(default)]
+    pub request_total: Option<RequestTotalReport>,
     pub verdict: Verdict,
+}
+
+/// Per-request decode-total (sum of a request's ITL gaps) quantiles, pooled across
+/// all multi-token records.
+///
+/// This metric is deliberately NOT folded into `replay_pass` yet: i.i.d. per-token
+/// sampling reproduces per-token quantiles while provably compressing per-request
+/// totals (a sum of n independent draws concentrates ~sqrt(n) tighter than n
+/// correlated gaps). It is reported so the gap is visible; hierarchical per-request
+/// sampling is the planned fix that turns it into a gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestTotalReport {
+    /// Number of multi-token requests contributing totals.
+    pub count: usize,
+    pub source: Quantiles,
+    pub replay: Quantiles,
+    pub max_error: f64,
+    /// Whether `max_error` is within the run's tolerance (informational).
+    pub within_tolerance: bool,
 }
 
 /// The verdict block printed at the bottom of the report.
@@ -636,6 +658,9 @@ pub fn calibrate(
         sample_model_to_buckets(&trace_model, records, samples_per_record, seed);
     let replay = quantiles_from_buckets(&replay_buckets, &replay_pooled_ttft, &replay_pooled_itl);
 
+    let request_total =
+        request_total_report(records, &trace_model, samples_per_record, seed, tolerance);
+
     // KNOB-FIT: fit KnobLatency from source stats
     let knob_model = fit_knob_from_trace(records);
 
@@ -710,7 +735,76 @@ pub fn calibrate(
         source,
         replay,
         knobfit: Some(knobfit),
+        request_total,
         verdict,
+    })
+}
+
+/// Compare per-request decode totals: observed sums of each record's ITL gaps vs
+/// totals assembled by drawing the same number of gaps from the replay model.
+fn request_total_report(
+    records: &[TraceRecord],
+    model: &dyn LatencyModel,
+    samples_per_record: usize,
+    seed: u64,
+    tolerance: f64,
+) -> Option<RequestTotalReport> {
+    let mut source_totals: Vec<f64> = Vec::new();
+    for r in records {
+        if let Some(ref gaps) = r.itl_ms {
+            if !gaps.is_empty() {
+                source_totals.push(gaps.iter().sum());
+            }
+        } else if let Some(ref s) = r.itl_summary
+            && s.count > 0
+        {
+            source_totals.push(s.mean_ms * s.count as f64);
+        }
+    }
+    if source_totals.is_empty() {
+        return None;
+    }
+
+    // Bound the per-record repetitions: totals need far fewer draws than
+    // per-token quantiles to stabilize, and each repetition costs n_gaps draws.
+    let reps = samples_per_record.clamp(3, 20);
+    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(2));
+    let mut replay_totals: Vec<f64> = Vec::new();
+    for r in records {
+        let n_gaps = match (&r.itl_ms, &r.itl_summary) {
+            (Some(gaps), _) => gaps.len(),
+            (None, Some(s)) => s.count,
+            (None, None) => 0,
+        };
+        if n_gaps == 0 {
+            continue;
+        }
+        for _ in 0..reps {
+            let total_ms: f64 = (0..n_gaps)
+                .map(|_| {
+                    model
+                        .inter_token_delay(&mut rng, r.concurrency)
+                        .as_secs_f64()
+                        * 1000.0
+                })
+                .sum();
+            replay_totals.push(total_ms);
+        }
+    }
+
+    source_totals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    replay_totals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let source = Quantiles::from_sorted(&source_totals);
+    let replay = Quantiles::from_sorted(&replay_totals);
+    let max_error = source.max_relative_error(&replay);
+
+    Some(RequestTotalReport {
+        count: source_totals.len(),
+        source,
+        replay,
+        max_error,
+        within_tolerance: max_error <= tolerance,
     })
 }
 
@@ -797,8 +891,52 @@ pub fn write_report(writer: &mut impl Write, report: &CalibrationReport) -> Resu
         )?;
     }
 
+    if let Some(ref rt) = report.request_total {
+        writeln!(writer)?;
+        writeln!(writer, "=== Request decode total (ms) ===")?;
+        writeln!(
+            writer,
+            "{:<10} {:>6}  {:>10} {:>10} {:>10}  {:>10} {:>10} {:>10}",
+            "",
+            "n",
+            "src p50",
+            "src p90",
+            "src p99",
+            format!("{m} p50"),
+            format!("{m} p90"),
+            format!("{m} p99"),
+        )?;
+        writeln!(
+            writer,
+            "{:<10} {:>6}  {:>10.2} {:>10.2} {:>10.2}  {:>10.2} {:>10.2} {:>10.2}",
+            "pooled",
+            rt.count,
+            rt.source.p50,
+            rt.source.p90,
+            rt.source.p99,
+            rt.replay.p50,
+            rt.replay.p90,
+            rt.replay.p99,
+        )?;
+    }
+
     writeln!(writer)?;
     write_verdict(writer, &report.verdict, m)?;
+
+    if let Some(ref rt) = report.request_total {
+        writeln!(
+            writer,
+            "Request-total max relative error: {:.4} ({}; informational, not gating: \
+             i.i.d. per-token sampling compresses request totals until hierarchical \
+             sampling lands)",
+            rt.max_error,
+            if rt.within_tolerance {
+                "within tolerance"
+            } else {
+                "EXCEEDS tolerance"
+            },
+        )?;
+    }
 
     Ok(())
 }
@@ -1123,5 +1261,61 @@ mod tests {
         assert!(text.contains("TTFT"), "report should contain TTFT table");
         assert!(text.contains("Verdict"), "report should contain verdict");
         assert!(text.contains("PASS") || text.contains("FAIL"));
+        assert!(
+            text.contains("Request decode total"),
+            "report should contain request-total table"
+        );
+    }
+
+    /// Documents the known i.i.d. compression: per-request decode totals from a
+    /// trace whose requests are internally consistent but bimodal ACROSS requests
+    /// (all-fast vs all-slow) cannot be reproduced by sampling gaps independently.
+    /// Per-token quantiles still pass; the request-total metric exposes the gap.
+    /// Hierarchical per-request sampling is the planned fix; when it lands this
+    /// test flips to asserting within_tolerance.
+    #[test]
+    fn iid_sampling_compresses_request_totals() {
+        let mut records: Vec<TraceRecord> = Vec::new();
+        for i in 0..100 {
+            // Half the requests decode at 5ms/token, half at 50ms/token.
+            let gap = if i % 2 == 0 { 5.0 } else { 50.0 };
+            records.push(TraceRecord {
+                prompt_tokens: 100,
+                cached_tokens: 0,
+                output_tokens: 65,
+                ttft_ms: 40.0,
+                itl_ms: Some(vec![gap; 64]),
+                itl_summary: None,
+                concurrency: 4,
+            });
+        }
+
+        let report = calibrate(&records, 50_000, 0, 0.10).unwrap();
+        let rt = report
+            .request_total
+            .expect("request totals should be computed");
+        assert_eq!(rt.count, 100);
+
+        // Source totals are bimodal: 320ms and 3200ms (p50 picks one mode, p99 the
+        // other). i.i.d. totals concentrate near 64 * 27.5 = 1760ms across the board.
+        assert!(
+            !rt.within_tolerance,
+            "i.i.d. sampling should NOT reproduce bimodal request totals yet \
+             (max_error {:.3}); if this now passes, hierarchical sampling landed — \
+             flip this test to assert within_tolerance",
+            rt.max_error
+        );
+        assert!(
+            rt.max_error > 0.5,
+            "expected severe compression of request totals, got max_error {:.3}",
+            rt.max_error
+        );
+
+        // Meanwhile the per-token ITL quantiles DO pass — that's exactly the trap.
+        assert!(
+            report.verdict.replay_itl_max_error <= 0.10,
+            "per-token ITL quantiles should still replay fine, got {:.3}",
+            report.verdict.replay_itl_max_error
+        );
     }
 }

@@ -512,6 +512,9 @@ async fn calibrate_e2e_impl(
         source: source_stats,
         replay: replay_stats,
         knobfit: None,
+        // The e2e harness measures client-side streams; per-request totals are a
+        // model-level metric.
+        request_total: None,
         verdict,
     })
 }

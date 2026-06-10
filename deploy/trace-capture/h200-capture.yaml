@@ -88,7 +88,7 @@ spec:
             - { mountPath: /models, name: model-cache }
         # --- Recording tap ---------------------------------------------------------------
         - name: tap
-          image: quay.io/wseaton/mock-engine-nixl:trace-capture
+          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v2
           command: ["/usr/local/bin/inference-sim-tap"]
           args:
             - --frontend-handshake=tcp://127.0.0.1:5570
@@ -108,7 +108,7 @@ spec:
             - { mountPath: /trace, name: trace }
         # --- Rust frontend: OpenAI server, no local engine --------------------------------
         - name: frontend
-          image: quay.io/wseaton/mock-engine-nixl:trace-capture
+          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v2
           command: ["/usr/local/bin/vllm-rs", "serve"]
           args:
             - Qwen/Qwen3-8B

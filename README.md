@@ -83,17 +83,17 @@ Needs the `vllm-rs` frontend built once (`cargo build --bin vllm-rs` in the vLLM
 `rust/` workspace); override its path with `FRONTEND_BIN=...`. First run fetches the
 tokenizer from HF.
 
-`e2e_lora.sh` needs a `vllm-rs` built from the LoRA-gauge fork (`wseaton/vllm@lora-info-gauge`):
-the upstream Rust frontend at `ba94a3b` does not export `vllm:lora_requests_info`, though the
-engine and the Python frontend both speak it. The container image already builds `vllm-rs` from
-that fork by default (`VLLM_REPO`/`VLLM_REF` Docker build args); point them back at
-`vllm-project/vllm` once the gauge is upstream.
+`e2e_lora.sh` needs a `vllm-rs` at or past vLLM #45030, which exports
+`vllm:lora_requests_info` from the frontend (derived from per-request LoRA tracking;
+the engine no longer reports per-adapter maps in `SchedulerStats`). The pinned commit
+in `Cargo.toml`/`Dockerfile` qualifies.
 
 ### LoRA simulation
 
-The engine tracks LoRA adapters the frontend loads (`add_lora`/`remove_lora`), counts per-adapter
-running/waiting requests for `vllm:lora_requests_info`, and honors `--max-loras` (distinct
-adapters allowed in the running batch; `0` = no cap). In the image, set `MOCK_MAX_LORAS`.
+The engine tracks LoRA adapters the frontend loads (`add_lora`/`remove_lora`) and honors
+`--max-loras` (distinct adapters allowed in the running batch; `0` = no cap). In the
+image, set `MOCK_MAX_LORAS`. The `vllm:lora_requests_info` gauge itself is frontend-derived
+as of vLLM #45030.
 
 ## Build & run
 
@@ -169,6 +169,10 @@ Unit tests in `src/engine.rs` cover engine internals at a finer grain.
 The binary is `inference-sim`; the k8s deployment lives in `deploy/llm-d-pd/`.
 
 ## Trace replay and calibration
+
+Captured traces live under `traces/` (gitignored; see
+[traces/README.md](traces/README.md) for the inventory, which captures are
+fitting vs gate seeds, and the known-anomalous ones).
 
 The `inference-sim-trace` binary includes a calibration harness that proves two
 claims about the latency models:
@@ -263,7 +267,7 @@ llm-d-inference-sim --port 8001 --model Qwen/Qwen3-8B --mode random \
 
 # this simulator: vllm-rs frontend + trace replay, vLLM-default scheduler limits
 inference-sim --handshake-address tcp://127.0.0.1:5571 \
-  --latency-trace h200-qwen3-tap-trace.jsonl \
+  --latency-trace traces/h200-qwen3-8b/h200-qwen3-tap-trace.jsonl \
   --max-num-seqs 1024 --max-num-batched-tokens 8192
 ```
 
@@ -353,7 +357,7 @@ uv run --with httpx deploy/trace-capture/loadgen.py --url http://127.0.0.1:8000 
   --prompt-tokens 512 --output-tokens 128 --out run.json --trace-out client.jsonl
 
 # replay the schedule, fitting the model from a different capture
-just replay tap-poisson.jsonl h200-qwen3-tap-trace-v2.jsonl
+just replay tap-poisson.jsonl traces/h200-qwen3-8b/h200-qwen3-tap-trace-v2.jsonl
 
 # real-vs-replay survival curves (replay measurements via --dump-trace)
 just compare "real=tap-poisson.jsonl" "replay=replay-measured.jsonl"
@@ -406,7 +410,7 @@ uv run --with httpx deploy/trace-capture/loadgen.py --url http://127.0.0.1:8000 
 
 # session-paced replay (the gate), then the cache-off what-if
 cargo run --release --bin inference-sim-trace -- calibrate-e2e tap-multiturn.jsonl \
-  --replay-arrivals --replay-sessions --latency-trace h200-qwen3-tap-trace-v2.jsonl \
+  --replay-arrivals --replay-sessions --latency-trace traces/h200-qwen3-8b/h200-qwen3-tap-trace-v2.jsonl \
   --sim-arg=--kv-cache-size --sim-arg=65536 --dump-trace replay-measured.jsonl
 cargo run --release --bin inference-sim-trace -- calibrate-e2e tap-multiturn.jsonl \
   --replay-arrivals --replay-sessions --cold-prompts ... --dump-trace nocache-measured.jsonl

@@ -1,2 +1,6 @@
 /target
 /target-linux
+# Captured trace data (large, and token-recording traces carry model content).
+# The inventory README stays tracked.
+/traces/*
+!/traces/README.md

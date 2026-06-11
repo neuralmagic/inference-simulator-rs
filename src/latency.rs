@@ -73,6 +73,11 @@ impl DecodePacing {
     pub fn note_prefill(&mut self, prompt_tokens: u32) {
         self.pending_stall = Some(self.pending_stall.unwrap_or(0).max(prompt_tokens));
     }
+
+    /// Context bucket this request's decode gaps are conditioned on.
+    pub fn context_bucket(&self) -> usize {
+        self.context_bucket
+    }
 }
 
 impl Default for DecodePacing {
@@ -101,6 +106,29 @@ pub trait LatencyModel: Send {
         _pacing: &mut DecodePacing,
     ) -> Duration {
         self.inter_token_delay(rng, num_running)
+    }
+
+    /// Step-time cost of `chunk_tokens` prefill tokens starting at `kv_depth`
+    /// tokens already in KV (attention makes deep chunks cost more per token).
+    /// This is what elongates co-running decodes' gaps. Zero for models that
+    /// account prefill entirely in `first_token_overhead`.
+    fn prefill_chunk_cost(&self, _chunk_tokens: usize, _kv_depth: usize) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Cost floor for steps whose chunks saturate the token budget: real
+    /// engines pay a premium past the per-token law on max-shape steps. Zero
+    /// disables the floor.
+    fn budget_full_chunk_floor(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Per-request first-token cost beyond the chunk compute that rode the
+    /// step stream. Delays the request's own emissions; never blocks the step
+    /// clock. Defaults to the full first-token delay for models whose prefill
+    /// does not touch the step stream.
+    fn first_token_overhead(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration {
+        self.first_token_delay(rng, ctx)
     }
 }
 
@@ -242,9 +270,9 @@ const PROMPT_EDGES: &[usize] = &[0, 65, 129, 257, 513, 1025, 2049, 4097, 8193, 1
 /// riding alongside (half the capture's 8192-token budget).
 pub const BIG_CHUNK_TOKENS: u32 = 4096;
 
-/// Whether a trace record's decode ran under big-chunk churn: a few percent
-/// of its gaps carry budget-scale admission marks (sweep cells sit under 1%,
-/// churn captures around 8%).
+/// Whether a trace record's decode ran under big-chunk churn: more than 6% of
+/// its gaps carry budget-scale admission marks. Steady sweep cells reach 3-5%
+/// with a calm decode baseline, so the cut sits above them.
 pub fn record_decodes_under_churn(record: &TraceRecord) -> bool {
     record
         .itl_ctx
@@ -255,7 +283,7 @@ pub fn record_decodes_under_churn(record: &TraceRecord) -> bool {
                 .iter()
                 .filter(|&&t| t > BIG_CHUNK_TOKENS)
                 .count();
-            big * 100 > ctx.prefill_tokens.len().max(1) * 3
+            big * 100 > ctx.prefill_tokens.len().max(1) * 6
         })
         .unwrap_or(false)
 }
@@ -512,6 +540,166 @@ fn solve_weighted_poly<const DEG: usize>(windows: &[ServiceWindow]) -> Option<[f
     Some(out)
 }
 
+/// Depth-dependent chunk step cost `c0*tokens + c1*(d1^2 - d0^2)/2` (ms) for
+/// a chunk computing prompt positions `d0..d1`. Drives `prefill_chunk_cost`.
+#[derive(Debug, Clone, Copy, Default)]
+struct ChunkCostFit {
+    /// Per-token compute (ms/token).
+    c0: f64,
+    /// Per-token-per-KV-depth attention cost (ms/token/position).
+    c1: f64,
+}
+
+impl ChunkCostFit {
+    fn eval_ms(&self, chunk_tokens: usize, kv_depth: usize) -> f64 {
+        let t = chunk_tokens as f64;
+        let d0 = kv_depth as f64;
+        let d1 = d0 + t;
+        self.c0 * t + self.c1 * (d1 * d1 - d0 * d0) / 2.0
+    }
+}
+
+/// Fit `ChunkCostFit` from prefill-admission marks. The tap marks the step
+/// that emitted a request's first token, i.e. the prompt's FINAL chunk
+/// (tap.rs `step_prefill_tokens`). Only isolated marks count (another mark
+/// within two gaps means stacked chunks), and an iteratively trimmed least
+/// squares rejects residual stacking. Zero fit when the trace is too sparse;
+/// `first_token_overhead` then carries the whole first-token delay.
+fn fit_chunk_cost(records: &[TraceRecord], budget: usize) -> ChunkCostFit {
+    let budget = budget.max(1);
+    // (tokens, depth_integral, surcharge_ms)
+    let mut obs: Vec<(f64, f64, f64)> = Vec::new();
+    for record in records {
+        let (Some(itls), Some(ctx)) = (&record.itl_ms, &record.itl_ctx) else {
+            continue;
+        };
+        let marks = &ctx.prefill_tokens;
+        if marks.len() != itls.len() {
+            continue;
+        }
+        let mut clean: Vec<f64> = itls
+            .iter()
+            .zip(marks)
+            .filter(|&(_, &m)| m == 0)
+            .map(|(&g, _)| g)
+            .collect();
+        if clean.len() < 5 {
+            continue;
+        }
+        clean.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let base = clean[clean.len() / 2];
+        for (i, (&gap, &mark)) in itls.iter().zip(marks).enumerate() {
+            let prompt = mark as usize;
+            if prompt == 0 {
+                continue;
+            }
+            let final_chunk = ((prompt - 1) % budget) + 1;
+            if final_chunk < 256 {
+                continue;
+            }
+            let lo = i.saturating_sub(2);
+            let hi = (i + 3).min(marks.len());
+            if (lo..hi).any(|j| j != i && marks[j] > 0) {
+                continue;
+            }
+            let d1 = prompt as f64;
+            let d0 = (prompt - final_chunk) as f64;
+            obs.push((
+                final_chunk as f64,
+                (d1 * d1 - d0 * d0) / 2.0,
+                (gap - base).max(0.0),
+            ));
+        }
+    }
+
+    const MIN_OBS: usize = 30;
+    let lstsq2 = |obs: &[(f64, f64, f64)]| -> Option<(f64, f64)> {
+        let (mut saa, mut sab, mut sbb, mut say, mut sby) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for &(a, b, y) in obs {
+            saa += a * a;
+            sab += a * b;
+            sbb += b * b;
+            say += a * y;
+            sby += b * y;
+        }
+        let det = saa * sbb - sab * sab;
+        if det.abs() < 1e-9 {
+            return None;
+        }
+        Some(((sbb * say - sab * sby) / det, (saa * sby - sab * say) / det))
+    };
+
+    let mut kept = obs;
+    let mut fit = (0.0, 0.0);
+    for _ in 0..4 {
+        if kept.len() < MIN_OBS {
+            return ChunkCostFit::default();
+        }
+        let Some(round) = lstsq2(&kept) else {
+            return ChunkCostFit::default();
+        };
+        fit = round;
+        let mut scored: Vec<(f64, (f64, f64, f64))> = kept
+            .into_iter()
+            .map(|o| ((fit.0 * o.0 + fit.1 * o.1 - o.2).abs(), o))
+            .collect();
+        scored.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(scored.len() * 4 / 5);
+        kept = scored.into_iter().map(|(_, o)| o).collect();
+    }
+    let (c0, c1) = fit;
+    if c0 < 0.0 || c1 < 0.0 {
+        // A negative term means the mark mixture defeated the trim; refuse
+        // rather than model chunks that speed steps up.
+        return ChunkCostFit::default();
+    }
+    ChunkCostFit { c0, c1 }
+}
+
+/// Median surcharge of unmarked gaps within 0.8x-2.5x of the law's own
+/// full-budget prediction: the budget-saturated chunk steps the tap never
+/// marks. The window anchors to the law, not the decode base, so it stays
+/// valid across models. 0.0 with too few observations or no chunk fit.
+fn fit_full_step_floor(records: &[TraceRecord], chunk_cost: &ChunkCostFit, budget: usize) -> f64 {
+    let law_full = chunk_cost.eval_ms(budget.max(1), 0);
+    if law_full <= 0.0 {
+        return 0.0;
+    }
+    let (lo, hi) = (0.8 * law_full, 2.5 * law_full);
+    let mut obs: Vec<f64> = Vec::new();
+    for record in records {
+        let (Some(itls), Some(ctx)) = (&record.itl_ms, &record.itl_ctx) else {
+            continue;
+        };
+        let marks = &ctx.prefill_tokens;
+        if marks.len() != itls.len() {
+            continue;
+        }
+        let mut clean: Vec<f64> = itls
+            .iter()
+            .zip(marks)
+            .filter(|&(_, &m)| m == 0)
+            .map(|(&g, _)| g)
+            .collect();
+        if clean.len() < 5 {
+            continue;
+        }
+        clean.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let base = clean[clean.len() / 2];
+        obs.extend(
+            itls.iter()
+                .zip(marks)
+                .filter(|&(&g, &m)| m == 0 && (lo..=hi).contains(&(g - base)))
+                .map(|(&g, _)| g - base),
+        );
+    }
+    if obs.len() < 30 {
+        return 0.0;
+    }
+    obs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    obs[obs.len() / 2]
+}
+
 /// Replay latency model fit from recorded observations.
 ///
 /// The decomposition matters: `first_token_delay` is prefill SERVICE time
@@ -548,17 +736,26 @@ pub struct TraceLatency {
     /// Fallback for do_remote_prefill KV-transfer timing (the trace does not record
     /// transfer latencies from disaggregated decode pulls).
     kv_transfer_fallback: KnobLatency,
+    /// Depth-dependent chunk step cost; see `fit_chunk_cost`.
+    chunk_cost: ChunkCostFit,
+    /// Budget-saturated step premium; see `fit_full_step_floor`.
+    full_step_floor_ms: f64,
+    /// The capture's per-step token budget; chunk-step charging in
+    /// `first_token_overhead` mirrors the engine's chunking against it.
+    budget_tokens: usize,
     #[allow(dead_code)]
     meta: TraceMeta,
 }
 
 impl TraceLatency {
-    /// Build from parsed trace records. Returns an error if the trace has no
-    /// records or no decode-pacing data.
+    /// Build from parsed trace records. `max_batched_tokens` must match the
+    /// capture's per-step token budget (chunk sizes are derived from it).
+    /// Returns an error if the trace has no records or no decode-pacing data.
     pub fn from_records(
         meta: TraceMeta,
         records: &[TraceRecord],
         kv_transfer_fallback: KnobLatency,
+        max_batched_tokens: usize,
     ) -> anyhow::Result<Self> {
         if records.is_empty() {
             anyhow::bail!("trace has no records; cannot build a replay latency model");
@@ -694,6 +891,8 @@ impl TraceLatency {
         floor_obs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let service_fit = fit_service_curve(&service_windows(&floor_obs));
 
+        let chunk_cost = fit_chunk_cost(records, max_batched_tokens);
+
         Ok(TraceLatency {
             service_fit,
             service_by_prompt,
@@ -701,6 +900,9 @@ impl TraceLatency {
             donors_grid,
             stalls_grid,
             kv_transfer_fallback,
+            chunk_cost,
+            full_step_floor_ms: fit_full_step_floor(records, &chunk_cost, max_batched_tokens),
+            budget_tokens: max_batched_tokens.max(1),
             meta,
         })
     }
@@ -884,6 +1086,41 @@ impl LatencyModel for TraceLatency {
         };
         let ms = sample_inverse_cdf(rng, &bucket.donors[donor_idx].gaps);
         Duration::from_secs_f64(ms / 1000.0)
+    }
+
+    fn budget_full_chunk_floor(&self) -> Duration {
+        Duration::from_secs_f64(self.full_step_floor_ms / 1000.0)
+    }
+
+    fn prefill_chunk_cost(&self, chunk_tokens: usize, kv_depth: usize) -> Duration {
+        Duration::from_secs_f64(self.chunk_cost.eval_ms(chunk_tokens, kv_depth).max(0.0) / 1000.0)
+    }
+
+    /// The fitted service curve minus what the step stream charges an
+    /// isolated request (full chunks pay the saturated-step premium, the
+    /// final partial pays the law) - the chunking `T(u)` was fitted under,
+    /// so isolated TTFT == T(u) by construction. A loaded drain step charging
+    /// the decode base instead is real added latency, not double-counted.
+    fn first_token_overhead(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration {
+        let total = self.first_token_delay(rng, ctx);
+        if ctx.do_remote_prefill {
+            return total;
+        }
+        let mut left = ctx
+            .num_prompt_tokens
+            .saturating_sub(ctx.num_cached_tokens)
+            .max(1);
+        let mut depth = ctx.num_cached_tokens;
+        let mut charged = Duration::ZERO;
+        while left > self.budget_tokens {
+            charged += self
+                .prefill_chunk_cost(self.budget_tokens, depth)
+                .max(self.budget_full_chunk_floor());
+            depth += self.budget_tokens;
+            left -= self.budget_tokens;
+        }
+        charged += self.prefill_chunk_cost(left, depth);
+        total.saturating_sub(charged)
     }
 }
 
@@ -1080,9 +1317,13 @@ mod tests {
 
     #[test]
     fn trace_service_fit_recovers_quadratic() {
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &quad_floor_records(), zero_knob())
-                .unwrap();
+        let trace = TraceLatency::from_records(
+            TraceMeta::default(),
+            &quad_floor_records(),
+            zero_knob(),
+            8192,
+        )
+        .unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         // Interpolated and extrapolated points; the fit is deterministic.
         for u in [500usize, 2_000, 5_000, 7_800, 11_000] {
@@ -1109,7 +1350,7 @@ mod tests {
             }
         }
         let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         let got = trace
             .first_token_delay(&mut rng, &ctx(5_000, 0, false, 1))
@@ -1124,9 +1365,13 @@ mod tests {
 
     #[test]
     fn trace_service_fit_clamps_to_floor() {
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &quad_floor_records(), zero_knob())
-                .unwrap();
+        let trace = TraceLatency::from_records(
+            TraceMeta::default(),
+            &quad_floor_records(),
+            zero_knob(),
+            8192,
+        )
+        .unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         // u=1: the raw curve sits near its intercept; the clamp keeps the
         // result at or above the smallest observed window floor.
@@ -1168,7 +1413,7 @@ mod tests {
 
     #[test]
     fn trace_empty_records_is_error() {
-        let result = TraceLatency::from_records(TraceMeta::default(), &[], zero_knob());
+        let result = TraceLatency::from_records(TraceMeta::default(), &[], zero_knob(), 8192);
         assert!(result.is_err());
     }
 
@@ -1180,7 +1425,7 @@ mod tests {
             make_record(60, 1, 42.0, vec![], 1),
         ];
         let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(99);
         for _ in 0..100 {
             let d = trace.first_token_delay(&mut rng, &ctx(55, 0, false, 1));
@@ -1196,7 +1441,7 @@ mod tests {
             make_record(40, 3, 15.0, vec![6.0, 10.0], 1),
         ];
         let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         for _ in 0..1000 {
             let ttft = trace.first_token_delay(&mut rng, &ctx(50, 0, false, 1));
@@ -1222,7 +1467,7 @@ mod tests {
             make_record(120, 3, 35.0, vec![7.0, 8.0], 2),
         ];
         let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
 
         let run = |seed: u64| {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -1251,7 +1496,7 @@ mod tests {
         // Only populate a single cell: prompt 30 tokens, concurrency 1.
         let records = vec![make_record(30, 2, 77.0, vec![11.0], 1)];
         let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
 
         // A much larger prompt borrows the only populated bucket's service
@@ -1287,7 +1532,7 @@ mod tests {
             block_hashes: None,
         }];
         let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
 
         // All ITL samples are 9.0, so sampling always returns 9.0.
@@ -1319,7 +1564,7 @@ mod tests {
             block_hashes: None,
         }];
         let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
         let mut pacing = DecodePacing::default();
 
@@ -1360,7 +1605,7 @@ mod tests {
             make_record(100, 10, 40.0, vec![50.0; 9], 4),
         ];
         let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
 
         let mut seen_fast_request = false;
@@ -1408,7 +1653,7 @@ mod tests {
             make_record(50, 1, 42.0, vec![], 1),
             make_record(60, 1, 42.0, vec![], 1),
         ];
-        let result = TraceLatency::from_records(TraceMeta::default(), &records, zero_knob());
+        let result = TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192);
         let error = result.err().expect("ITL-less trace must be rejected");
         assert!(error.to_string().contains("inter-token"), "got: {error}");
     }
@@ -1418,11 +1663,126 @@ mod tests {
         let records = vec![make_record(50, 2, 10.0, vec![1.0], 1)];
         let mut knob = zero_knob();
         knob.kv_cache_transfer_latency = 500;
-        let trace = TraceLatency::from_records(TraceMeta::default(), &records, knob).unwrap();
+        let trace = TraceLatency::from_records(TraceMeta::default(), &records, knob, 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
 
         let d = trace.first_token_delay(&mut rng, &ctx(50, 0, true, 1));
         assert_eq!(d, std::time::Duration::from_millis(500));
+    }
+
+    /// Records with 10ms clean gaps and isolated FINAL-CHUNK admission marks:
+    /// each mark carries the admitted prompt's full token count, and the
+    /// marked gap costs `10 + c0*uf + c1*(d1^2-d0^2)/2` for that prompt's
+    /// final chunk at an 8192-token budget. Prompt sizes cycle so the fit
+    /// sees distinct (tokens, depth) points.
+    fn marked_records(n_records: usize, c0: f64, c1: f64, positions: &[usize]) -> Vec<TraceRecord> {
+        const PROMPTS: [usize; 4] = [2048, 4096, 16384, 11008];
+        (0..n_records)
+            .map(|_| {
+                let mut itl = vec![10.0; 40];
+                let mut marks = vec![0u32; 40];
+                for (k, &i) in positions.iter().enumerate() {
+                    let prompt = PROMPTS[k % PROMPTS.len()];
+                    let uf = ((prompt - 1) % 8192) + 1;
+                    let (d0, d1) = ((prompt - uf) as f64, prompt as f64);
+                    itl[i] = 10.0 + c0 * uf as f64 + c1 * (d1 * d1 - d0 * d0) / 2.0;
+                    marks[i] = prompt as u32;
+                }
+                TraceRecord {
+                    prompt_tokens: 16384,
+                    cached_tokens: 0,
+                    output_tokens: 41,
+                    ttft_ms: 300.0,
+                    itl_ms: Some(itl),
+                    itl_summary: None,
+                    concurrency: 4,
+                    arrival_ms: None,
+                    itl_ctx: Some(crate::trace::ItlContext {
+                        num_running: vec![4; 40],
+                        prefill_tokens: marks,
+                    }),
+                    block_hashes: None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chunk_cost_fit_recovers_isolated_marks() {
+        let (c0, c1) = (0.012, 2.0e-6);
+        let records = marked_records(20, c0, c1, &[5, 15, 25, 35]);
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+
+        // A full budget chunk at depth 0.
+        let cost = trace.prefill_chunk_cost(8192, 0).as_secs_f64() * 1000.0;
+        let want = c0 * 8192.0 + c1 * (8192.0f64 * 8192.0) / 2.0;
+        assert!(
+            (cost - want).abs() < 1.0,
+            "chunk(8192@0) {cost:.1}ms, want ~{want:.1}ms"
+        );
+
+        // The same tokens deep in a prompt cost more (attention over the KV).
+        let deep = trace.prefill_chunk_cost(2816, 8192).as_secs_f64() * 1000.0;
+        let want_deep = c0 * 2816.0 + c1 * (11008.0f64 * 11008.0 - 8192.0f64 * 8192.0) / 2.0;
+        assert!(
+            (deep - want_deep).abs() < 1.0,
+            "chunk(2816@8192) {deep:.1}ms, want ~{want_deep:.1}ms"
+        );
+        assert!(deep > trace.prefill_chunk_cost(2816, 0).as_secs_f64() * 1000.0);
+
+        // Zero tokens ride for free.
+        assert_eq!(trace.prefill_chunk_cost(0, 0), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn chunk_cost_fit_rejects_stacked_marks() {
+        // Adjacent marks mean two admissions' chunks share measured gaps; with
+        // no isolated marks left the fit must refuse rather than double-count.
+        let records = marked_records(10, 0.024, 4.0e-6, &[5, 6, 15, 16]);
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        assert_eq!(trace.prefill_chunk_cost(8192, 0), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn prefill_overhead_subtracts_chunk_compute() {
+        // Quadratic service records pin T(u); marked records pin the chunk fit.
+        let (c0, c1) = (0.012, 2.0e-6);
+        let mut records = quad_floor_records();
+        records.extend(marked_records(20, c0, c1, &[5, 15, 25, 35]));
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let u = 5_000usize;
+        let total = trace
+            .first_token_delay(&mut rng, &ctx(u, 0, false, 1))
+            .as_secs_f64()
+            * 1000.0;
+        let overhead = trace
+            .first_token_overhead(&mut rng, &ctx(u, 0, false, 1))
+            .as_secs_f64()
+            * 1000.0;
+        let want = total - (c0 * u as f64 + c1 * (u as f64 * u as f64) / 2.0);
+        assert!(
+            (overhead - want).abs() < 1.0,
+            "overhead {overhead:.1}ms, want ~{want:.1}ms (T(u) {total:.1}ms)"
+        );
+    }
+
+    #[test]
+    fn knob_model_prefill_stays_off_the_step_stream() {
+        // Knob-style models account the whole prefill in the overhead; chunk
+        // steps cost nothing.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let mut m = model();
+        m.prefill_overhead = 100;
+        m.prefill_time_per_token = 2;
+        assert_eq!(m.prefill_chunk_cost(8192, 0), std::time::Duration::ZERO);
+        assert_eq!(
+            m.first_token_overhead(&mut rng, &ctx(50, 10, false, 1)),
+            std::time::Duration::from_millis(180)
+        );
     }
 
     #[test]

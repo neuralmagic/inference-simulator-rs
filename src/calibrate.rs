@@ -592,7 +592,7 @@ pub fn dump_samples(records: &[TraceRecord], num_samples: usize, seed: u64) -> R
     source_ttft.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     source_itl.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    let trace_model = TraceLatency::from_records(TraceMeta::default(), records, zero_knob())
+    let trace_model = TraceLatency::from_records(TraceMeta::default(), records, zero_knob(), 8192)
         .context("building TraceLatency for replay")?;
     let (_, replay_ttft, replay_itl) =
         sample_model_to_buckets(&trace_model, records, samples_per_record, seed);
@@ -636,7 +636,7 @@ pub fn calibrate(
     let source = quantiles_from_buckets(&source_buckets, &source_pooled_ttft, &source_pooled_itl);
 
     // REPLAY: build TraceLatency with a zero KnobLatency fallback
-    let trace_model = TraceLatency::from_records(TraceMeta::default(), records, zero_knob())
+    let trace_model = TraceLatency::from_records(TraceMeta::default(), records, zero_knob(), 8192)
         .context("building TraceLatency for replay")?;
 
     let (replay_buckets, replay_pooled_ttft, replay_pooled_itl) =
@@ -1879,7 +1879,7 @@ mod tests {
         // Build TraceLatency from original records, but compare against shifted source.
         // The replay (from original records) should NOT match shifted source quantiles.
         let replay_model =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
 
         // Sample from the replay model using the shifted records' contexts
         let samples_per_record = 200;

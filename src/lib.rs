@@ -369,10 +369,13 @@ impl Opt {
         // The KV-transfer knobs are NOT mutually exclusive: the trace does not cover
         // P/D transfer timing, so the knob model handles do_remote_prefill requests.
         let kv_fallback = self.latency_model();
-        let trace_model = latency::TraceLatency::from_records(meta, &records, kv_fallback)
-            .with_context(|| {
-                format!("building trace latency model from: {}", self.latency_trace)
-            })?;
+        let trace_model = latency::TraceLatency::from_records(
+            meta,
+            &records,
+            kv_fallback,
+            self.max_num_batched_tokens as usize,
+        )
+        .with_context(|| format!("building trace latency model from: {}", self.latency_trace))?;
 
         Ok(Box::new(trace_model))
     }

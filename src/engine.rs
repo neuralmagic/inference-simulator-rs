@@ -454,17 +454,14 @@ struct PendingPull {
 /// Result sent from a `spawn_blocking` pull task back to the engine loop.
 type PullCompletion = (String, Result<u64>);
 
-/// One prefill's chunk steps as concurrent decodes see them, in scaled wall time. The
-/// span `[start, end)` covers only the chunk COMPUTE (occupancy); the rest of the
-/// prefill's service (scheduling overhead the engine pipelines past decode steps)
-/// advances the stream tail but stalls nobody. Chunk boundaries inside the span sit at
-/// token-proportional positions, so a full first chunk costs more than a partial last.
+/// Internal state for one engine instance, owned by the engine loop task.
+/// One prefill's chunk steps occupying the engine's serial step stream, in scaled wall time.
 #[derive(Debug, Clone, Copy)]
 struct PrefillWindow {
     start: Instant,
     end: Instant,
-    /// Uncached prompt tokens; places the chunk boundaries (one per budget's worth).
-    uncached: u32,
+    /// Chunk-step count: tokens due inside the window slip to chunk boundaries.
+    chunks: u32,
     /// Whether this prefill found the engine already loaded at admission: it queued
     /// behind the stream tail, or the running batch was past the heaviest load real
     /// captures show the engine hiding chunks at (zero decode elongation up to
@@ -517,11 +514,6 @@ pub(crate) struct SimEngine {
     /// engine hides the chunk), with the 100ms+ stalls appearing only once prefills arrive
     /// faster than the stream drains. Drained windows are dropped at the next admission.
     prefill_busy: VecDeque<PrefillWindow>,
-    /// Where the serial prefill stream's tail ends in scaled wall time: the next prefill's
-    /// chunks start here. Advanced by each admission's FULL service time (chunk compute
-    /// plus the per-prefill scheduling overhead), so prefill-behind-prefill first-token
-    /// queueing accrues at service rate even though decodes only see the occupancy spans.
-    prefill_tail: Instant,
     /// Sender half for pull completion results. Cloned into each `spawn_blocking` task.
     pull_completion_tx: mpsc::UnboundedSender<PullCompletion>,
     /// Receiver half; wrapped in Option so `take_internal_rx` can hand it to the loop once.
@@ -972,25 +964,27 @@ impl SimEngine {
                     } else {
                         1.0
                     };
+                    let budget = (self.opt.max_num_batched_tokens as usize).max(1);
                     let uncached = active.prompt_len - num_local_cached;
-                    let start = self.prefill_tail.max(now);
+                    let chunks = uncached.div_ceil(budget) as u32;
+                    let start = match self.prefill_busy.back() {
+                        Some(w) if w.end > now => w.end,
+                        _ => now,
+                    };
                     // Decodes see the chunk steps' compute, not the prefill's
                     // full service time (which also carries scheduling
-                    // overhead the engine pipelines past decode steps). The
-                    // tail still advances by full service: that is the rate
-                    // queued prefills' first tokens drain at.
+                    // overhead the engine pipelines past decode steps).
                     let occupancy = self
                         .latency
                         .prefill_occupancy(uncached)
                         .unwrap_or(active.prefill_service)
                         .min(active.prefill_service);
                     let end = start + occupancy.div_f64(time_scale);
-                    self.prefill_tail = start + active.prefill_service.div_f64(time_scale);
                     active.next_at += start.saturating_duration_since(now);
                     self.prefill_busy.push_back(PrefillWindow {
                         start,
                         end,
-                        uncached: uncached as u32,
+                        chunks,
                         stalls_decodes: start > now || num_running > CHUNK_HIDING_MAX_RUNNING,
                     });
                 }
@@ -1210,16 +1204,11 @@ impl SimEngine {
                         break;
                     }
                     if w.stalls_decodes {
-                        // Chunk boundaries sit at token-proportional positions:
-                        // slip to the end of the chunk the token is due inside.
                         let dur = w.end.duration_since(w.start).as_secs_f64();
                         let into = due.duration_since(w.start).as_secs_f64();
-                        let budget = (self.opt.max_num_batched_tokens as f64).max(1.0);
-                        let tokens = f64::from(w.uncached.max(1));
-                        let token_pos = into / dur * tokens;
-                        let boundary_tokens =
-                            ((token_pos / budget).ceil().max(1.0) * budget).min(tokens);
-                        next = w.start + Duration::from_secs_f64(dur * boundary_tokens / tokens);
+                        let n = w.chunks.max(1) as f64;
+                        let boundary = (into / dur * n).ceil().clamp(1.0, n);
+                        next = w.start + Duration::from_secs_f64(dur * boundary / n);
                     }
                     break;
                 }
@@ -1393,7 +1382,6 @@ impl SimEngine {
             waiting: VecDeque::new(),
             pending_pulls: BTreeMap::new(),
             prefill_busy: VecDeque::new(),
-            prefill_tail: Instant::now(),
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
         })
@@ -1488,7 +1476,6 @@ mod tests {
             waiting: VecDeque::new(),
             pending_pulls: BTreeMap::new(),
             prefill_busy: VecDeque::new(),
-            prefill_tail: Instant::now(),
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
             opt,

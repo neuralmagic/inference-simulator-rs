@@ -1329,8 +1329,24 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
     let opt = crate::Opt::parse_from(&args);
     let token = CancellationToken::new();
     let sim_token = token.clone();
-    tokio::spawn(async move {
-        let _ = crate::run(opt, sim_token).await;
+    // The engine gets its own runtime on a dedicated thread. Sharing the
+    // harness runtime starves the engine's step loop in 35-170ms bursts
+    // while hundreds of measurement streams churn (16% of emissions land
+    // >10ms late, draining as fabricated zero-gaps); the real capture
+    // topology runs the engine as a separate process.
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!("engine runtime construction failed: {error:#}");
+                return;
+            }
+        };
+        let _ = runtime.block_on(crate::run(opt, sim_token));
     });
 
     let config = EngineCoreClientConfig::new_single(&addr);

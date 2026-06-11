@@ -272,6 +272,11 @@ struct ActiveRequest {
     /// block every running decode by the same amount: prefill chunks and decode steps run
     /// in one serial engine step stream, so a prefill delays everyone, not just itself.
     prefill_service: Duration,
+    /// Per-step interference owed to prefill chunks admitted while this request decodes.
+    /// Each admitted chunk pushes one surcharge; each emitted token pops one and stretches
+    /// that gap by it, smearing the prefill's service across the chunk window the way real
+    /// chunked prefill elongates the steps it rides in (instead of one giant gap).
+    step_surcharges: VecDeque<Duration>,
     /// When the next output token is due. Set to `now + first-token delay` at admission, then
     /// advanced by the inter-token delay after each emitted token. The engine loop sleeps
     /// until the earliest deadline across all active requests, so this is the timing model.
@@ -378,6 +383,7 @@ impl ActiveRequest {
             block_ids,
             lora_name,
             prefill_service: first_delay,
+            step_surcharges: VecDeque::new(),
             next_at: Instant::now() + (first_delay + step_wait).div_f64(time_scale),
         })
     }
@@ -919,24 +925,25 @@ impl SimEngine {
             block_ids.clone(),
         ) {
             Ok(active) => {
-                // This admission starts a prefill chunk in the engine's single
-                // serial step stream, so every running decode's next token is
-                // pushed out by the prefill's service time. Remote-prefill
-                // requests (P/D decode side) burned their prefill on another
-                // node and merely join the batch; full cache hits run no chunk.
-                // Either way they block nothing.
+                // This admission runs its prefill as chunked steps in the
+                // engine's single serial step stream, so every running
+                // decode's next few gaps stretch by one chunk's service time
+                // each (the prefill's total service spread over its chunks).
+                // Remote-prefill requests (P/D decode side) burned their
+                // prefill on another node and merely join the batch; full
+                // cache hits run no chunk. Either way they block nothing.
                 let blocks_engine = !active.remote_prefill
                     && active.prompt_len > num_local_cached
                     && !self.active_requests.is_empty();
                 if blocks_engine {
-                    let time_scale = if self.opt.time_scale > 0.0 {
-                        self.opt.time_scale
-                    } else {
-                        1.0
-                    };
-                    let block = active.prefill_service.div_f64(time_scale);
+                    let budget = (self.opt.max_num_batched_tokens as usize).max(1);
+                    let uncached = active.prompt_len - num_local_cached;
+                    let chunks = uncached.div_ceil(budget);
+                    let per_chunk = active.prefill_service.div_f64(chunks as f64);
                     for running in self.active_requests.values_mut() {
-                        running.next_at += block;
+                        running
+                            .step_surcharges
+                            .extend(std::iter::repeat_n(per_chunk, chunks));
                     }
                 }
                 self.active_requests.insert(request_id, active);
@@ -1134,12 +1141,16 @@ impl SimEngine {
                     num_running,
                     &mut request.pacing,
                 );
+                let surcharge = request
+                    .step_surcharges
+                    .pop_front()
+                    .unwrap_or(Duration::ZERO);
                 let time_scale = if self.opt.time_scale > 0.0 {
                     self.opt.time_scale
                 } else {
                     1.0
                 };
-                request.next_at = now + gap.div_f64(time_scale);
+                request.next_at = now + (gap + surcharge).div_f64(time_scale);
             }
 
             let (outs, finished_set) = by_client

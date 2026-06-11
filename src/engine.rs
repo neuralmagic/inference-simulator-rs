@@ -462,16 +462,18 @@ struct PrefillWindow {
     end: Instant,
     /// Chunk-step count: tokens due inside the window slip to chunk boundaries.
     chunks: u32,
-    /// End of the decode-stalling span: the chunk COMPUTE share of the window. The
-    /// rest of the service time (per-request overhead) pipelines past decode steps
-    /// and stalls nobody.
-    stall_end: Instant,
-    /// Whether this prefill's chunks stall concurrent decodes: true for multi-chunk
-    /// prefills (their budget-saturated steps exclude decode tokens), false for
-    /// single-chunk ones (they share their step; real captures show zero decode
-    /// elongation from sub-budget admissions regardless of batch size).
+    /// Whether this prefill found the engine already loaded at admission: it queued
+    /// behind the stream tail, or the running batch was past the heaviest load real
+    /// captures show the engine hiding chunks at (zero decode elongation up to
+    /// concurrency 8 at light load; full chunk-step stalls near saturation). Only
+    /// loaded windows stall decodes; an isolated prefill's chunk is hidden.
     stalls_decodes: bool,
 }
+
+/// Largest running batch at which real captures still show ZERO decode elongation from
+/// a prefill admission (held-out multiturn capture, concurrency <= 8, surcharge ~0.1ms).
+/// Past it the engine's chunk-hiding capacity is exhausted and decodes ride chunk steps.
+const CHUNK_HIDING_MAX_RUNNING: u64 = 8;
 
 pub(crate) struct SimEngine {
     engine_index: u32,
@@ -974,23 +976,12 @@ impl SimEngine {
                         _ => now,
                     };
                     let end = start + active.prefill_service.div_f64(time_scale);
-                    // Decodes are excluded only while the chunk COMPUTE drains;
-                    // the remaining service is per-request overhead pipelined
-                    // past their steps.
-                    let stall_end = start
-                        + self
-                            .latency
-                            .prefill_occupancy(uncached)
-                            .unwrap_or(active.prefill_service)
-                            .min(active.prefill_service)
-                            .div_f64(time_scale);
                     active.next_at += start.saturating_duration_since(now);
                     self.prefill_busy.push_back(PrefillWindow {
                         start,
                         end,
-                        stall_end,
                         chunks,
-                        stalls_decodes: chunks > 1,
+                        stalls_decodes: start > now || num_running > CHUNK_HIDING_MAX_RUNNING,
                     });
                 }
                 self.active_requests.insert(request_id, active);
@@ -1207,18 +1198,18 @@ impl SimEngine {
                 let due = request.next_at + gap.div_f64(time_scale);
                 let mut next = due;
                 for w in &self.prefill_busy {
-                    if w.stall_end <= due {
+                    if w.end <= due {
                         continue;
                     }
                     if w.start >= due {
                         break;
                     }
                     if w.stalls_decodes {
-                        let span = w.stall_end.duration_since(w.start).as_secs_f64();
+                        let dur = w.end.duration_since(w.start).as_secs_f64();
                         let into = due.duration_since(w.start).as_secs_f64();
                         let n = w.chunks.max(1) as f64;
-                        let boundary = (into / span * n).ceil().clamp(1.0, n);
-                        next = w.start + Duration::from_secs_f64(span * boundary / n);
+                        let boundary = (into / dur * n).ceil().clamp(1.0, n);
+                        next = w.start + Duration::from_secs_f64(dur * boundary / n);
                     }
                     break;
                 }

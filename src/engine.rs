@@ -967,12 +967,15 @@ impl SimEngine {
                     let budget = (self.opt.max_num_batched_tokens as usize).max(1);
                     let uncached = active.prompt_len - num_local_cached;
                     let chunks = uncached.div_ceil(budget) as u32;
-                    // A single-chunk prefill shares its step with whatever else
-                    // is pending, so it never waits behind the stream tail;
-                    // only multi-chunk prefills own their steps and serialize
-                    // behind each other.
+                    // A single-chunk prefill admitted to a light batch shares
+                    // its step with whatever else is pending, so it never
+                    // waits behind the stream tail. Multi-chunk prefills own
+                    // their steps and serialize behind each other, and past
+                    // the hiding bound even small chunks queue: both sweeps
+                    // show loaded small-prompt TTFT floors well above idle.
+                    let queues = chunks > 1 || num_running > CHUNK_HIDING_MAX_RUNNING;
                     let start = match self.prefill_busy.back() {
-                        Some(w) if chunks > 1 && w.end > now => w.end,
+                        Some(w) if queues && w.end > now => w.end,
                         _ => now,
                     };
                     let end = start + active.prefill_service.div_f64(time_scale);

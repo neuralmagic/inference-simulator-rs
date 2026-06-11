@@ -93,6 +93,15 @@ pub trait LatencyModel: Send {
     ) -> Duration {
         self.inter_token_delay(rng, num_running)
     }
+
+    /// Engine wall-clock occupancy of a prefill's chunk steps: the duration
+    /// concurrent decodes are slowed by, which is shorter than the prefill's
+    /// full first-token service (that also carries scheduling overhead the
+    /// engine hides behind decode steps). `None` when the model cannot
+    /// separate the two; callers then use the service time.
+    fn prefill_occupancy(&self, _uncached_tokens: usize, _chunks: u32) -> Option<Duration> {
+        None
+    }
 }
 
 /// All timing knobs, in milliseconds (except the unitless `time_factor_under_load`).
@@ -324,6 +333,75 @@ struct ServiceCell {
     median_uncached: f64,
 }
 
+/// The chunked-prefill token budget the capture ran with
+/// (`--max-num-batched-tokens`). A marked gap reflects at most one chunk step,
+/// so surcharge observations saturate here.
+const CHUNK_BUDGET_TOKENS: u32 = 8192;
+
+/// Engine wall-clock occupancy of one prefill chunk step, fitted as
+/// `step_ms = beta + alpha * chunk_tokens` over marked-gap surcharges (the
+/// gap's excess over its record's clean median). This is what concurrent
+/// decodes SEE of a prefill: less than the prefill's full service time, which
+/// also carries scheduling overhead the engine pipelines past decode steps.
+#[derive(Debug, Clone, Copy)]
+struct OccupancyFit {
+    beta_ms: f64,
+    alpha_ms_per_token: f64,
+}
+
+impl OccupancyFit {
+    /// Total busy-window duration of a prefill: `chunks` steps of overhead
+    /// plus the per-token compute over all uncached tokens.
+    fn window_ms(&self, uncached_tokens: f64, chunks: u32) -> f64 {
+        (self.beta_ms * f64::from(chunks.max(1)) + self.alpha_ms_per_token * uncached_tokens)
+            .max(0.0)
+    }
+}
+
+/// Fit the chunk-step occupancy law from marked-gap surcharges, bucketed by
+/// prompt bucket of the chunk tokens (median per bucket, count-weighted).
+/// Requires two distinct buckets for the affine fit; one bucket falls back to
+/// a through-origin slope; none yields `None` (callers use full service).
+fn fit_occupancy(obs: &[(f64, f64)]) -> Option<OccupancyFit> {
+    let mut by_bucket: Vec<Vec<(f64, f64)>> = vec![Vec::new(); NUM_PROMPT_BUCKETS];
+    for &(tokens, surcharge) in obs {
+        by_bucket[prompt_bucket(tokens as usize)].push((tokens, surcharge));
+    }
+    let windows: Vec<ServiceWindow> = by_bucket
+        .into_iter()
+        .filter(|cell| cell.len() >= 5)
+        .map(|mut cell| {
+            cell.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let median_surcharge = cell[cell.len() / 2].1;
+            cell.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            ServiceWindow {
+                u: cell[cell.len() / 2].0,
+                p10_ms: median_surcharge,
+                count: cell.len(),
+            }
+        })
+        .collect();
+    if windows.len() >= 2
+        && let Some([beta, alpha]) = solve_weighted_poly::<2>(&windows)
+        && beta >= 0.0
+        && alpha >= 0.0
+    {
+        return Some(OccupancyFit {
+            beta_ms: beta,
+            alpha_ms_per_token: alpha,
+        });
+    }
+    // Through-origin slope over everything we saw.
+    let (sxy, sxx) = windows.iter().fold((0.0, 0.0), |(sxy, sxx), w| {
+        let weight = (w.count as f64).sqrt();
+        (sxy + weight * w.u * w.p10_ms, sxx + weight * w.u * w.u)
+    });
+    (sxx > 0.0 && sxy > 0.0).then(|| OccupancyFit {
+        beta_ms: 0.0,
+        alpha_ms_per_token: sxy / sxx,
+    })
+}
+
 /// Parametric prefill service curve `T(u) = a + b*u + c*u^2` (ms, u = uncached
 /// prompt tokens), least-squares fitted to p10-TTFT floors of sliding token
 /// windows over the trace's lowest-concurrency records. The low percentile
@@ -494,6 +572,9 @@ pub struct TraceLatency {
     /// Parametric service curve fitted across all prompt sizes; the primary
     /// first-token model when the trace supports it (see `ServiceFit`).
     service_fit: Option<ServiceFit>,
+    /// Chunk-step occupancy law fitted from marked-gap surcharges; sizes the
+    /// engine's prefill busy windows (see `OccupancyFit`).
+    occupancy_fit: Option<OccupancyFit>,
     /// First-token service time per uncached-prompt bucket. Fallback when the
     /// trace is too sparse to fit a service curve.
     service_by_prompt: Vec<Option<ServiceCell>>,
@@ -534,6 +615,9 @@ impl TraceLatency {
             vec![vec![DonorBucket::default(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
         let mut stalls_grid = vec![vec![Vec::new(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
         let mut itl_by_concurrency = vec![Vec::new(); NUM_CONCURRENCY_BUCKETS];
+        // (chunk tokens, gap surcharge over the record's clean median) per
+        // marked gap, feeding the chunk-step occupancy fit.
+        let mut occupancy_obs: Vec<(f64, f64)> = Vec::new();
 
         for record in records {
             let uncached = record.prompt_tokens.saturating_sub(record.cached_tokens);
@@ -552,11 +636,32 @@ impl TraceLatency {
                         Some(ctx) => {
                             let (stalled, clean): (Vec<usize>, Vec<usize>) =
                                 (0..itls.len()).partition(|&i| ctx.prefill_tokens[i] > 0);
+                            let mut clean_gaps: Vec<f64> = clean.iter().map(|&i| itls[i]).collect();
+                            clean_gaps.sort_by(|a, b| {
+                                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let clean_median =
+                                (!clean_gaps.is_empty()).then(|| clean_gaps[clean_gaps.len() / 2]);
                             for &i in &stalled {
-                                let ppb = prompt_bucket(ctx.prefill_tokens[i] as usize);
+                                let tokens = ctx.prefill_tokens[i];
+                                let ppb = prompt_bucket(tokens as usize);
                                 stalls_grid[ppb][cb].push(itls[i]);
+                                // The gap's surcharge over the record's own clean
+                                // decode is one chunk step of the marked prefill.
+                                // A prefill larger than the chunk budget runs the
+                                // marked step at the budget, so the token count
+                                // saturates there.
+                                if let Some(median) = clean_median {
+                                    let surcharge = itls[i] - median;
+                                    if surcharge > 0.0 {
+                                        occupancy_obs.push((
+                                            f64::from(tokens.min(CHUNK_BUDGET_TOKENS)),
+                                            surcharge,
+                                        ));
+                                    }
+                                }
                             }
-                            clean.iter().map(|&i| itls[i]).collect()
+                            clean_gaps
                         }
                         None => itls.clone(),
                     };
@@ -649,9 +754,11 @@ impl TraceLatency {
             .collect();
         floor_obs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let service_fit = fit_service_curve(&service_windows(&floor_obs));
+        let occupancy_fit = fit_occupancy(&occupancy_obs);
 
         Ok(TraceLatency {
             service_fit,
+            occupancy_fit,
             service_by_prompt,
             itl_by_concurrency,
             donors_grid,
@@ -785,6 +892,13 @@ impl LatencyModel for TraceLatency {
         };
         let ms = sample_inverse_cdf(rng, samples);
         Duration::from_secs_f64(ms / 1000.0)
+    }
+
+    fn prefill_occupancy(&self, uncached_tokens: usize, chunks: u32) -> Option<Duration> {
+        let fit = self.occupancy_fit.as_ref()?;
+        Some(Duration::from_secs_f64(
+            fit.window_ms(uncached_tokens.max(1) as f64, chunks) / 1000.0,
+        ))
     }
 
     /// Hierarchical sampling conditioned on (context bucket, concurrency
@@ -1073,6 +1187,59 @@ mod tests {
             (got - want).abs() / want < 0.05,
             "loaded records leaked into the fit: T(5000) = {got:.1}ms, want ~{want:.1}ms"
         );
+    }
+
+    /// One trace record whose marked gaps carry `surcharge` over a 10ms clean
+    /// decode, attributed to a `tokens`-token prefill admission.
+    fn marked_record(tokens: u32, surcharge: f64, marks: usize) -> TraceRecord {
+        let mut gaps = Vec::new();
+        let mut prefill = Vec::new();
+        for _ in 0..marks {
+            gaps.extend([10.0, 10.0, 10.0 + surcharge]);
+            prefill.extend([0u32, 0, tokens]);
+        }
+        let n = gaps.len();
+        TraceRecord {
+            prompt_tokens: 100,
+            cached_tokens: 0,
+            output_tokens: n + 1,
+            ttft_ms: 40.0,
+            itl_ms: Some(gaps),
+            itl_summary: None,
+            concurrency: 4,
+            arrival_ms: None,
+            itl_ctx: Some(crate::trace::ItlContext {
+                num_running: vec![4; n],
+                prefill_tokens: prefill,
+            }),
+            block_hashes: None,
+        }
+    }
+
+    #[test]
+    fn trace_occupancy_fit_recovers_chunk_law() {
+        // Surcharges follow 5ms + 0.01 ms/token at two chunk sizes.
+        let records = vec![
+            marked_record(500, 5.0 + 0.01 * 500.0, 6),
+            marked_record(4000, 5.0 + 0.01 * 4000.0, 6),
+        ];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+        let got = trace
+            .prefill_occupancy(8000, 2)
+            .expect("two marked buckets should fit an occupancy law")
+            .as_secs_f64()
+            * 1000.0;
+        let want = 2.0 * 5.0 + 0.01 * 8000.0;
+        assert!(
+            (got - want).abs() / want < 0.05,
+            "occupancy(8000, 2) = {got:.1}ms, want ~{want:.1}ms"
+        );
+    }
+
+    #[test]
+    fn knob_latency_has_no_occupancy_law() {
+        assert_eq!(model().prefill_occupancy(8000, 2), None);
     }
 
     #[test]

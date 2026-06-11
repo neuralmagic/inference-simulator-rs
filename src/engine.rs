@@ -954,7 +954,14 @@ impl SimEngine {
                         Some(&(_, end, _)) if end > now => end,
                         _ => now,
                     };
-                    let end = start + active.prefill_service.div_f64(time_scale);
+                    // Decodes see the chunk steps' compute, not the prefill's
+                    // full service time (which also carries scheduling
+                    // overhead the engine hides behind decode steps).
+                    let occupancy = self
+                        .latency
+                        .prefill_occupancy(uncached, chunks)
+                        .unwrap_or(active.prefill_service);
+                    let end = start + occupancy.div_f64(time_scale);
                     active.next_at += start.saturating_duration_since(now);
                     self.prefill_busy.push_back((start, end, chunks));
                 }

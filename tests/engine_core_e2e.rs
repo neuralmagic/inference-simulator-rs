@@ -134,6 +134,93 @@ async fn token_stream_round_trip() {
 }
 
 #[tokio::test]
+async fn replay_tokens_serves_recorded_stream() {
+    use inference_simulator_rs::trace::{
+        TraceFinishReason, TraceMeta, TraceRecord, TraceWriter, write_trace,
+    };
+
+    // A two-record trace, written out of arrival order to prove the sim maps
+    // replay indices through the canonical arrival ordering.
+    let recorded_late: Vec<u32> = vec![900, 901, 902];
+    let recorded_early: Vec<u32> = vec![800, 801, 802, 803];
+    let records = vec![
+        TraceRecord {
+            prompt_tokens: 8,
+            output_tokens: recorded_late.len(),
+            ttft_ms: 1.0,
+            itl_ms: Some(vec![1.0; recorded_late.len() - 1]),
+            arrival_ms: Some(100.0),
+            output_token_ids: Some(recorded_late.clone()),
+            finish_reason: Some(TraceFinishReason::Length),
+            ..Default::default()
+        },
+        TraceRecord {
+            prompt_tokens: 8,
+            output_tokens: recorded_early.len(),
+            ttft_ms: 1.0,
+            itl_ms: Some(vec![1.0; recorded_early.len() - 1]),
+            arrival_ms: Some(0.0),
+            output_token_ids: Some(recorded_early.clone()),
+            finish_reason: Some(TraceFinishReason::Stop),
+            ..Default::default()
+        },
+    ];
+    // The .gz extension also covers the compressed read path end to end.
+    let trace_path = format!(
+        "/tmp/inf-sim-e2e-replay-tokens-{}.jsonl.gz",
+        std::process::id()
+    );
+    let mut writer =
+        TraceWriter::create(std::path::Path::new(&trace_path)).expect("create trace file");
+    write_trace(&mut writer, &TraceMeta::default(), &records).expect("write trace");
+    writer.finish().expect("finish trace file");
+
+    let (client, _guard) = harness("replay_tokens", &["--replay-tokens", &trace_path]).await;
+
+    // replay-0 = the arrival_ms 0.0 record (file order is finish order).
+    let req = make_request("replay-0", 8, recorded_early.len() as u32);
+    let stream = client.call(req).await.expect("call failed");
+    let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
+        .await
+        .expect("stream collect timed out");
+    let tokens: Vec<u32> = outputs
+        .iter()
+        .flat_map(|r| r.as_ref().expect("stream item error").new_token_ids.clone())
+        .collect();
+    assert_eq!(tokens, recorded_early, "replay-0 serves the early arrival");
+    assert_eq!(
+        outputs.last().unwrap().as_ref().unwrap().finish_reason,
+        Some(EngineCoreFinishReason::Stop),
+        "stream ends with the recorded finish reason"
+    );
+
+    let req = make_request("replay-1", 8, recorded_late.len() as u32);
+    let stream = client.call(req).await.expect("call failed");
+    let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
+        .await
+        .expect("stream collect timed out");
+    let tokens: Vec<u32> = outputs
+        .iter()
+        .flat_map(|r| r.as_ref().expect("stream item error").new_token_ids.clone())
+        .collect();
+    assert_eq!(tokens, recorded_late, "replay-1 serves the late arrival");
+
+    // An unmatched request still streams (random fallback).
+    let req = make_request("adhoc", 8, 2);
+    let stream = client.call(req).await.expect("call failed");
+    let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
+        .await
+        .expect("stream collect timed out");
+    let total: usize = outputs
+        .iter()
+        .map(|r| r.as_ref().expect("stream item error").new_token_ids.len())
+        .sum();
+    assert_eq!(total, 2, "unmatched request falls back to random tokens");
+
+    let _ = std::fs::remove_file(&trace_path);
+}
+
+#[tokio::test]
 async fn abort_terminates_stream() {
     let (client, _guard) = harness(
         "abort_terminates_stream",
@@ -172,6 +259,95 @@ async fn abort_terminates_stream() {
     assert!(
         got_abort,
         "expected an output with finish_reason Abort after calling abort"
+    );
+}
+
+#[tokio::test]
+async fn graceful_shutdown_drains_in_flight() {
+    let (client, guard) = harness(
+        "graceful_shutdown_drains_in_flight",
+        &["--shutdown-timeout", "10", "--inter-token-latency", "50"],
+    )
+    .await;
+
+    let req = make_request("drain-1", 4, 10);
+    let mut stream = client.call(req).await.expect("call failed");
+
+    // Wait for the first output so the request is in flight, then request shutdown.
+    let first = tokio::time::timeout(TIMEOUT, stream.next())
+        .await
+        .expect("first output timed out")
+        .expect("stream ended unexpectedly")
+        .expect("first output error");
+    assert_eq!(first.request_id, "drain-1");
+    guard.token.cancel();
+
+    // A request arriving during the drain is rejected with an immediate Abort.
+    let late = make_request("late-1", 4, 5);
+    let late_stream = client.call(late).await.expect("late call failed");
+    let late_outputs: Vec<_> = tokio::time::timeout(TIMEOUT, late_stream.collect::<Vec<_>>())
+        .await
+        .expect("late stream timed out");
+    let late_final = late_outputs
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .find(|o| o.finish_reason.is_some())
+        .expect("late request should get a terminal output");
+    assert_eq!(
+        late_final.finish_reason,
+        Some(EngineCoreFinishReason::Abort),
+        "a request arriving during drain is rejected with Abort"
+    );
+
+    // The in-flight request still completes naturally, through the real ZMQ path,
+    // even though shutdown was requested mid-stream.
+    let remaining: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
+        .await
+        .expect("drained stream timed out");
+    let total_tokens = first.new_token_ids.len()
+        + remaining
+            .iter()
+            .map(|r| r.as_ref().expect("stream item error").new_token_ids.len())
+            .sum::<usize>();
+    assert_eq!(total_tokens, 10, "drain delivers the full token stream");
+    assert_eq!(
+        remaining.last().unwrap().as_ref().unwrap().finish_reason,
+        Some(EngineCoreFinishReason::Length),
+        "drained request finishes with its natural reason"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_default_aborts_in_flight() {
+    // Default --shutdown-timeout 0 (vLLM's default): shutdown aborts immediately.
+    let (client, guard) = harness(
+        "shutdown_default_aborts_in_flight",
+        &["--inter-token-latency", "200"],
+    )
+    .await;
+
+    let req = make_request("abort-on-shutdown-1", 4, 10000);
+    let mut stream = client.call(req).await.expect("call failed");
+
+    let first = tokio::time::timeout(TIMEOUT, stream.next())
+        .await
+        .expect("first output timed out")
+        .expect("stream ended unexpectedly")
+        .expect("first output error");
+    assert_eq!(first.request_id, "abort-on-shutdown-1");
+    guard.token.cancel();
+
+    let remaining: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
+        .await
+        .expect("remaining stream timed out");
+    let got_abort = remaining.iter().any(|r| {
+        r.as_ref()
+            .map(|o| o.finish_reason == Some(EngineCoreFinishReason::Abort))
+            .unwrap_or(false)
+    });
+    assert!(
+        got_abort,
+        "shutdown with timeout 0 must abort the in-flight request"
     );
 }
 

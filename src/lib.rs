@@ -98,6 +98,16 @@ pub struct Opt {
     #[arg(long, default_value_t = 32_000)]
     pub vocab_size: u32,
 
+    /// Path to a JSONL trace whose recorded output token ids (tap
+    /// `--record-tokens`) are served verbatim instead of random tokens, making
+    /// replayed streams content-identical to the capture. A request resolves
+    /// to its record through the trailing `-<index>` of its request id, where
+    /// the index is the record's position in the arrival-ordered subset (the
+    /// arrival-replay harness names them `replay-{i}`). Unmatched requests
+    /// fall back to random tokens.
+    #[arg(long, default_value = "")]
+    pub replay_tokens: String,
+
     /// Base seed for deterministic random token generation.
     #[arg(long, default_value_t = 0)]
     pub seed: u64,
@@ -273,6 +283,13 @@ pub struct Opt {
     /// Failure kinds to inject (one is chosen uniformly per injected failure).
     #[arg(long, value_enum, value_delimiter = ',', default_value = "error")]
     pub failure_types: Vec<FailureType>,
+
+    /// Graceful-shutdown grace period in seconds (vLLM `shutdown_timeout`). On
+    /// SIGTERM/SIGINT the engine rejects new requests and lets in-flight ones finish for
+    /// up to this long; whatever remains is then aborted. `0` (vLLM's default) aborts
+    /// every in-flight request immediately.
+    #[arg(long, default_value_t = 0)]
+    pub shutdown_timeout: u64,
 }
 
 /// Offset the port of a `tcp://host:port` endpoint by `n` (no-op for `n == 0` or non-tcp),
@@ -332,6 +349,36 @@ impl Opt {
         }
     }
 
+    /// Build the token source: replay recorded output ids (from `--replay-tokens`) or
+    /// random draws. Returns an error if the trace is unreadable or carries no tokens.
+    pub(crate) fn build_token_source(&self) -> Result<Box<dyn tokens::TokenSource>> {
+        if self.replay_tokens.is_empty() {
+            return Ok(Box::new(tokens::RandomTokens {
+                vocab_size: self.vocab_size,
+            }));
+        }
+        let (_, records) = trace::read_trace_file(std::path::Path::new(&self.replay_tokens))?;
+        let subset = trace::replay_subset(records);
+        if subset.is_empty() {
+            bail!(
+                "--replay-tokens trace {} has no records with arrival_ms (nothing to map \
+                 request indices onto)",
+                self.replay_tokens
+            );
+        }
+        if !subset.iter().any(|r| r.output_token_ids.is_some()) {
+            bail!(
+                "--replay-tokens trace {} has no output_token_ids; capture it with the \
+                 tap's --record-tokens",
+                self.replay_tokens
+            );
+        }
+        Ok(Box::new(tokens::ReplayTokens::from_records(
+            &subset,
+            self.vocab_size,
+        )))
+    }
+
     /// Whether any of the timing knobs that are mutually exclusive with `--latency-trace`
     /// have been set to a nonzero value.
     fn has_timing_knobs(&self) -> bool {
@@ -360,11 +407,7 @@ impl Opt {
             );
         }
 
-        let file = std::fs::File::open(&self.latency_trace)
-            .with_context(|| format!("opening trace file: {}", self.latency_trace))?;
-        let reader = std::io::BufReader::new(file);
-        let (meta, records) = trace::read_trace(reader)
-            .with_context(|| format!("parsing trace file: {}", self.latency_trace))?;
+        let (meta, records) = trace::read_trace_file(std::path::Path::new(&self.latency_trace))?;
 
         // The KV-transfer knobs are NOT mutually exclusive: the trace does not cover
         // P/D transfer timing, so the knob model handles do_remote_prefill requests.
@@ -381,7 +424,9 @@ impl Opt {
     }
 }
 
-/// Run one mock engine until shutdown or transport failure.
+/// Run one mock engine until shutdown completes or the transport fails. Shutdown is
+/// graceful: the engine loop drains or aborts in-flight requests per `--shutdown-timeout`
+/// (mirroring vLLM's engine core), and the IO loop flushes the final outputs before exit.
 async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) -> Result<()> {
     // Advertise the sim's actual configured limits in the registration ready
     // response so the frontend validates against what this engine enforces.
@@ -395,57 +440,80 @@ async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) ->
         ..MockEngineConfig::default()
     };
 
-    let MockEngineSockets { data_sockets, .. } = connect_to_frontend(
+    // A shutdown signal during the handshake means there is nothing to drain; just leave.
+    let connect = connect_to_frontend(
         &opt.handshake_address,
         EngineId::from_engine_index(engine_index),
         config,
-    )
-    .await
-    .with_context(|| format!("engine {engine_index} failed to connect to frontend"))?;
+    );
+    let MockEngineSockets { data_sockets, .. } = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            info!(engine_index, "shutdown requested before frontend handshake completed");
+            return Ok(());
+        }
+        result = connect => result
+            .with_context(|| format!("engine {engine_index} failed to connect to frontend"))?,
+    };
 
     info!(engine_index, role = ?opt.pd_role, "engine connected to frontend");
 
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (output_tx, output_rx) = mpsc::unbounded_channel();
 
-    let mut io_loop = tokio::spawn(io::run_io_loop(
-        data_sockets,
-        input_tx,
-        output_rx,
-        shutdown.clone(),
-    ));
-    let events = kvevents::spawn(opt.kv_events_config(engine_index), shutdown.clone())
+    let mut io_loop = tokio::spawn(io::run_io_loop(data_sockets, input_tx, output_rx));
+    // The publisher's token is cancelled only after the engine loop exits, so KV events
+    // keep flowing while in-flight requests drain (the publisher also exits on its own
+    // once the engine drops its KvEventTx).
+    let engine_done = CancellationToken::new();
+    let events = kvevents::spawn(opt.kv_events_config(engine_index), engine_done.clone())
         .await
         .unwrap_or_else(|error| {
             tracing::warn!(%error, "kv-event publisher failed to start; continuing without events");
             None
         });
+    let shutdown_timeout = std::time::Duration::from_secs(opt.shutdown_timeout);
     let sim_engine = engine::SimEngine::new(engine_index, opt, events).await?;
     let mut engine_loop = tokio::spawn(engine_core::run_loop(
         sim_engine,
         input_rx,
         output_tx,
         shutdown.clone(),
+        shutdown_timeout,
     ));
 
     tokio::select! {
         biased;
-        _ = shutdown.cancelled() => {
-            io_loop.abort();
-            engine_loop.abort();
-            io_loop.await.ok();
-            engine_loop.await.ok();
+        result = &mut engine_loop => {
+            engine_done.cancel();
+            if !shutdown.is_cancelled() {
+                error!(engine_index, "engine loop exited unexpectedly");
+            }
+            // The engine loop dropped its output sender; the IO loop exits on its own
+            // after flushing the remaining outputs (final tokens and abort notices).
+            // Bound the flush so a wedged peer socket cannot hold up process exit.
+            let flushed = tokio::time::timeout(std::time::Duration::from_secs(5), &mut io_loop).await;
+            match flushed {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    tracing::warn!(engine_index, %error, "IO loop errored while flushing final outputs");
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(engine_index, %error, "IO loop task join failed during flush");
+                }
+                Err(_) => {
+                    error!(engine_index, "IO loop failed to flush within 5s; aborting it");
+                    io_loop.abort();
+                    io_loop.await.ok();
+                }
+            }
+            result??;
         }
         result = &mut io_loop => {
             error!(engine_index, "engine IO loop exited unexpectedly");
+            engine_done.cancel();
             engine_loop.abort();
             engine_loop.await.ok();
-            result??;
-        }
-        result = &mut engine_loop => {
-            error!(engine_index, "engine loop exited unexpectedly");
-            io_loop.abort();
-            io_loop.await.ok();
             result??;
         }
     }
@@ -472,20 +540,20 @@ pub async fn run(opt: Opt, shutdown: CancellationToken) -> Result<()> {
         ));
     }
 
-    tokio::select! {
-        biased;
-        _ = shutdown.cancelled() => {
-            engines.abort_all();
-            while engines.join_next().await.is_some() {}
-            Ok(())
-        }
-        joined = engines.join_next() => {
-            match joined {
-                Some(Ok(Ok(()))) => bail!("engine exited unexpectedly"),
-                Some(Ok(Err(error))) => Err(error),
-                Some(Err(error)) => Err(error).context("engine task join failed"),
-                None => Ok(()),
+    // No abort-on-shutdown here: each engine loop observes `shutdown` itself and drains
+    // or aborts its in-flight requests per `--shutdown-timeout`, so this just waits for
+    // every engine to finish. An engine failing (or exiting without a shutdown request)
+    // is an error; returning early drops the JoinSet, which aborts the survivors.
+    while let Some(joined) = engines.join_next().await {
+        match joined {
+            Ok(Ok(())) => {
+                if !shutdown.is_cancelled() {
+                    bail!("engine exited unexpectedly");
+                }
             }
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return Err(error).context("engine task join failed"),
         }
     }
+    Ok(())
 }

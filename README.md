@@ -210,7 +210,9 @@ for machine-readable output and `--seed` for determinism.
 
 ### Calibration against a real engine
 
-Both figures below come from one capture: the recording tap (`inference-sim-tap`)
+Both figures below come from one capture: the recording tap (`inference-sim-tap`,
+sidecar deployment and component docs in
+[deploy/trace-capture/README.md](deploy/trace-capture/README.md))
 sitting between the vLLM Rust frontend and a real headless vLLM engine
 (Qwen3-8B, TP=1, H200), recording per-token inter-token gaps server-side over
 in-pod localhost ZMQ. 1230 requests at concurrency 1 and 16, 118k token gaps.
@@ -421,3 +423,45 @@ nearest bucket; the ~50x what-if delta is dominated by mechanically simulated
 queueing, but a prompt-length-sweep capture would pin it down. Mooncake-style
 workload traces (block-hash ids + lengths + timestamps) map directly onto this
 schema for replaying production workloads.
+
+### Content-identical replay
+
+By default the trace schema is share-freely: timing, shapes, and prefix
+*structure* (block hashes), never tokens. Opting in with the tap's
+`--record-tokens` adds each request's `output_token_ids` (plus
+`finish_reason`, which is always recorded) to the trace - note that with the
+same tokenizer those ids decode back to the generated text, so such traces
+carry user content.
+
+On the replay side, `inference-sim --replay-tokens <trace>` serves the
+recorded ids verbatim instead of random tokens, and ends each stream with the
+recorded finish reason. A request resolves to its record through the trailing
+`-<index>` of its request id, where the index is the record's position in the
+arrival-ordered schedule (the replay harness already names requests
+`replay-{i}`); unmatched requests fall back to random tokens. Combined with
+arrival replay this makes the simulated engine byte-identical to the capture
+on the wire - deterministic, realistic streams for testing routers, EPPs,
+guardrails, and client SDK streaming behavior without a GPU.
+
+Every trace touchpoint (`--trace-out`, `--latency-trace`, `--replay-tokens`,
+trace conversion and replay harnesses) reads and writes gzip transparently
+when the path ends in `.gz`; token-recording traces grow by one integer per
+generated token, so compressing them is recommended.
+
+### Replay pacing
+
+Content fidelity (`--replay-tokens`) and timing are independent axes, so
+pacing is knob composition rather than a mode switch:
+
+| Mode | Invocation |
+| --- | --- |
+| Timing-accurate | `--replay-tokens trace.gz --latency-trace trace.gz` plus scheduler args matching the capture (`--max-num-seqs`, `--max-num-batched-tokens`, ...) |
+| As fast as possible | `--replay-tokens trace.gz` and nothing else: all timing knobs default to 0, the instant model |
+| Compressed but shaped | `--replay-tokens trace.gz --latency-trace trace.gz --time-scale 100`: same interleavings and relative ordering, 100x faster wall clock |
+| Synthetic timing | `--replay-tokens trace.gz --time-to-first-token 50 --inter-token-latency 10` |
+
+Two knobs worth knowing for the fast path: the scheduler still runs at zero
+delay (`--max-num-seqs` and the token budget produce real queueing and
+backpressure semantics at infinite speed - bump them for pure pass-through),
+and `--output-token-chunk-size` controls output framing if the client under
+test should also see multi-token chunks.

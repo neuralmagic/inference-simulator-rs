@@ -2,13 +2,14 @@
 //! summarizing existing traces, and running calibration comparisons.
 
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Write as _};
+use std::io::{self, BufWriter, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use inference_simulator_rs::calibrate;
+use inference_simulator_rs::calibrate::{self, PromptReplay, SessionPacing, SimDriver};
+use inference_simulator_rs::trace::{TraceWriter, open_trace_reader, read_trace_file};
 use inference_simulator_rs::trace_convert::{
     ConvertOptions, convert_guidellm, summarize_trace, write_conversion, write_summary,
 };
@@ -21,6 +22,37 @@ use inference_simulator_rs::trace_convert::{
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// Output format for calibration reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum ReportFormat {
+    /// Human-readable text report.
+    #[default]
+    Text,
+    /// Machine-readable JSON.
+    Json,
+}
+
+/// Magnitude profile for the synthesized demo trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum DemoProfile {
+    /// Realistic magnitudes (TTFT ~50-400ms, ITL ~10-60ms).
+    #[default]
+    Realistic,
+    /// Fast/small magnitudes suitable for e2e testing (TTFT ~15-40ms, ITL ~3-10ms).
+    Fast,
+}
+
+/// Which e2e harness runs: closed-loop sampled batches or open-loop arrival replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum E2eHarness {
+    /// Sample N requests and drive them closed-loop.
+    #[default]
+    Sampled,
+    /// Replay the trace's recorded arrival schedule open-loop (real time).
+    /// Requires records with arrival_ms; runtime equals the schedule's span.
+    ReplayArrivals,
 }
 
 #[derive(Subcommand)]
@@ -58,10 +90,15 @@ enum Command {
         /// RNG seed for deterministic output.
         #[arg(long, default_value_t = 0)]
         seed: u64,
-        /// Generate a fast/small-magnitude trace suitable for e2e testing
-        /// (TTFT ~15-40ms, ITL ~3-10ms).
-        #[arg(long)]
-        fast: bool,
+        /// Magnitude profile; bare `--fast` selects the fast one.
+        #[arg(
+            long = "fast",
+            value_enum,
+            default_value_t = DemoProfile::Realistic,
+            default_missing_value = "fast",
+            num_args = 0..=1
+        )]
+        fast: DemoProfile,
     },
     /// Model-level calibration: compare source trace quantiles against TraceLatency
     /// replay and a best-fit KnobLatency. No transport, exact and fast.
@@ -77,9 +114,15 @@ enum Command {
         /// Maximum allowed relative error for replay vs source (PASS/FAIL threshold).
         #[arg(long, default_value_t = 0.10)]
         tolerance: f64,
-        /// Emit JSON instead of human-readable text.
-        #[arg(long)]
-        json: bool,
+        /// Report format; bare `--json` selects JSON.
+        #[arg(
+            long = "json",
+            value_enum,
+            default_value_t = ReportFormat::Text,
+            default_missing_value = "json",
+            num_args = 0..=1
+        )]
+        json: ReportFormat,
         /// Also write the pooled source/replay/knob-fit sample arrays to this path
         /// as JSON, for external plotting.
         #[arg(long)]
@@ -101,17 +144,27 @@ enum Command {
         /// RNG seed.
         #[arg(long, default_value_t = 0)]
         seed: u64,
-        /// Use knob-fit latency instead of trace replay.
-        #[arg(long)]
-        knob_fit: bool,
+        /// Latency model driving the sim; bare `--knob-fit` selects knob-fit.
+        #[arg(
+            long = "knob-fit",
+            value_enum,
+            default_value_t = SimDriver::TraceReplay,
+            default_missing_value = "knob-fit",
+            num_args = 0..=1
+        )]
+        knob_fit: SimDriver,
         /// Maximum allowed relative error (looser default for transport jitter).
         #[arg(long, default_value_t = 0.25)]
         tolerance: f64,
-        /// Replay the trace's recorded arrival schedule open-loop (real time)
-        /// instead of sampling closed-loop batches. Requires records with
-        /// arrival_ms; runtime equals the schedule's span.
-        #[arg(long)]
-        replay_arrivals: bool,
+        /// Which harness runs; bare `--replay-arrivals` selects arrival replay.
+        #[arg(
+            long = "replay-arrivals",
+            value_enum,
+            default_value_t = E2eHarness::Sampled,
+            default_missing_value = "replay-arrivals",
+            num_args = 0..=1
+        )]
+        replay_arrivals: E2eHarness,
         /// With --replay-arrivals: build the sim's latency model from this
         /// trace instead of the replayed one, validating against an arrival
         /// process the model was not fitted on.
@@ -122,17 +175,30 @@ enum Command {
         /// scripts/plot_calibration.py --compare).
         #[arg(long, requires = "replay_arrivals")]
         dump_trace: Option<PathBuf>,
-        /// With --replay-arrivals: pace each multiturn session closed-loop
-        /// (turn N+1 fires when turn N completes plus the recorded think gap)
-        /// instead of at recorded wall-clock offsets. Sessions are inferred
-        /// from block-hash chains.
-        #[arg(long, requires = "replay_arrivals")]
-        replay_sessions: bool,
-        /// With --replay-arrivals: cache-off what-if. Replay every prompt as
-        /// unique tokens even when the trace carries block_hashes; the TTFT
-        /// delta vs a normal replay is the prefix cache's contribution.
-        #[arg(long, requires = "replay_arrivals")]
-        cold_prompts: bool,
+        /// With --replay-arrivals: arrival pacing; bare `--replay-sessions`
+        /// chains each multiturn session closed-loop (turn N+1 fires when
+        /// turn N completes plus the recorded think gap). Sessions are
+        /// inferred from block-hash chains.
+        #[arg(
+            long = "replay-sessions",
+            value_enum,
+            default_value_t = SessionPacing::OpenLoop,
+            default_missing_value = "chained",
+            num_args = 0..=1,
+            requires = "replay_arrivals"
+        )]
+        replay_sessions: SessionPacing,
+        /// With --replay-arrivals: prompt reconstruction; bare `--cold-prompts`
+        /// replays every prompt as unique tokens (cache-off what-if).
+        #[arg(
+            long = "cold-prompts",
+            value_enum,
+            default_value_t = PromptReplay::SharedPrefixes,
+            default_missing_value = "cold",
+            num_args = 0..=1,
+            requires = "replay_arrivals"
+        )]
+        cold_prompts: PromptReplay,
         /// With --replay-arrivals: time compression (sim delays divided by
         /// this, measurements re-multiplied). Faster inner loops, slightly
         /// noisier quantiles; use 1.0 for final validation.
@@ -147,9 +213,15 @@ enum Command {
             allow_hyphen_values = true
         )]
         sim_args: Vec<String>,
-        /// Emit JSON instead of human-readable text.
-        #[arg(long)]
-        json: bool,
+        /// Report format; bare `--json` selects JSON.
+        #[arg(
+            long = "json",
+            value_enum,
+            default_value_t = ReportFormat::Text,
+            default_missing_value = "json",
+            num_args = 0..=1
+        )]
+        json: ReportFormat,
     },
 }
 
@@ -170,17 +242,14 @@ fn run() -> Result<ExitCode> {
             let opts = ConvertOptions { model, gpu, tp };
             let (meta, records) = convert_guidellm(&report_json, &opts)?;
 
-            let file = fs::File::create(&output)
-                .with_context(|| format!("creating {}", output.display()))?;
-            let mut writer = BufWriter::new(file);
+            let mut writer = TraceWriter::create(&output)?;
             write_conversion(&mut writer, &meta, &records)?;
+            writer.finish()?;
 
             eprintln!("wrote {} records to {}", records.len(), output.display());
         }
         Command::Summarize { input } => {
-            let file =
-                fs::File::open(&input).with_context(|| format!("opening {}", input.display()))?;
-            let reader = BufReader::new(file);
+            let reader = open_trace_reader(&input)?;
             let (meta, stats) = summarize_trace(reader)?;
 
             let stdout = io::stdout();
@@ -193,10 +262,9 @@ fn run() -> Result<ExitCode> {
             seed,
             fast,
         } => {
-            let (meta, recs) = if fast {
-                calibrate::gen_demo_fast(records, seed)
-            } else {
-                calibrate::gen_demo(records, seed)
+            let (meta, recs) = match fast {
+                DemoProfile::Fast => calibrate::gen_demo_fast(records, seed),
+                DemoProfile::Realistic => calibrate::gen_demo(records, seed),
             };
             calibrate::write_demo_trace(&output, &meta, &recs)?;
             eprintln!("wrote {} records to {}", recs.len(), output.display());
@@ -212,10 +280,7 @@ fn run() -> Result<ExitCode> {
             let report = calibrate::calibrate_from_file(&trace, samples, seed, tolerance)?;
 
             if let Some(dump_path) = dump_samples {
-                let file = fs::File::open(&trace)
-                    .with_context(|| format!("opening {}", trace.display()))?;
-                let (_meta, records) =
-                    inference_simulator_rs::trace::read_trace(BufReader::new(file))?;
+                let (_meta, records) = read_trace_file(&trace)?;
                 let dump = calibrate::dump_samples(&records, samples, seed)?;
                 let out = fs::File::create(&dump_path)
                     .with_context(|| format!("creating {}", dump_path.display()))?;
@@ -224,17 +289,7 @@ fn run() -> Result<ExitCode> {
                 eprintln!("wrote sample dump to {}", dump_path.display());
             }
 
-            if json {
-                let stdout = io::stdout();
-                let mut writer = BufWriter::new(stdout.lock());
-                serde_json::to_writer_pretty(&mut writer, &report)
-                    .context("serializing report to JSON")?;
-                writeln!(writer)?;
-            } else {
-                let stdout = io::stdout();
-                let mut writer = BufWriter::new(stdout.lock());
-                calibrate::write_report(&mut writer, &report)?;
-            }
+            write_report_as(json, &report)?;
 
             if !report.verdict.replay_pass {
                 return Ok(ExitCode::FAILURE);
@@ -260,17 +315,17 @@ fn run() -> Result<ExitCode> {
                 .build()
                 .context("building tokio runtime for calibrate-e2e")?;
 
-            let report = if replay_arrivals {
+            let report = if replay_arrivals == E2eHarness::ReplayArrivals {
                 let cfg = calibrate::ReplayArrivalsConfig {
                     trace_path: &trace,
                     latency_trace: latency_trace.as_deref(),
                     max_requests: requests,
                     tolerance,
-                    use_knob_fit: knob_fit,
+                    driver: knob_fit,
                     ipc_tag: seed.to_string(),
                     extra_sim_args: sim_args,
-                    session_replay: replay_sessions,
-                    cold_prompts,
+                    pacing: replay_sessions,
+                    prompts: cold_prompts,
                     time_scale,
                 };
                 let outcome = runtime.block_on(calibrate::replay_arrivals(&cfg))?;
@@ -286,14 +341,13 @@ fn run() -> Result<ExitCode> {
                         source: Some("replay-arrivals".to_string()),
                         ..Default::default()
                     };
-                    let file = fs::File::create(&dump_path)
-                        .with_context(|| format!("creating {}", dump_path.display()))?;
-                    let mut writer = BufWriter::new(file);
+                    let mut writer = TraceWriter::create(&dump_path)?;
                     inference_simulator_rs::trace::write_trace(
                         &mut writer,
                         &meta,
                         &outcome.measured,
                     )?;
+                    writer.finish()?;
                     eprintln!(
                         "wrote {} measured records to {}",
                         outcome.measured.len(),
@@ -311,17 +365,7 @@ fn run() -> Result<ExitCode> {
                 ))?
             };
 
-            if json {
-                let stdout = io::stdout();
-                let mut writer = BufWriter::new(stdout.lock());
-                serde_json::to_writer_pretty(&mut writer, &report)
-                    .context("serializing report to JSON")?;
-                writeln!(writer)?;
-            } else {
-                let stdout = io::stdout();
-                let mut writer = BufWriter::new(stdout.lock());
-                calibrate::write_report(&mut writer, &report)?;
-            }
+            write_report_as(json, &report)?;
 
             if !report.verdict.replay_pass {
                 return Ok(ExitCode::FAILURE);
@@ -330,6 +374,21 @@ fn run() -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Print a calibration report to stdout in the requested format.
+fn write_report_as(format: ReportFormat, report: &calibrate::CalibrationReport) -> Result<()> {
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+    match format {
+        ReportFormat::Json => {
+            serde_json::to_writer_pretty(&mut writer, report)
+                .context("serializing report to JSON")?;
+            writeln!(writer)?;
+        }
+        ReportFormat::Text => calibrate::write_report(&mut writer, report)?,
+    }
+    Ok(())
 }
 
 /// Wire-level calibration implementation. Spins the real simulator in-process
@@ -342,7 +401,7 @@ async fn calibrate_e2e_impl(
     trace_path: &std::path::Path,
     num_requests: usize,
     seed: u64,
-    use_knob_fit: bool,
+    driver: SimDriver,
     tolerance: f64,
 ) -> Result<calibrate::CalibrationReport> {
     use std::collections::HashMap;
@@ -351,7 +410,7 @@ async fn calibrate_e2e_impl(
     use clap::Parser as _;
     use futures::StreamExt;
     use inference_simulator_rs::latency::{NUM_CONCURRENCY_BUCKETS, concurrency_bucket};
-    use inference_simulator_rs::trace::{TraceRecord, read_trace};
+    use inference_simulator_rs::trace::TraceRecord;
     use inference_simulator_rs::{Opt, run};
     use rand::Rng;
     use rand::SeedableRng as _;
@@ -359,11 +418,7 @@ async fn calibrate_e2e_impl(
     use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
     use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 
-    let file = std::fs::File::open(trace_path)
-        .with_context(|| format!("opening trace: {}", trace_path.display()))?;
-    let reader = std::io::BufReader::new(file);
-    let (_meta, all_records) =
-        read_trace(reader).with_context(|| format!("parsing trace: {}", trace_path.display()))?;
+    let (_meta, all_records) = read_trace_file(trace_path)?;
 
     if all_records.is_empty() {
         anyhow::bail!("trace has no records");
@@ -389,7 +444,7 @@ async fn calibrate_e2e_impl(
         "64".to_string(),
     ];
 
-    if use_knob_fit {
+    if driver == SimDriver::KnobFit {
         let knob = calibrate::fit_knob_from_trace(&all_records);
         args.extend([
             "--time-to-first-token".to_string(),
@@ -573,7 +628,11 @@ async fn calibrate_e2e_impl(
     };
 
     Ok(calibrate::CalibrationReport {
-        measured_label: if use_knob_fit { "knobfit" } else { "replay" }.to_string(),
+        measured_label: match driver {
+            SimDriver::KnobFit => "knobfit",
+            SimDriver::TraceReplay => "replay",
+        }
+        .to_string(),
         source: source_stats,
         replay: replay_stats,
         knobfit: None,

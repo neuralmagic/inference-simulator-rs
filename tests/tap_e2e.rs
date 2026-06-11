@@ -27,7 +27,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use inference_simulator_rs::trace::{TraceRecord, read_trace};
+use inference_simulator_rs::trace::{TraceFinishReason, TraceRecord, read_trace};
 use inference_simulator_rs::{Opt, run};
 
 use clap::Parser as _;
@@ -117,6 +117,7 @@ async fn tap_records_trace() {
         .arg(&trace_path)
         .arg("--model")
         .arg("test-model")
+        .arg("--record-tokens")
         .env("RUST_LOG", "info")
         .spawn()
         .expect("failed to spawn inference-sim-tap");
@@ -160,11 +161,11 @@ async fn tap_records_trace() {
     let outputs1: Vec<_> = tokio::time::timeout(TIMEOUT, stream1.collect::<Vec<_>>())
         .await
         .expect("stream 1 timed out");
-    let total1: usize = outputs1
+    let tokens1: Vec<u32> = outputs1
         .iter()
-        .map(|r| r.as_ref().expect("output error").new_token_ids.len())
-        .sum();
-    assert_eq!(total1, 5, "request 1 should produce 5 tokens");
+        .flat_map(|r| r.as_ref().expect("output error").new_token_ids.clone())
+        .collect();
+    assert_eq!(tokens1.len(), 5, "request 1 should produce 5 tokens");
     let last1 = outputs1.last().unwrap().as_ref().unwrap();
     assert_eq!(last1.finish_reason, Some(EngineCoreFinishReason::Length));
 
@@ -174,11 +175,11 @@ async fn tap_records_trace() {
     let outputs2: Vec<_> = tokio::time::timeout(TIMEOUT, stream2.collect::<Vec<_>>())
         .await
         .expect("stream 2 timed out");
-    let total2: usize = outputs2
+    let tokens2: Vec<u32> = outputs2
         .iter()
-        .map(|r| r.as_ref().expect("output error").new_token_ids.len())
-        .sum();
-    assert_eq!(total2, 3, "request 2 should produce 3 tokens");
+        .flat_map(|r| r.as_ref().expect("output error").new_token_ids.clone())
+        .collect();
+    assert_eq!(tokens2.len(), 3, "request 2 should produce 3 tokens");
     let last2 = outputs2.last().unwrap().as_ref().unwrap();
     assert_eq!(last2.finish_reason, Some(EngineCoreFinishReason::Length));
 
@@ -206,11 +207,11 @@ async fn tap_records_trace() {
     let outputs4: Vec<_> = tokio::time::timeout(TIMEOUT, stream4.collect::<Vec<_>>())
         .await
         .expect("stream 4 timed out");
-    let total4: usize = outputs4
+    let tokens4: Vec<u32> = outputs4
         .iter()
-        .map(|r| r.as_ref().expect("output error").new_token_ids.len())
-        .sum();
-    assert_eq!(total4, 4, "request 3 should produce 4 tokens");
+        .flat_map(|r| r.as_ref().expect("output error").new_token_ids.clone())
+        .collect();
+    assert_eq!(tokens4.len(), 4, "request 3 should produce 4 tokens");
 
     // Step 5: Shut down the simulator and tap.
     sim_token.cancel();
@@ -259,6 +260,22 @@ async fn tap_records_trace() {
         itl1.len()
     );
     assert!(r1.concurrency >= 1, "concurrency should be >= 1");
+
+    // --record-tokens: the trace carries exactly the token ids the client saw,
+    // plus the finish reason.
+    assert_eq!(
+        r1.output_token_ids.as_deref(),
+        Some(tokens1.as_slice()),
+        "recorded ids must be content-identical to the delivered stream"
+    );
+    assert_eq!(r1.finish_reason, Some(TraceFinishReason::Length));
+    assert!(
+        records.iter().all(
+            |r| r.output_token_ids.as_ref().map(Vec::len) == Some(r.output_tokens)
+                && r.finish_reason == Some(TraceFinishReason::Length)
+        ),
+        "every record carries ids matching output_tokens and a finish reason"
+    );
 
     // Per-gap batch context parallels the gap array and carries a sane
     // running count for every step.
@@ -314,8 +331,67 @@ async fn tap_records_trace() {
         itl3.len()
     );
 
+    // Step 7: full record -> replay round trip. Boot a FRESH sim on the trace
+    // the tap just captured (fast mode: no latency config) and verify each
+    // replayed stream is byte-identical to what the live client saw.
+    let replay_addr = format!("ipc:///tmp/tap-e2e-replay-{pid}.ipc");
+    if let Some(p) = replay_addr.strip_prefix("ipc://") {
+        let _ = std::fs::remove_file(p);
+    }
+    let replay_args = vec![
+        "inference-sim",
+        "--handshake-address",
+        &replay_addr,
+        "--replay-tokens",
+        &trace_path,
+    ];
+    let replay_opt = Opt::parse_from(&replay_args);
+    let replay_guard = CancellationToken::new();
+    let replay_sim_token = replay_guard.clone();
+    tokio::spawn(async move {
+        let _ = run(replay_opt, replay_sim_token).await;
+    });
+    let config = EngineCoreClientConfig::new_single(&replay_addr);
+    let replay_client =
+        tokio::time::timeout(Duration::from_secs(30), EngineCoreClient::connect(config))
+            .await
+            .expect("replay client connect timed out")
+            .expect("replay client connect failed");
+
+    // Replay indices follow arrival order, which is the send order above.
+    let captured: Vec<(usize, &Vec<u32>)> = vec![(10, &tokens1), (20, &tokens2), (15, &tokens4)];
+    for (i, (prompt_len, expected)) in captured.into_iter().enumerate() {
+        let req = make_request(&format!("replay-{i}"), prompt_len, expected.len() as u32);
+        let stream = replay_client.call(req).await.expect("replay call failed");
+        let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
+            .await
+            .expect("replay stream timed out");
+        let tokens: Vec<u32> = outputs
+            .iter()
+            .flat_map(|r| {
+                r.as_ref()
+                    .expect("replay output error")
+                    .new_token_ids
+                    .clone()
+            })
+            .collect();
+        assert_eq!(
+            &tokens, expected,
+            "replay-{i} must reproduce the captured stream byte for byte"
+        );
+        assert_eq!(
+            outputs.last().unwrap().as_ref().unwrap().finish_reason,
+            Some(EngineCoreFinishReason::Length),
+            "replay-{i} must end with the recorded finish reason"
+        );
+    }
+    replay_guard.cancel();
+
     // Clean up.
     let _ = std::fs::remove_file(&trace_path);
+    if let Some(p) = replay_addr.strip_prefix("ipc://") {
+        let _ = std::fs::remove_file(p);
+    }
     for path in [
         &frontend_handshake,
         &tap_engine_handshake,

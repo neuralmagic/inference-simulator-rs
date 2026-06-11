@@ -8,19 +8,15 @@
 ARG FEDORA_VERSION=42
 # Keep NIXL_REF in lockstep with Cargo.toml's git dep so the data-plane ABI matches.
 ARG NIXL_REF=41685d39
-# The vllm-rs frontend source. Defaults to upstream vLLM at ba94a3b, the exact commit our
-# engine-core-client Cargo dep is pinned to, so the frontend, the tap, and a real engine
-# built from the same commit are all wire-identical (the msgspec data-path structs are
-# positional; do not mix revs).
+# The vllm-rs frontend source. Defaults to upstream vLLM at c9340e6f3, the exact commit
+# our engine-core-client Cargo dep is pinned to, so the frontend, the tap, and a real
+# engine built from the same commit are all wire-identical (the msgspec data-path structs
+# are positional; do not mix revs).
 #
-# The `vllm:lora_requests_info` gauge only exists on Will's fork (lora-info-gauge branch,
-# still unmerged upstream). The previously pinned fork rev (e96171e) went dangling when
-# that branch was rebased past ba94a3b, including a utility-call protocol refactor, so it
-# is no longer a safe default. For LoRA-metric builds, pass:
-#   --build-arg VLLM_REPO=https://github.com/wseaton/vllm.git --build-arg VLLM_REF=<rev>
-# and verify protocol compat with scripts/e2e_lora.sh first.
+# The `vllm:lora_requests_info` gauge is upstream as of #45030 (frontend-derived; the
+# engine no longer reports per-adapter maps in SchedulerStats), so no fork is needed.
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
-ARG VLLM_REF=ba94a3b9989666f950e1f784d18f2033c63c6cad
+ARG VLLM_REF=c9340e6f350a009cf835878abad2a0e379b9e6a4
 
 # ---------------------------------------------------------------------------------------
 FROM fedora:${FEDORA_VERSION} AS builder

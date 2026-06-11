@@ -75,6 +75,21 @@ struct RequestState {
     cached_tokens: usize,
     /// Concurrency snapshot at arrival.
     concurrency: u64,
+    /// Accumulated output token ids; only filled when the tap records tokens.
+    output_token_ids: Vec<u32>,
+}
+
+/// Whether the tap writes output token ids into trace records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum TokenRecording {
+    /// Timing + prefix hashes only (default): the trace stays free of user
+    /// content and can be shared freely.
+    #[default]
+    Off,
+    /// Also record each request's `output_token_ids`. With the same tokenizer
+    /// these decode back to the generated text, so the trace carries user
+    /// content.
+    On,
 }
 
 /// Configuration for the tap proxy.
@@ -92,6 +107,9 @@ pub struct TapConfig {
     /// Token-block size for prompt prefix fingerprints (should match the
     /// engine's prefix-cache block size).
     pub block_size: usize,
+    /// Record each request's output token ids into the trace
+    /// (`TraceRecord::output_token_ids`).
+    pub record_tokens: TokenRecording,
 }
 
 /// Sockets and handshake payloads captured while connecting the real engine.
@@ -333,7 +351,14 @@ pub async fn run_tap<W: Write>(
 
                 // Decode a copy for observation; the trace write at request
                 // completion also lands here, after the frame is already out.
-                observe_output(&frames, &mut requests, writer, arrival, capture_start);
+                observe_output(
+                    &frames,
+                    &mut requests,
+                    writer,
+                    arrival,
+                    capture_start,
+                    config.record_tokens,
+                );
             }
         }
     }
@@ -401,6 +426,7 @@ fn observe_request<F: AsRef<[u8]>>(
                             itl_prefill: Vec::new(),
                             cached_tokens: 0,
                             concurrency,
+                            output_token_ids: Vec::new(),
                         },
                     );
                 }
@@ -436,6 +462,7 @@ fn observe_output<W: Write, F: AsRef<[u8]>>(
     writer: &mut W,
     arrival: Instant,
     capture_start: Instant,
+    record_tokens: TokenRecording,
 ) {
     let outputs = match decode_engine_core_outputs(frames) {
         Ok(outputs) => outputs,
@@ -472,6 +499,10 @@ fn observe_output<W: Write, F: AsRef<[u8]>>(
             // a utility call. Ignore silently.
             continue;
         };
+
+        if record_tokens == TokenRecording::On {
+            state.output_token_ids.extend(&output.new_token_ids);
+        }
 
         // Extract cached_tokens from prefill_stats if present (first output).
         if let Some(ref stats) = output.prefill_stats {
@@ -544,6 +575,9 @@ fn observe_output<W: Write, F: AsRef<[u8]>>(
                         prefill_tokens: state.itl_prefill,
                     }),
                     block_hashes: state.block_hashes,
+                    output_token_ids: (record_tokens == TokenRecording::On)
+                        .then_some(state.output_token_ids),
+                    finish_reason: Some((*reason).into()),
                 };
                 debug!(
                     request_id = %request_id_owned,

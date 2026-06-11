@@ -13,17 +13,42 @@ fn init_tracing() {
         .init();
 }
 
-/// A cancellation token triggered by Ctrl-C.
+/// A cancellation token triggered by SIGINT (Ctrl-C) or SIGTERM, mirroring vLLM's
+/// engine-core signal handlers (k8s sends SIGTERM on pod termination). What happens
+/// next is up to `--shutdown-timeout`: drain in-flight requests or abort them.
 fn shutdown_signal() -> CancellationToken {
     let token = CancellationToken::new();
     let shutdown = token.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            info!("received Ctrl-C, shutting down");
-            shutdown.cancel();
-        }
+        let signal = wait_for_signal().await;
+        info!(signal, "received shutdown signal");
+        shutdown.cancel();
     });
     token
+}
+
+#[cfg(unix)]
+async fn wait_for_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = sigterm.recv() => "SIGTERM",
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to install SIGTERM handler; handling SIGINT only");
+            let _ = tokio::signal::ctrl_c().await;
+            "SIGINT"
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "ctrl-c"
 }
 
 fn main() -> Result<()> {

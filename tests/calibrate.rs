@@ -224,7 +224,7 @@ async fn replay_arrivals_constant_trace() {
                 concurrency: 1,
                 arrival_ms: Some(i as f64 * 250.0),
                 itl_ctx: None,
-                block_hashes: None,
+                ..Default::default()
             })
             .collect();
         let path = std::env::temp_dir().join(format!(
@@ -239,11 +239,11 @@ async fn replay_arrivals_constant_trace() {
             latency_trace: None,
             max_requests: None,
             tolerance: 0.25,
-            use_knob_fit: false,
+            driver: calibrate::SimDriver::TraceReplay,
             ipc_tag: "test-const".to_string(),
             extra_sim_args: Vec::new(),
-            session_replay: false,
-            cold_prompts: false,
+            pacing: calibrate::SessionPacing::OpenLoop,
+            prompts: calibrate::PromptReplay::SharedPrefixes,
             time_scale: 1.0,
         };
         let outcome = calibrate::replay_arrivals(&cfg).await.expect("replay should run");
@@ -297,11 +297,11 @@ async fn replay_arrivals_requires_arrival_ms() {
         latency_trace: None,
         max_requests: None,
         tolerance: 0.25,
-        use_knob_fit: false,
+        driver: calibrate::SimDriver::TraceReplay,
         ipc_tag: "test-noarrivals".to_string(),
         extra_sim_args: Vec::new(),
-        session_replay: false,
-        cold_prompts: false,
+        pacing: calibrate::SessionPacing::OpenLoop,
+        prompts: calibrate::PromptReplay::SharedPrefixes,
         time_scale: 1.0,
     };
     let err = calibrate::replay_arrivals(&cfg)

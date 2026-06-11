@@ -11,10 +11,16 @@
 //!   a summary).
 
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
+use flate2::Compression;
+use flate2::read::MultiGzDecoder;
+use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
+use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
 /// Metadata header optionally present as the first line of a trace file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -49,6 +55,42 @@ struct MetaWrapper {
 pub struct ItlSummary {
     pub mean_ms: f64,
     pub count: usize,
+}
+
+/// Why a request finished, mirroring vLLM's finish reasons in a
+/// human-readable wire form.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TraceFinishReason {
+    Stop,
+    Length,
+    Abort,
+    Error,
+    Repetition,
+}
+
+impl From<EngineCoreFinishReason> for TraceFinishReason {
+    fn from(reason: EngineCoreFinishReason) -> Self {
+        match reason {
+            EngineCoreFinishReason::Stop => TraceFinishReason::Stop,
+            EngineCoreFinishReason::Length => TraceFinishReason::Length,
+            EngineCoreFinishReason::Abort => TraceFinishReason::Abort,
+            EngineCoreFinishReason::Error => TraceFinishReason::Error,
+            EngineCoreFinishReason::Repetition => TraceFinishReason::Repetition,
+        }
+    }
+}
+
+impl From<TraceFinishReason> for EngineCoreFinishReason {
+    fn from(reason: TraceFinishReason) -> Self {
+        match reason {
+            TraceFinishReason::Stop => EngineCoreFinishReason::Stop,
+            TraceFinishReason::Length => EngineCoreFinishReason::Length,
+            TraceFinishReason::Abort => EngineCoreFinishReason::Abort,
+            TraceFinishReason::Error => EngineCoreFinishReason::Error,
+            TraceFinishReason::Repetition => EngineCoreFinishReason::Repetition,
+        }
+    }
 }
 
 /// Per-gap batch context, parallel to `itl_ms`: the engine state under which each
@@ -98,10 +140,42 @@ pub struct TraceRecord {
     /// overlap (and thus prefix-cache behavior) matches the capture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_hashes: Option<Vec<u64>>,
+    /// The request's actual output token ids, recorded only when the capture
+    /// opts in (tap `--record-tokens`). Length must equal `output_tokens`.
+    /// CAUTION: with the same tokenizer these decode back to the generated
+    /// text, so traces carrying this field contain user content and lose the
+    /// share-freely property of the hash-only schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_token_ids: Option<Vec<u32>>,
+    /// Why the request finished. Recorded by the tap regardless of
+    /// `--record-tokens` (it carries no content).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<TraceFinishReason>,
 }
 
 fn default_concurrency() -> u64 {
     1
+}
+
+/// Matches the serde field defaults (notably `concurrency: 1`), so literal
+/// initializers can spell out only what they care about.
+impl Default for TraceRecord {
+    fn default() -> Self {
+        TraceRecord {
+            prompt_tokens: 0,
+            cached_tokens: 0,
+            output_tokens: 0,
+            ttft_ms: 0.0,
+            itl_ms: None,
+            itl_summary: None,
+            concurrency: default_concurrency(),
+            arrival_ms: None,
+            itl_ctx: None,
+            block_hashes: None,
+            output_token_ids: None,
+            finish_reason: None,
+        }
+    }
 }
 
 /// Chained FNV-1a fingerprints of a prompt's full token blocks, for
@@ -132,6 +206,86 @@ pub fn prompt_block_hashes(tokens: &[u32], block_size: usize) -> Option<Vec<u64>
         hashes.push(h);
     }
     Some(hashes)
+}
+
+/// Whether a trace path names a gzip-compressed file. Token-recording traces
+/// get large (one integer per generated token), so every trace touchpoint
+/// reads and writes `.gz` transparently.
+fn is_gz(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "gz")
+}
+
+/// Open a trace file for buffered reading, transparently decompressing when
+/// the path ends in `.gz`.
+pub fn open_trace_reader(path: &Path) -> Result<Box<dyn BufRead>> {
+    let file =
+        File::open(path).with_context(|| format!("opening trace file: {}", path.display()))?;
+    Ok(if is_gz(path) {
+        Box::new(BufReader::new(MultiGzDecoder::new(BufReader::new(file))))
+    } else {
+        Box::new(BufReader::new(file))
+    })
+}
+
+/// Open and parse a trace file (gzip-aware, see [`open_trace_reader`]).
+pub fn read_trace_file(path: &Path) -> Result<(TraceMeta, Vec<TraceRecord>)> {
+    read_trace(open_trace_reader(path)?)
+        .with_context(|| format!("parsing trace file: {}", path.display()))
+}
+
+/// A trace file writer: plain JSONL, or gzip when the path ends in `.gz`.
+///
+/// Call [`TraceWriter::finish`] when done - a gzip stream needs its trailer
+/// written, and dropping the encoder swallows any error doing so.
+pub enum TraceWriter {
+    Plain(BufWriter<File>),
+    Gzip(Box<GzEncoder<BufWriter<File>>>),
+}
+
+impl TraceWriter {
+    /// Create (truncate) a trace file, gzip-compressing when the path ends in
+    /// `.gz`.
+    pub fn create(path: &Path) -> Result<TraceWriter> {
+        let file = File::create(path)
+            .with_context(|| format!("creating trace file: {}", path.display()))?;
+        let buffered = BufWriter::new(file);
+        Ok(if is_gz(path) {
+            TraceWriter::Gzip(Box::new(GzEncoder::new(buffered, Compression::default())))
+        } else {
+            TraceWriter::Plain(buffered)
+        })
+    }
+
+    /// Finalize the file: write the gzip trailer (when compressing) and flush.
+    pub fn finish(self) -> Result<()> {
+        match self {
+            TraceWriter::Plain(mut writer) => writer.flush().context("flushing trace file"),
+            TraceWriter::Gzip(encoder) => encoder
+                .finish()
+                .context("finishing gzip trace stream")?
+                .flush()
+                .context("flushing trace file"),
+        }
+    }
+}
+
+impl Write for TraceWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            TraceWriter::Plain(writer) => writer.write(buf),
+            TraceWriter::Gzip(encoder) => encoder.write(buf),
+        }
+    }
+
+    /// Flushing a gzip stream emits a sync point so the data written so far is
+    /// readable (the tap flushes per record); this costs a little compression
+    /// ratio compared to one final flush.
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            TraceWriter::Plain(writer) => writer.flush(),
+            TraceWriter::Gzip(encoder) => encoder.flush(),
+        }
+    }
 }
 
 /// Parse a trace from any `BufRead`. The first line is checked for a `"meta"` key; if
@@ -214,7 +368,35 @@ fn validate_record(record: &TraceRecord, line_num: usize) -> Result<()> {
             );
         }
     }
+    if let Some(ref ids) = record.output_token_ids
+        && ids.len() != record.output_tokens
+    {
+        bail!(
+            "line {line_num}: output_token_ids has {} ids but output_tokens={}",
+            ids.len(),
+            record.output_tokens,
+        );
+    }
     Ok(())
+}
+
+/// The canonical replay ordering of a trace: records that carry an arrival
+/// time, sorted by it (stable, so finish-order ties keep file order). A
+/// record's index in this subset is its replay identity - the arrival-replay
+/// harness names request `i` `replay-{i}`, and `ReplayTokens` resolves the
+/// trailing index back to the record. Both sides MUST use this function so
+/// the mapping cannot drift.
+pub fn replay_subset(records: Vec<TraceRecord>) -> Vec<TraceRecord> {
+    let mut subset: Vec<TraceRecord> = records
+        .into_iter()
+        .filter(|r| r.arrival_ms.is_some())
+        .collect();
+    subset.sort_by(|a, b| {
+        a.arrival_ms
+            .partial_cmp(&b.arrival_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    subset
 }
 
 /// Write a trace meta line followed by records to a writer.
@@ -270,7 +452,7 @@ mod tests {
                 concurrency: 3,
                 arrival_ms: Some(1234.5),
                 itl_ctx: None,
-                block_hashes: None,
+                ..Default::default()
             },
             TraceRecord {
                 prompt_tokens: 200,
@@ -282,7 +464,7 @@ mod tests {
                 concurrency: 1,
                 arrival_ms: None,
                 itl_ctx: None,
-                block_hashes: None,
+                ..Default::default()
             },
             TraceRecord {
                 prompt_tokens: 50,
@@ -297,7 +479,7 @@ mod tests {
                 concurrency: 5,
                 arrival_ms: None,
                 itl_ctx: None,
-                block_hashes: None,
+                ..Default::default()
             },
         ]
     }
@@ -425,7 +607,7 @@ mod tests {
             concurrency: 1,
             arrival_ms: None,
             itl_ctx: None,
-            block_hashes: None,
+            ..Default::default()
         };
         let mut buf = Vec::new();
         append_record(&mut buf, &record).unwrap();
@@ -433,6 +615,134 @@ mod tests {
         assert!(text.ends_with('\n'));
         let parsed: TraceRecord = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(parsed, record);
+    }
+
+    #[test]
+    fn gzip_trace_file_round_trips() {
+        let meta = sample_meta();
+        let records = sample_records();
+        let path = std::env::temp_dir().join(format!(
+            "inference-sim-trace-gz-test-{}.jsonl.gz",
+            std::process::id()
+        ));
+
+        let mut writer = TraceWriter::create(&path).unwrap();
+        write_trace(&mut writer, &meta, &records).unwrap();
+        writer.finish().unwrap();
+
+        // The bytes on disk are actually gzip, not plain JSONL.
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(&raw[..2], &[0x1f, 0x8b], "gzip magic bytes");
+
+        let (parsed_meta, parsed_records) = read_trace_file(&path).unwrap();
+        assert_eq!(parsed_meta, meta);
+        assert_eq!(parsed_records, records);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plain_trace_file_round_trips() {
+        let meta = sample_meta();
+        let records = sample_records();
+        let path = std::env::temp_dir().join(format!(
+            "inference-sim-trace-plain-test-{}.jsonl",
+            std::process::id()
+        ));
+
+        let mut writer = TraceWriter::create(&path).unwrap();
+        write_trace(&mut writer, &meta, &records).unwrap();
+        writer.finish().unwrap();
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw[0], b'{', "plain path stays uncompressed JSONL");
+
+        let (parsed_meta, parsed_records) = read_trace_file(&path).unwrap();
+        assert_eq!(parsed_meta, meta);
+        assert_eq!(parsed_records, records);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn output_token_ids_and_finish_reason_round_trip() {
+        let record = TraceRecord {
+            prompt_tokens: 10,
+            output_tokens: 3,
+            ttft_ms: 12.0,
+            itl_ms: Some(vec![5.0, 6.0]),
+            output_token_ids: Some(vec![7, 8, 9]),
+            finish_reason: Some(TraceFinishReason::Stop),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        append_record(&mut buf, &record).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        // Wire form is human-readable lowercase, not the protocol's int repr.
+        assert!(text.contains(r#""finish_reason":"stop""#), "{text}");
+        assert!(text.contains(r#""output_token_ids":[7,8,9]"#), "{text}");
+
+        let (_, records) = read_trace(io::BufReader::new(text.as_bytes())).unwrap();
+        assert_eq!(records[0], record);
+    }
+
+    #[test]
+    fn records_without_tokens_serialize_without_the_fields() {
+        let mut buf = Vec::new();
+        append_record(
+            &mut buf,
+            &TraceRecord {
+                prompt_tokens: 10,
+                output_tokens: 1,
+                ttft_ms: 5.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(!text.contains("output_token_ids"), "{text}");
+        assert!(!text.contains("finish_reason"), "{text}");
+    }
+
+    #[test]
+    fn output_token_ids_length_mismatch_is_rejected() {
+        let input = br#"{"prompt_tokens":10,"output_tokens":3,"ttft_ms":10.0,"itl_ms":[5.0,6.0],"output_token_ids":[7,8]}"#;
+        let err = read_trace(io::BufReader::new(input.as_slice())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("output_token_ids"), "{msg}");
+    }
+
+    #[test]
+    fn finish_reason_protocol_conversions_are_inverse() {
+        for reason in [
+            TraceFinishReason::Stop,
+            TraceFinishReason::Length,
+            TraceFinishReason::Abort,
+            TraceFinishReason::Error,
+            TraceFinishReason::Repetition,
+        ] {
+            let wire: EngineCoreFinishReason = reason.into();
+            assert_eq!(TraceFinishReason::from(wire), reason);
+        }
+    }
+
+    #[test]
+    fn replay_subset_orders_by_arrival_and_drops_unscheduled() {
+        let rec = |arrival: Option<f64>, prompt: usize| TraceRecord {
+            prompt_tokens: prompt,
+            output_tokens: 1,
+            ttft_ms: 1.0,
+            arrival_ms: arrival,
+            ..Default::default()
+        };
+        // Finish order on disk: arrivals 50, none, 10, 50 (tie keeps file order).
+        let records = vec![
+            rec(Some(50.0), 1),
+            rec(None, 2),
+            rec(Some(10.0), 3),
+            rec(Some(50.0), 4),
+        ];
+        let subset = replay_subset(records);
+        let prompts: Vec<usize> = subset.iter().map(|r| r.prompt_tokens).collect();
+        assert_eq!(prompts, vec![3, 1, 4]);
     }
 
     #[test]

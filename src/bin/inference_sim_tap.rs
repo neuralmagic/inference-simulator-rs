@@ -32,16 +32,16 @@
 //! - Multi-token output chunks: ITL is divided evenly across the tokens in the chunk.
 //! - Aborted requests are silently discarded (no trace record emitted).
 
-use std::fs::File;
-use std::io::BufWriter;
+use std::path::Path;
 use std::process::ExitCode;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, info};
 
-use inference_simulator_rs::tap::{TapConfig, run_tap, write_meta};
+use inference_simulator_rs::tap::{TapConfig, TokenRecording, run_tap, write_meta};
+use inference_simulator_rs::trace::TraceWriter;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -65,7 +65,10 @@ struct TapOpt {
     #[arg(long, default_value = "tcp://127.0.0.1:29561")]
     output_address: String,
 
-    /// Path to write the JSONL trace output.
+    /// Path to write the JSONL trace output. Gzip-compressed when the path
+    /// ends in `.gz` (recommended with --record-tokens, which grows traces by
+    /// one integer per generated token); the stream is finalized on Ctrl-C,
+    /// so don't SIGKILL the tap if you want a well-terminated gzip file.
     #[arg(long)]
     trace_out: String,
 
@@ -85,6 +88,19 @@ struct TapOpt {
     /// trace). Should match the engine's prefix-cache block size.
     #[arg(long, default_value_t = 16)]
     block_size: usize,
+
+    /// Record each request's output token ids (`output_token_ids` in the
+    /// trace), enabling content-identical replay via the sim's
+    /// `--replay-tokens`. Off by default: with the same tokenizer the ids
+    /// decode back to the generated text, so such traces carry user content.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = TokenRecording::Off,
+        default_missing_value = "on",
+        num_args = 0..=1
+    )]
+    record_tokens: TokenRecording,
 }
 
 fn init_tracing() {
@@ -136,9 +152,7 @@ fn main() -> ExitCode {
 }
 
 async fn run_main(opt: TapOpt) -> Result<()> {
-    let file = File::create(&opt.trace_out)
-        .with_context(|| format!("creating trace file: {}", opt.trace_out))?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = TraceWriter::create(Path::new(&opt.trace_out))?;
 
     write_meta(
         &mut writer,
@@ -155,8 +169,13 @@ async fn run_main(opt: TapOpt) -> Result<()> {
         output_address: opt.output_address,
         model: opt.model,
         block_size: opt.block_size,
+        record_tokens: opt.record_tokens,
     };
 
     let shutdown = shutdown_signal();
-    run_tap(config, &mut writer, shutdown).await
+    // Finalize the trace even when the proxy dies on a transport error: a
+    // gzip stream without its trailer reads as truncated.
+    let result = run_tap(config, &mut writer, shutdown).await;
+    writer.finish()?;
+    result
 }

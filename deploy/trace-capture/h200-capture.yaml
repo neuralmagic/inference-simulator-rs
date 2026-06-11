@@ -11,7 +11,7 @@
 #   engine     vllm serve --headless                        connects handshake :5580, 1x GPU
 #
 # Version pinning is load-bearing: the engine image is the vLLM postmerge CI build for
-# EXACTLY the commit our protocol structs are pinned to (ba94a3b, see Cargo.toml). The
+# EXACTLY the commit our protocol structs are pinned to (c9340e6f3, see Cargo.toml). The
 # msgspec data-path structs are positional (array_like), so a version-skewed engine
 # (e.g. llm-d-cuda v0.7.0 = vLLM v0.19.1) misdecodes against this frontend/tap.
 #
@@ -49,7 +49,7 @@ spec:
       containers:
         # --- Real engine: headless vLLM at the protocol-pinned commit -------------------
         - name: engine
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:ba94a3b9989666f950e1f784d18f2033c63c6cad
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:c9340e6f350a009cf835878abad2a0e379b9e6a4
           command: ["vllm", "serve"]
           args:
             - Qwen/Qwen3-8B
@@ -88,7 +88,7 @@ spec:
             - { mountPath: /models, name: model-cache }
         # --- Recording tap ---------------------------------------------------------------
         - name: tap
-          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v3
+          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v5
           command: ["/usr/local/bin/inference-sim-tap"]
           args:
             - --frontend-handshake=tcp://127.0.0.1:5570
@@ -99,6 +99,9 @@ spec:
             - --model=Qwen/Qwen3-8B
             - --gpu=H200
             - --tp=1
+            # Content capture: records output_token_ids per request. The trace
+            # then carries user/model content - handle accordingly.
+            - --record-tokens
           env:
             - { name: RUST_LOG, value: info }
           resources:
@@ -108,7 +111,7 @@ spec:
             - { mountPath: /trace, name: trace }
         # --- Rust frontend: OpenAI server, no local engine --------------------------------
         - name: frontend
-          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v3
+          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v5
           command: ["/usr/local/bin/vllm-rs", "serve"]
           args:
             - Qwen/Qwen3-8B

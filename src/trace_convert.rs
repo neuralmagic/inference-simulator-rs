@@ -193,7 +193,7 @@ pub fn convert_guidellm(
                 concurrency,
                 arrival_ms: None,
                 itl_ctx: None,
-                block_hashes: None,
+                ..Default::default()
             });
         }
     }

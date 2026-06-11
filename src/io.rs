@@ -5,7 +5,6 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::{Stream, StreamExt as _, stream};
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use vllm_engine_core_client::mock_engine::MockEngineDataSockets;
 use vllm_engine_core_client::protocol::utility::EngineCoreUtilityRequest;
@@ -92,11 +91,15 @@ fn decode_request(message: ZmqMessage) -> Result<EngineInput> {
 }
 
 /// Run the IO loop: dealer frames -> `input_tx`, `output_rx` -> push sockets.
+///
+/// The loop has no shutdown signal of its own: it must keep delivering outputs while
+/// the engine drains in-flight requests, so it exits only when the engine loop is done
+/// (the output channel closes, or an input send finds the engine gone), after flushing
+/// every queued output - the final tokens and abort notices of a graceful shutdown.
 pub(crate) async fn run_io_loop(
     data_sockets: Vec<MockEngineDataSockets>,
     input_tx: mpsc::UnboundedSender<EngineInput>,
     mut output_rx: mpsc::UnboundedReceiver<EngineOutput>,
-    shutdown: CancellationToken,
 ) -> Result<()> {
     let (dealers, mut push_sockets): (Vec<_>, Vec<_>) = data_sockets
         .into_iter()
@@ -108,16 +111,23 @@ pub(crate) async fn run_io_loop(
     loop {
         tokio::select! {
             biased;
-            _ = shutdown.cancelled() => return Ok(()),
-
             output = output_rx.recv() => {
-                let output = output.ok_or_else(|| anyhow!("engine output channel closed"))?;
+                let Some(output) = output else {
+                    // Engine loop exited and every queued output is flushed.
+                    return Ok(());
+                };
                 send_engine_outputs_to_client(&mut push_sockets, output).await?;
             }
 
             input = input_streams.next() => {
                 let input = input.ok_or_else(|| anyhow!("engine input streams closed"))??;
-                input_tx.send(input).map_err(|_| anyhow!("engine state task shut down"))?;
+                if input_tx.send(input).is_err() {
+                    // Engine loop exited between our select arms; flush and leave.
+                    while let Some(output) = output_rx.recv().await {
+                        send_engine_outputs_to_client(&mut push_sockets, output).await?;
+                    }
+                    return Ok(());
+                }
             }
         }
     }

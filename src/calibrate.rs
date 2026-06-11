@@ -24,7 +24,7 @@ use crate::latency::{
     DecodePacing, FirstTokenCtx, KnobLatency, LatencyModel, NUM_CONCURRENCY_BUCKETS, TraceLatency,
     concurrency_bucket, concurrency_label, random_norm,
 };
-use crate::trace::{TraceMeta, TraceRecord, read_trace, write_trace};
+use crate::trace::{TraceMeta, TraceRecord, write_trace};
 
 /// Nearest-rank percentile on a sorted slice. Returns 0.0 for empty input.
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -244,7 +244,7 @@ pub fn gen_demo(num_records: usize, seed: u64) -> (TraceMeta, Vec<TraceRecord>) 
                 concurrency: group.concurrency,
                 arrival_ms: None,
                 itl_ctx: None,
-                block_hashes: None,
+                ..Default::default()
             });
         }
     }
@@ -332,7 +332,7 @@ pub fn gen_demo_fast(num_records: usize, seed: u64) -> (TraceMeta, Vec<TraceReco
                 concurrency: group.concurrency,
                 arrival_ms: None,
                 itl_ctx: None,
-                block_hashes: None,
+                ..Default::default()
             });
         }
     }
@@ -345,13 +345,11 @@ pub fn gen_demo_fast(num_records: usize, seed: u64) -> (TraceMeta, Vec<TraceReco
     (meta, records)
 }
 
-/// Write a generated demo trace to a file.
+/// Write a generated demo trace to a file (gzip when the path ends in `.gz`).
 pub fn write_demo_trace(path: &Path, meta: &TraceMeta, records: &[TraceRecord]) -> Result<()> {
-    let file =
-        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    let mut writer = std::io::BufWriter::new(file);
+    let mut writer = crate::trace::TraceWriter::create(path)?;
     write_trace(&mut writer, meta, records)?;
-    Ok(())
+    writer.finish()
 }
 
 /// Collect TTFT and ITL samples from trace records, grouped by concurrency bucket.
@@ -767,10 +765,8 @@ fn request_total_report(
             continue;
         }
         for _ in 0..reps {
-            let mut pacing = DecodePacing::for_prompt(
-                r.prompt_tokens,
-                crate::latency::record_decodes_under_churn(r),
-            );
+            let mut pacing =
+                DecodePacing::for_prompt(r.prompt_tokens, crate::latency::record_churn(r));
             let total_ms: f64 = (0..n_gaps)
                 .map(|i| {
                     // Model-level calibration has no scheduler to generate prefill
@@ -987,11 +983,7 @@ pub fn calibrate_from_file(
     seed: u64,
     tolerance: f64,
 ) -> Result<CalibrationReport> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("opening trace: {}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
-    let (_meta, records) =
-        read_trace(reader).with_context(|| format!("parsing trace: {}", path.display()))?;
+    let (_meta, records) = crate::trace::read_trace_file(path)?;
     calibrate(&records, num_samples, seed, tolerance)
 }
 
@@ -1051,6 +1043,45 @@ pub fn prompt_from_block_hashes(
     tokens
 }
 
+/// Which latency model drives the in-process sim during a replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum SimDriver {
+    /// Trace-replay latency model (`--latency-trace`).
+    #[default]
+    TraceReplay,
+    /// Best-fit timing knobs (mean/std-dev TTFT and ITL) fitted from the trace.
+    KnobFit,
+}
+
+/// How replayed arrivals are paced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum SessionPacing {
+    /// Every request fires at its recorded wall-clock offset.
+    #[default]
+    OpenLoop,
+    /// Multiturn sessions run closed-loop: a turn fires when its parent turn
+    /// completes plus the recorded think gap; session roots (and traces
+    /// without block-hash chains) stay open-loop. This mirrors how agentic
+    /// workloads actually pace turns; pure open-loop replay of a
+    /// closed-loop-generated schedule amplifies any transient divergence
+    /// (arrivals do not back off when the replay runs momentarily slower).
+    Chained,
+}
+
+/// How replayed prompts are reconstructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum PromptReplay {
+    /// Rebuild prefix sharing from the trace's block-hash chains when present,
+    /// so prefix-cache behavior matches the capture.
+    #[default]
+    SharedPrefixes,
+    /// Cache-off what-if: every prompt replays as unique tokens even when the
+    /// trace carries block_hashes (the chains still drive session inference).
+    /// The TTFT delta vs a SharedPrefixes replay is the prefix cache's
+    /// contribution.
+    Cold,
+}
+
 /// Config for the open-loop arrival replay harness ([`replay_arrivals`]).
 pub struct ReplayArrivalsConfig<'a> {
     /// Trace supplying the arrival schedule, request shapes, and ground-truth
@@ -1063,27 +1094,18 @@ pub struct ReplayArrivalsConfig<'a> {
     pub max_requests: Option<usize>,
     /// Max allowed relative error on pooled quantiles and request totals.
     pub tolerance: f64,
-    /// Drive the sim with fitted knobs instead of trace replay.
-    pub use_knob_fit: bool,
+    /// Which latency model drives the sim.
+    pub driver: SimDriver,
     /// Disambiguates the IPC socket when several replays share a process.
     pub ipc_tag: String,
     /// Extra CLI flags for the in-process sim (e.g. --kv-cache-size). The
     /// replay sim must match the capture engine's scheduler/cache config for
     /// the reactive comparison to be apples-to-apples.
     pub extra_sim_args: Vec<String>,
-    /// Replay multiturn sessions closed-loop: a turn fires when its parent
-    /// turn completes plus the recorded think gap, instead of at its recorded
-    /// wall-clock offset. Session roots still fire open-loop. This mirrors how
-    /// agentic workloads actually pace turns; pure open-loop replay of a
-    /// closed-loop-generated schedule amplifies any transient divergence
-    /// (arrivals do not back off when the replay runs momentarily slower).
-    /// Sessions are inferred from block-hash chains; requires a trace with
-    /// `block_hashes`.
-    pub session_replay: bool,
-    /// Cache-off what-if: replay every prompt as unique tokens even when the
-    /// trace carries block_hashes (the chains still drive session inference).
-    /// The TTFT delta vs a normal replay is the prefix cache's contribution.
-    pub cold_prompts: bool,
+    /// How arrivals are paced (open-loop offsets vs session-chained turns).
+    pub pacing: SessionPacing,
+    /// How prompts are reconstructed (shared prefixes vs cache-off cold).
+    pub prompts: PromptReplay,
     /// Time compression factor: the sim divides its delays by this, the
     /// harness compresses the schedule and re-multiplies measurements. Inner
     /// calibration loops run faster at the cost of timer-granularity fidelity;
@@ -1233,10 +1255,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
     use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
     use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 
-    let file = std::fs::File::open(cfg.trace_path)
-        .with_context(|| format!("opening trace: {}", cfg.trace_path.display()))?;
-    let (meta, all_records) = read_trace(std::io::BufReader::new(file))
-        .with_context(|| format!("parsing trace: {}", cfg.trace_path.display()))?;
+    let (meta, all_records) = crate::trace::read_trace_file(cfg.trace_path)?;
     let block_size = meta.block_size.unwrap_or(16);
     let time_scale = if cfg.time_scale > 0.0 {
         cfg.time_scale
@@ -1244,21 +1263,16 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
         1.0
     };
 
-    let mut subset: Vec<TraceRecord> = all_records
-        .into_iter()
-        .filter(|r| r.arrival_ms.is_some())
-        .collect();
+    // The canonical replay ordering: a record's index here is also its
+    // `replay-{i}` request id, which the sim's `--replay-tokens` resolves
+    // back to the record.
+    let mut subset = crate::trace::replay_subset(all_records);
     if subset.is_empty() {
         bail!(
             "trace has no records with arrival_ms; capture with a tap/loadgen that \
              records the arrival schedule"
         );
     }
-    subset.sort_by(|a, b| {
-        a.arrival_ms
-            .partial_cmp(&b.arrival_ms)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
     if let Some(n) = cfg.max_requests {
         subset.truncate(n);
     }
@@ -1299,11 +1313,8 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
     {
         args.extend(["--max-num-seqs".to_string(), max_num_seqs.to_string()]);
     }
-    if cfg.use_knob_fit {
-        let lat_file = std::fs::File::open(latency_path)
-            .with_context(|| format!("opening latency trace: {}", latency_path.display()))?;
-        let (_, lat_records) = read_trace(std::io::BufReader::new(lat_file))
-            .with_context(|| format!("parsing latency trace: {}", latency_path.display()))?;
+    if cfg.driver == SimDriver::KnobFit {
+        let (_, lat_records) = crate::trace::read_trace_file(latency_path)?;
         let knob = fit_knob_from_trace(&lat_records);
         args.extend([
             "--time-to-first-token".to_string(),
@@ -1362,7 +1373,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
     // Session mode: a child turn fires when its parent completes plus the
     // recorded think gap; roots (and every request, in pure arrival mode)
     // fire at recorded offsets.
-    let parents = if cfg.session_replay {
+    let parents = if cfg.pacing == SessionPacing::Chained {
         infer_session_parents(&subset)
     } else {
         vec![None; subset.len()]
@@ -1371,7 +1382,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
         (0..subset.len()).map(|_| Vec::new()).collect();
     let mut triggers: Vec<Option<(tokio::sync::oneshot::Receiver<()>, f64)>> =
         (0..subset.len()).map(|_| None).collect();
-    if cfg.session_replay {
+    if cfg.pacing == SessionPacing::Chained {
         let mut roots = 0usize;
         for (i, parent) in parents.iter().enumerate() {
             let Some(p) = *parent else {
@@ -1399,7 +1410,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
         // Reconstruct prefix sharing when the capture fingerprinted it;
         // otherwise every prompt is unique (cold cache, matching the capture).
         let prompt = match rec.block_hashes.as_deref() {
-            Some(hashes) if !cfg.cold_prompts => {
+            Some(hashes) if cfg.prompts == PromptReplay::SharedPrefixes => {
                 prompt_from_block_hashes(hashes, rec.prompt_tokens, block_size, i)
             }
             _ => synthetic_prompt(i, rec.prompt_tokens),
@@ -1509,7 +1520,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
             concurrency: rec.concurrency,
             arrival_ms: rec.arrival_ms,
             itl_ctx: None,
-            block_hashes: None,
+            ..Default::default()
         });
     }
 
@@ -1576,7 +1587,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
         && replay_itl_err <= cfg.tolerance
         && request_total.as_ref().is_none_or(|rt| rt.within_tolerance);
 
-    let measured_label = if cfg.use_knob_fit {
+    let measured_label = if cfg.driver == SimDriver::KnobFit {
         "knobfit"
     } else {
         "replay"
@@ -1681,6 +1692,7 @@ mod tests {
             arrival_ms: Some(arrival),
             itl_ctx: None,
             block_hashes: prompt_block_hashes(tokens, block),
+            ..Default::default()
         };
 
         // Two interleaved sessions; session B shares session A's first block
@@ -1774,7 +1786,7 @@ mod tests {
                 concurrency: 1,
                 arrival_ms: None,
                 itl_ctx: None,
-                block_hashes: None,
+                ..Default::default()
             })
             .collect();
 
@@ -1822,7 +1834,7 @@ mod tests {
                 concurrency: 1,
                 arrival_ms: None,
                 itl_ctx: None,
-                block_hashes: None,
+                ..Default::default()
             })
             .collect();
 
@@ -1849,7 +1861,7 @@ mod tests {
                 concurrency: 1,
                 arrival_ms: None,
                 itl_ctx: None,
-                block_hashes: None,
+                ..Default::default()
             })
             .collect();
 
@@ -1872,7 +1884,7 @@ mod tests {
                 concurrency: 1,
                 arrival_ms: None,
                 itl_ctx: None,
-                block_hashes: None,
+                ..Default::default()
             })
             .collect();
 
@@ -1943,7 +1955,7 @@ mod tests {
                 concurrency: 1,
                 arrival_ms: None,
                 itl_ctx: None,
-                block_hashes: None,
+                ..Default::default()
             })
             .collect();
 
@@ -1982,7 +1994,7 @@ mod tests {
                 concurrency: 4,
                 arrival_ms: None,
                 itl_ctx: None,
-                block_hashes: None,
+                ..Default::default()
             });
         }
 

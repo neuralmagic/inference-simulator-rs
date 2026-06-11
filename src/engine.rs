@@ -32,7 +32,7 @@ use vllm_engine_core_client::protocol::{
 use crate::blockpool::BlockPool;
 use crate::dataplane::{KvDataPlane, NixlConfig, RemoteKv, RequestKv, make_data_plane};
 use crate::kvevents::KvEventTx;
-use crate::latency::{DecodePacing, FirstTokenCtx, LatencyModel};
+use crate::latency::{Churn, DecodePacing, FirstTokenCtx, LatencyModel};
 use crate::lora::LoraRegistry;
 use crate::sched::{self, Scheduler};
 use crate::tokens::{RandomTokens, TokenCtx, TokenSource};
@@ -292,8 +292,8 @@ struct AdmissionCtx {
     num_local_cached_tokens: usize,
     /// Block-pool slots pinned for the prompt.
     block_ids: Vec<usize>,
-    /// Whether the batch is under big-chunk churn (see `DecodePacing`).
-    churn: bool,
+    /// The batch's decode regime at admission (see `latency::Churn`).
+    churn: Churn,
 }
 
 impl ActiveRequest {
@@ -640,31 +640,6 @@ impl SimEngine {
         )))
     }
 
-    /// Count running requests per LoRA adapter (from the batch) and waiting requests per
-    /// adapter (from the queue) for the `running_lora_adapters`/`waiting_lora_adapters`
-    /// scheduler stats. Base-model requests carry no adapter and are not counted.
-    fn lora_counts(&self) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
-        let mut running = BTreeMap::new();
-        for request in self.active_requests.values() {
-            if let Some(name) = &request.lora_name {
-                *running.entry(name.clone()).or_insert(0) += 1;
-            }
-        }
-        // Pending pulls hold batch slots and count as running for LoRA accounting.
-        for pending in self.pending_pulls.values() {
-            if let Some(name) = &pending.lora_name {
-                *running.entry(name.clone()).or_insert(0) += 1;
-            }
-        }
-        let mut waiting = BTreeMap::new();
-        for request in &self.waiting {
-            if let Some(lora) = &request.lora_request {
-                *waiting.entry(lora.lora_name.clone()).or_insert(0) += 1;
-            }
-        }
-        (running, waiting)
-    }
-
     /// Whether the LoRA slot cap lets this request join the running batch right now (see
     /// `LoraRegistry::admits`). The running batch's distinct adapters are read live.
     fn lora_admits(&self, request: &EngineCoreRequest) -> bool {
@@ -738,63 +713,7 @@ impl SimEngine {
             }
 
             EngineInput::Abort(request_ids) => {
-                let mut by_client =
-                    BTreeMap::<u32, (Vec<EngineCoreOutput>, BTreeSet<String>)>::new();
-                for request_id in request_ids {
-                    // Release is cheap (a memset or no-op), lock inline.
-                    if let Ok(mut plane) = self.data_plane.lock() {
-                        plane.release(&request_id);
-                    }
-                    // A request is running, pending-pull, or waiting; abort whichever.
-                    let client_index =
-                        if let Some(request) = self.active_requests.remove(&request_id) {
-                            self.pool.unpin(&request.block_ids);
-                            self.token_source.on_request_finished(&request.request_id);
-                            Some(request.client_index)
-                        } else if let Some(pending) = self.pending_pulls.remove(&request_id) {
-                            // Pull is in flight on a background thread; unpin blocks and let
-                            // the orphaned task's completion be dropped in finish_pull.
-                            self.pool.unpin(&pending.block_ids);
-                            Some(pending.client_index)
-                        } else if let Some(pos) =
-                            self.waiting.iter().position(|r| r.request_id == request_id)
-                        {
-                            self.waiting.remove(pos).map(|r| r.client_index)
-                        } else {
-                            None
-                        };
-
-                    if let Some(client_index) = client_index {
-                        let output = request_output(
-                            request_id.clone(),
-                            Vec::new(),
-                            Some(EngineCoreFinishReason::Abort),
-                        );
-                        let (outs, finished) = by_client
-                            .entry(client_index)
-                            .or_insert_with(|| (Vec::new(), BTreeSet::new()));
-                        outs.push(output);
-                        finished.insert(request_id.clone());
-                        if self.opt.log_requests {
-                            info!(request_id, finish_reason = "abort", "request aborted");
-                        }
-                    }
-                }
-                for (client_index, (client_outputs, finished_requests)) in by_client {
-                    outputs.push(EngineOutput {
-                        client_index,
-                        outputs: EngineCoreOutputs {
-                            engine_index: self.engine_index,
-                            outputs: client_outputs,
-                            timestamp: now_secs(),
-                            finished_requests: Some(finished_requests),
-                            ..Default::default()
-                        },
-                    });
-                }
-                // Aborting running requests frees batch slots; admit any waiting requests.
-                outputs.extend(self.schedule());
-                self.ensure_step(Instant::now());
+                outputs.extend(self.abort_requests(request_ids));
             }
 
             EngineInput::Utility(request) => {
@@ -826,6 +745,68 @@ impl SimEngine {
         }
 
         Ok(outputs)
+    }
+
+    /// Abort the given requests wherever they stand (running, pending-pull, or waiting),
+    /// releasing their data-plane and block-pool resources and producing one Abort output
+    /// per request, batched per client. Unknown ids are ignored. Used by the frontend's
+    /// abort message and by the graceful-shutdown abort path.
+    fn abort_requests(&mut self, request_ids: Vec<String>) -> Vec<EngineOutput> {
+        let mut outputs = Vec::new();
+        let mut by_client = BTreeMap::<u32, (Vec<EngineCoreOutput>, BTreeSet<String>)>::new();
+        for request_id in request_ids {
+            // Release is cheap (a memset or no-op), lock inline.
+            if let Ok(mut plane) = self.data_plane.lock() {
+                plane.release(&request_id);
+            }
+            // A request is running, pending-pull, or waiting; abort whichever.
+            let client_index = if let Some(request) = self.active_requests.remove(&request_id) {
+                self.pool.unpin(&request.block_ids);
+                self.token_source.on_request_finished(&request.request_id);
+                Some(request.client_index)
+            } else if let Some(pending) = self.pending_pulls.remove(&request_id) {
+                // Pull is in flight on a background thread; unpin blocks and let
+                // the orphaned task's completion be dropped in finish_pull.
+                self.pool.unpin(&pending.block_ids);
+                Some(pending.client_index)
+            } else if let Some(pos) = self.waiting.iter().position(|r| r.request_id == request_id) {
+                self.waiting.remove(pos).map(|r| r.client_index)
+            } else {
+                None
+            };
+
+            if let Some(client_index) = client_index {
+                let output = request_output(
+                    request_id.clone(),
+                    Vec::new(),
+                    Some(EngineCoreFinishReason::Abort),
+                );
+                let (outs, finished) = by_client
+                    .entry(client_index)
+                    .or_insert_with(|| (Vec::new(), BTreeSet::new()));
+                outs.push(output);
+                finished.insert(request_id.clone());
+                if self.opt.log_requests {
+                    info!(request_id, finish_reason = "abort", "request aborted");
+                }
+            }
+        }
+        for (client_index, (client_outputs, finished_requests)) in by_client {
+            outputs.push(EngineOutput {
+                client_index,
+                outputs: EngineCoreOutputs {
+                    engine_index: self.engine_index,
+                    outputs: client_outputs,
+                    timestamp: now_secs(),
+                    finished_requests: Some(finished_requests),
+                    ..Default::default()
+                },
+            });
+        }
+        // Aborting running requests frees batch slots; admit any waiting requests.
+        outputs.extend(self.schedule());
+        self.ensure_step(Instant::now());
+        outputs
     }
 
     /// Maximum requests allowed in the running batch. Clamped to at least 1 so a misconfigured
@@ -973,7 +954,11 @@ impl SimEngine {
         {
             self.recent_big_admissions.pop_front();
         }
-        let churn = !self.recent_big_admissions.is_empty();
+        let churn = if self.recent_big_admissions.is_empty() {
+            Churn::Calm
+        } else {
+            Churn::BigChunk
+        };
         match ActiveRequest::new(
             self.engine_index,
             request,
@@ -1356,12 +1341,16 @@ impl SimEngine {
                 let is_first = request.emitted == 0;
                 request.emitted += emit.tokens.len();
                 let finished = request.emitted >= request.max_tokens;
+                // A replayed request ends with its recorded finish reason; the
+                // sim's own stop condition is always max_tokens (Length).
+                let finish_reason = finished.then(|| {
+                    self.token_source
+                        .finish_reason(&request.request_id)
+                        .unwrap_or(EngineCoreFinishReason::Length)
+                });
 
-                let mut output = request_output(
-                    request.request_id.clone(),
-                    emit.tokens,
-                    finished.then_some(EngineCoreFinishReason::Length),
-                );
+                let mut output =
+                    request_output(request.request_id.clone(), emit.tokens, finish_reason);
                 if is_first {
                     output.prefill_stats = Some(request.prefill_stats());
                 }
@@ -1380,7 +1369,8 @@ impl SimEngine {
                             request_id = %request.request_id,
                             prompt_len = request.prompt_len,
                             output_tokens = request.generated,
-                            finish_reason = "length",
+                            finish_reason =
+                                ?finish_reason.unwrap_or(EngineCoreFinishReason::Length),
                             "request finished"
                         );
                     }
@@ -1476,7 +1466,6 @@ impl SimEngine {
     /// does `inc_by` on them), so each snapshot drains them.
     fn scheduler_stats(&mut self) -> SchedulerStats {
         let prefix = self.pool.take_stats();
-        let (running_lora_adapters, waiting_lora_adapters) = self.lora_counts();
         // Pending pulls count as running: the request has left the waiting queue, holds pinned
         // blocks, and occupies a batch slot. This matches vLLM's WAITING_FOR_REMOTE_KVS
         // accounting, which is grouped under num_running_reqs in the stats surface.
@@ -1494,8 +1483,6 @@ impl SimEngine {
                 },
                 ..Default::default()
             },
-            running_lora_adapters,
-            waiting_lora_adapters,
             ..Default::default()
         }
     }
@@ -1535,9 +1522,7 @@ impl SimEngine {
             side_channel_port: opt.side_channel_port + engine_index,
         };
         let latency: Box<dyn LatencyModel> = opt.build_latency()?;
-        let token_source: Box<dyn TokenSource> = Box::new(RandomTokens {
-            vocab_size: opt.vocab_size,
-        });
+        let token_source: Box<dyn TokenSource> = opt.build_token_source()?;
         let scheduler: Box<dyn Scheduler> = match opt.scheduling_policy {
             SchedulingPolicy::Fcfs => Box::new(sched::Fcfs),
             SchedulingPolicy::Priority => Box::new(sched::Priority),
@@ -1605,6 +1590,39 @@ impl EngineCore for SimEngine {
     fn step(&mut self) -> Vec<EngineOutput> {
         SimEngine::step(self)
     }
+
+    fn num_unfinished_requests(&self) -> usize {
+        // Active requests include finished ones still flushing trailing emissions;
+        // those still owe the client tokens, so they count.
+        self.active_requests.len() + self.pending_pulls.len() + self.waiting.len()
+    }
+
+    fn abort_all_requests(&mut self) -> Vec<EngineOutput> {
+        let request_ids: Vec<String> = self
+            .active_requests
+            .keys()
+            .cloned()
+            .chain(self.pending_pulls.keys().cloned())
+            .chain(self.waiting.iter().map(|r| r.request_id.clone()))
+            .collect();
+        self.abort_requests(request_ids)
+    }
+
+    fn reject_request(&self, request: Box<EngineCoreRequest>) -> EngineOutput {
+        debug!(
+            engine_index = self.engine_index,
+            request_id = request.request_id,
+            "rejecting new request during shutdown"
+        );
+        EngineOutput {
+            client_index: request.client_index,
+            outputs: empty_finish_outputs(
+                self.engine_index,
+                request.request_id,
+                EngineCoreFinishReason::Abort,
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1641,10 +1659,7 @@ mod tests {
             opt.kv_cache_none_seed,
         );
         let latency: Box<dyn crate::latency::LatencyModel> = opt.build_latency().unwrap();
-        let token_source: Box<dyn crate::tokens::TokenSource> =
-            Box::new(crate::tokens::RandomTokens {
-                vocab_size: opt.vocab_size,
-            });
+        let token_source: Box<dyn crate::tokens::TokenSource> = opt.build_token_source().unwrap();
         let scheduler: Box<dyn crate::sched::Scheduler> = match opt.scheduling_policy {
             SchedulingPolicy::Fcfs => Box::new(crate::sched::Fcfs),
             SchedulingPolicy::Priority => Box::new(crate::sched::Priority),
@@ -2321,38 +2336,6 @@ mod tests {
     }
 
     #[test]
-    fn running_request_counts_into_lora_adapters() {
-        let (mut engine, mut rx) = test_engine(test_opt());
-        add(&mut engine, &mut rx, lora_request("r1", "adapterA", 1));
-        let stats = engine.scheduler_stats();
-        assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
-        assert!(stats.waiting_lora_adapters.is_empty());
-        // A base-model request adds nothing to the adapter maps.
-        add(&mut engine, &mut rx, request("base", 4, 50));
-        let stats = engine.scheduler_stats();
-        assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
-        assert_eq!(stats.running_lora_adapters.len(), 1);
-    }
-
-    #[test]
-    fn waiting_requests_count_into_waiting_lora_adapters() {
-        let mut opt = test_opt();
-        opt.max_num_seqs = 1; // one slot, so the rest queue behind it
-        let (mut engine, mut rx) = test_engine(opt);
-
-        add(&mut engine, &mut rx, lora_request("run", "adapterA", 1));
-        add(&mut engine, &mut rx, lora_request("wait1", "adapterB", 2));
-        add(&mut engine, &mut rx, lora_request("wait2", "adapterB", 2));
-        let stats = engine.scheduler_stats();
-        assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
-        assert_eq!(
-            stats.waiting_lora_adapters.get("adapterB"),
-            Some(&2),
-            "both queued requests for adapterB counted"
-        );
-    }
-
-    #[test]
     fn max_loras_blocks_a_new_adapter_until_a_slot_frees() {
         let mut opt = test_opt();
         opt.max_loras = 1; // only one distinct adapter may run at a time
@@ -2595,6 +2578,47 @@ mod tests {
         assert_eq!(
             all_tokens, prompt,
             "engine with EchoTokens echoes prompt ids exactly"
+        );
+    }
+
+    #[test]
+    fn replay_tokens_at_engine_level_reproduces_ids_and_finish_reason() {
+        use crate::trace::{TraceFinishReason, TraceRecord};
+
+        let recorded = vec![500u32, 501, 502, 503];
+        let records = vec![TraceRecord {
+            prompt_tokens: 4,
+            output_tokens: recorded.len(),
+            ttft_ms: 1.0,
+            itl_ms: Some(vec![1.0; recorded.len() - 1]),
+            output_token_ids: Some(recorded.clone()),
+            finish_reason: Some(TraceFinishReason::Stop),
+            ..Default::default()
+        }];
+
+        let (mut engine, mut rx) = test_engine(test_opt());
+        engine.token_source = Box::new(crate::tokens::ReplayTokens::from_records(&records, 100));
+
+        let req = EngineCoreRequest {
+            request_id: "replay-0".to_string(),
+            prompt_token_ids: Some(vec![1, 2, 3, 4]),
+            sampling_params: Some(EngineCoreSamplingParams {
+                max_tokens: recorded.len() as u32,
+                ..EngineCoreSamplingParams::for_test()
+            }),
+            ..Default::default()
+        };
+        add(&mut engine, &mut rx, req);
+        let outputs = drain(&mut engine, &mut rx);
+        let all_tokens: Vec<u32> = outputs
+            .iter()
+            .flat_map(|o| o.new_token_ids.clone())
+            .collect();
+        assert_eq!(all_tokens, recorded, "stream is content-identical");
+        assert_eq!(
+            outputs.last().unwrap().finish_reason,
+            Some(EngineCoreFinishReason::Stop),
+            "stream ends with the recorded finish reason, not Length"
         );
     }
 

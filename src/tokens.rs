@@ -2,10 +2,15 @@
 //!
 //! The `TokenSource` trait decouples *what tokens a request emits* from the engine loop
 //! that paces them. The default `RandomTokens` reproduces the original behavior: uniform
-//! random draws from `0..vocab_size` using the per-request seeded rng.
+//! random draws from `0..vocab_size` using the per-request seeded rng. `ReplayTokens`
+//! serves the output ids recorded in a trace (tap `--record-tokens`), making replayed
+//! streams content-identical to the capture.
 
 use rand::Rng as _;
 use rand::rngs::StdRng;
+use vllm_engine_core_client::protocol::EngineCoreFinishReason;
+
+use crate::trace::TraceRecord;
 
 /// Context passed to `TokenSource::next_tokens` so implementations can condition on
 /// request state without holding a reference to the full `ActiveRequest`.
@@ -26,6 +31,13 @@ pub(crate) trait TokenSource: Send {
     /// Called when a request finishes or is aborted, so stateful sources can drop any
     /// per-request bookkeeping. The default is a no-op.
     fn on_request_finished(&mut self, _request_id: &str) {}
+
+    /// The finish reason this request's stream should end with, when the source knows
+    /// it (replayed traces record one). `None` keeps the engine's own semantics
+    /// (`Length` at max_tokens).
+    fn finish_reason(&self, _request_id: &str) -> Option<EngineCoreFinishReason> {
+        None
+    }
 }
 
 /// The original token strategy: each token is drawn uniformly from `0..vocab_size`.
@@ -40,6 +52,78 @@ impl TokenSource for RandomTokens {
             tokens.push(rng.random_range(0..self.vocab_size));
         }
         tokens
+    }
+}
+
+/// One trace record's recorded output, in canonical replay order.
+struct RecordedOutput {
+    /// The recorded output ids; empty when the capture did not record tokens
+    /// for this request (the fallback source covers it).
+    token_ids: Vec<u32>,
+    finish_reason: Option<EngineCoreFinishReason>,
+}
+
+/// Serves the output token ids recorded in a trace, making a replayed stream
+/// content-identical to the capture.
+///
+/// A request resolves to its record through the trailing `-<index>` of its
+/// request id (the arrival-replay harness names them `replay-{i}`), where the
+/// index is the record's position in [`crate::trace::replay_subset`] order.
+/// Requests that don't resolve, and generation past the end of a record's ids,
+/// fall back to random tokens.
+pub(crate) struct ReplayTokens {
+    records: Vec<RecordedOutput>,
+    fallback: RandomTokens,
+}
+
+impl ReplayTokens {
+    /// Build from records already in [`crate::trace::replay_subset`] order.
+    pub(crate) fn from_records(records: &[TraceRecord], vocab_size: u32) -> ReplayTokens {
+        ReplayTokens {
+            records: records
+                .iter()
+                .map(|r| RecordedOutput {
+                    token_ids: r.output_token_ids.clone().unwrap_or_default(),
+                    finish_reason: r.finish_reason.map(EngineCoreFinishReason::from),
+                })
+                .collect(),
+            fallback: RandomTokens { vocab_size },
+        }
+    }
+
+    /// The replay-subset index encoded in a request id: everything after the
+    /// last `-` parsed as an integer (the whole id when there is no `-`).
+    fn record_index(request_id: &str) -> Option<usize> {
+        let tail = request_id.rsplit_once('-').map_or(request_id, |(_, t)| t);
+        tail.parse().ok()
+    }
+
+    fn record(&self, request_id: &str) -> Option<&RecordedOutput> {
+        Self::record_index(request_id).and_then(|i| self.records.get(i))
+    }
+}
+
+impl TokenSource for ReplayTokens {
+    fn next_tokens(&mut self, ctx: &TokenCtx<'_>, n: usize, rng: &mut StdRng) -> Vec<u32> {
+        let recorded = match self.record(ctx.request_id) {
+            Some(record) => {
+                let start = ctx.num_generated.min(record.token_ids.len());
+                let end = (ctx.num_generated + n).min(record.token_ids.len());
+                &record.token_ids[start..end]
+            }
+            None => &[],
+        };
+        let mut tokens = recorded.to_vec();
+        // The client asked for more than was recorded (or nothing was recorded
+        // for this request): pad with random draws rather than starving it.
+        if tokens.len() < n {
+            tokens.extend(self.fallback.next_tokens(ctx, n - tokens.len(), rng));
+        }
+        tokens
+    }
+
+    fn finish_reason(&self, request_id: &str) -> Option<EngineCoreFinishReason> {
+        self.record(request_id).and_then(|r| r.finish_reason)
     }
 }
 
@@ -104,6 +188,103 @@ mod tests {
         let mut src = RandomTokens { vocab_size: 10 };
         // Should not panic.
         src.on_request_finished("anything");
+    }
+
+    fn replay_source() -> crate::tokens::ReplayTokens {
+        use crate::trace::{TraceFinishReason, TraceRecord};
+        let records = vec![
+            TraceRecord {
+                prompt_tokens: 4,
+                output_tokens: 5,
+                ttft_ms: 1.0,
+                itl_ms: Some(vec![1.0; 4]),
+                output_token_ids: Some(vec![100, 101, 102, 103, 104]),
+                finish_reason: Some(TraceFinishReason::Stop),
+                ..Default::default()
+            },
+            // Captured without --record-tokens: reason only, no ids.
+            TraceRecord {
+                prompt_tokens: 4,
+                output_tokens: 2,
+                ttft_ms: 1.0,
+                itl_ms: Some(vec![1.0]),
+                finish_reason: Some(TraceFinishReason::Length),
+                ..Default::default()
+            },
+        ];
+        crate::tokens::ReplayTokens::from_records(&records, 50)
+    }
+
+    #[test]
+    fn replay_tokens_serves_recorded_ids_at_the_generation_offset() {
+        let mut src = replay_source();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let ctx = TokenCtx {
+            request_id: "replay-0",
+            prompt_token_ids: &[],
+            num_generated: 0,
+        };
+        assert_eq!(src.next_tokens(&ctx, 2, &mut rng), vec![100, 101]);
+        let ctx = TokenCtx {
+            request_id: "replay-0",
+            prompt_token_ids: &[],
+            num_generated: 2,
+        };
+        assert_eq!(src.next_tokens(&ctx, 3, &mut rng), vec![102, 103, 104]);
+    }
+
+    #[test]
+    fn replay_tokens_pads_past_recorded_end_with_fallback() {
+        let mut src = replay_source();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let ctx = TokenCtx {
+            request_id: "replay-0",
+            prompt_token_ids: &[],
+            num_generated: 3,
+        };
+        // 2 recorded ids remain; the other 3 come from the fallback (vocab 50).
+        let tokens = src.next_tokens(&ctx, 5, &mut rng);
+        assert_eq!(tokens.len(), 5);
+        assert_eq!(&tokens[..2], &[103, 104]);
+        assert!(tokens[2..].iter().all(|&t| t < 50));
+    }
+
+    #[test]
+    fn replay_tokens_falls_back_for_unmatched_and_tokenless_requests() {
+        let mut src = replay_source();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        for id in ["not-a-replay-id", "replay-99", "replay-1"] {
+            let ctx = TokenCtx {
+                request_id: id,
+                prompt_token_ids: &[],
+                num_generated: 0,
+            };
+            let tokens = src.next_tokens(&ctx, 4, &mut rng);
+            assert_eq!(tokens.len(), 4, "{id}");
+            assert!(tokens.iter().all(|&t| t < 50), "{id}");
+        }
+    }
+
+    #[test]
+    fn replay_tokens_reports_recorded_finish_reasons() {
+        use vllm_engine_core_client::protocol::EngineCoreFinishReason;
+        let src = replay_source();
+        assert_eq!(
+            src.finish_reason("replay-0"),
+            Some(EngineCoreFinishReason::Stop)
+        );
+        assert_eq!(
+            src.finish_reason("replay-1"),
+            Some(EngineCoreFinishReason::Length)
+        );
+        assert_eq!(src.finish_reason("replay-99"), None);
+        assert_eq!(src.finish_reason("other"), None);
+    }
+
+    #[test]
+    fn default_finish_reason_is_none() {
+        let src = RandomTokens { vocab_size: 10 };
+        assert_eq!(src.finish_reason("anything"), None);
     }
 
     #[test]

@@ -40,13 +40,10 @@ pub struct FirstTokenCtx {
 pub struct DecodePacing {
     /// Chosen donor index per concurrency bucket, lazily picked on first use.
     donors: [Option<u32>; NUM_CONCURRENCY_BUCKETS],
-    /// Prefill tokens admitted by the engine and not yet charged to this
-    /// request's gaps. Each subsequent draw consumes one budget-sized chunk
-    /// and surcharges the gap by chunk * prefill slope (a chunk step blocks
-    /// every concurrent decode for the chunk's compute time).
-    pending_stall_tokens: u32,
-    /// Per-step chunk budget (the engine's max_num_batched_tokens).
-    chunk_budget: u32,
+    /// Prefill interference noted by the engine since this request's last gap
+    /// draw: prompt tokens of a request admitted to prefill. Consumed by the
+    /// next draw, which samples the stall distribution instead of the clean one.
+    pending_stall: Option<u32>,
     /// Prompt bucket of this request's full context, conditioning decode gaps
     /// on KV depth (attention over a long context slows every step).
     context_bucket: usize,
@@ -62,15 +59,11 @@ impl DecodePacing {
     }
 
     /// Note that the engine admitted a prefill of `prompt_tokens` while this
-    /// request decodes, chunked at `chunk_budget` tokens per step. The tokens
-    /// accumulate; each subsequent gap draw consumes one chunk and pays its
-    /// compute time, so an 11k prefill inflates ceil(11k/budget) gaps the way
-    /// real chunked prefill blocks consecutive steps.
-    pub fn note_prefill(&mut self, prompt_tokens: u32, chunk_budget: u32) {
-        self.pending_stall_tokens = self.pending_stall_tokens.saturating_add(prompt_tokens);
-        if chunk_budget > 0 {
-            self.chunk_budget = chunk_budget;
-        }
+    /// request decodes. A real prefill blocks one engine step, spiking exactly
+    /// one gap per concurrent decode request, so the flag is consumed by a
+    /// single draw. Multiple admissions before the next draw keep the largest.
+    pub fn note_prefill(&mut self, prompt_tokens: u32) {
+        self.pending_stall = Some(self.pending_stall.unwrap_or(0).max(prompt_tokens));
     }
 }
 
@@ -78,8 +71,7 @@ impl Default for DecodePacing {
     fn default() -> Self {
         Self {
             donors: [None; NUM_CONCURRENCY_BUCKETS],
-            pending_stall_tokens: 0,
-            chunk_budget: u32::MAX,
+            pending_stall: None,
             context_bucket: 0,
         }
     }
@@ -356,12 +348,11 @@ pub struct TraceLatency {
     /// When the trace carries `itl_ctx`, donors hold only CLEAN gaps; the
     /// prefill-interfered gaps feed `stalls_grid`.
     donors_grid: Vec<Vec<DonorBucket>>,
-    /// Prefill compute slope (ms per uncached token), least-squares fit over
-    /// the service cells. A noted prefill chunk surcharges concurrent decode
-    /// gaps by chunk * slope: structural interference, instead of sampling
-    /// marked stall gaps whose magnitudes embed the fitting capture's own
-    /// chunk-queue depth (storm captures overshoot calm workloads 2x).
-    prefill_slope_ms_per_token: f64,
+    /// Sorted prefill-interfered gap samples, indexed by
+    /// [prefill-size bucket][concurrency bucket], drawn when the engine notes
+    /// a prefill admission on the request's pacing state. Empty for traces
+    /// without `itl_ctx`.
+    stalls_grid: Vec<Vec<Vec<f64>>>,
     /// Fallback for do_remote_prefill KV-transfer timing (the trace does not record
     /// transfer latencies from disaggregated decode pulls).
     kv_transfer_fallback: KnobLatency,
@@ -385,7 +376,7 @@ impl TraceLatency {
         let mut ttft_obs: Vec<Vec<(usize, f64, f64)>> = vec![Vec::new(); NUM_PROMPT_BUCKETS];
         let mut donors_grid =
             vec![vec![DonorBucket::default(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
-
+        let mut stalls_grid = vec![vec![Vec::new(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
         let mut itl_by_concurrency = vec![Vec::new(); NUM_CONCURRENCY_BUCKETS];
 
         for record in records {
@@ -402,10 +393,15 @@ impl TraceLatency {
                 if !itls.is_empty() {
                     itl_by_concurrency[cb].extend(itls.iter().copied());
                     let mut gaps: Vec<f64> = match &record.itl_ctx {
-                        Some(ctx) => (0..itls.len())
-                            .filter(|&i| ctx.prefill_tokens[i] == 0)
-                            .map(|i| itls[i])
-                            .collect(),
+                        Some(ctx) => {
+                            let (stalled, clean): (Vec<usize>, Vec<usize>) =
+                                (0..itls.len()).partition(|&i| ctx.prefill_tokens[i] > 0);
+                            for &i in &stalled {
+                                let ppb = prompt_bucket(ctx.prefill_tokens[i] as usize);
+                                stalls_grid[ppb][cb].push(itls[i]);
+                            }
+                            clean.iter().map(|&i| itls[i]).collect()
+                        }
                         None => itls.clone(),
                     };
                     if !gaps.is_empty() {
@@ -429,6 +425,11 @@ impl TraceLatency {
             }
         }
 
+        for row in &mut stalls_grid {
+            for cell in row.iter_mut() {
+                cell.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        }
         for samples in &mut itl_by_concurrency {
             samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         }
@@ -458,31 +459,6 @@ impl TraceLatency {
             })
             .collect();
 
-        // Least-squares ms-per-token over (median uncached, median service)
-        // bucket anchors; degenerate fits (one bucket) fall back to 0 and the
-        // interference surcharge disappears rather than inventing a slope.
-        let anchors: Vec<(f64, f64)> = service_by_prompt
-            .iter()
-            .flatten()
-            .filter(|c| c.samples.len() >= 5)
-            .map(|c| (c.median_uncached, c.samples[c.samples.len() / 2]))
-            .collect();
-        let prefill_slope_ms_per_token = if anchors.len() >= 2 {
-            let n = anchors.len() as f64;
-            let sx: f64 = anchors.iter().map(|(x, _)| x).sum();
-            let sy: f64 = anchors.iter().map(|(_, y)| y).sum();
-            let sxx: f64 = anchors.iter().map(|(x, _)| x * x).sum();
-            let sxy: f64 = anchors.iter().map(|(x, y)| x * y).sum();
-            let denom = n * sxx - sx * sx;
-            if denom > 0.0 {
-                ((n * sxy - sx * sy) / denom).max(0.0)
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-
         // A trace where every record is a single-token output carries no decode pacing
         // information; refuse it up front rather than replaying instant inter-token times.
         if itl_by_concurrency.iter().all(|samples| samples.is_empty()) {
@@ -494,9 +470,9 @@ impl TraceLatency {
 
         Ok(TraceLatency {
             service_by_prompt,
-            prefill_slope_ms_per_token,
             itl_by_concurrency,
             donors_grid,
+            stalls_grid,
             kv_transfer_fallback,
             meta,
         })
@@ -641,15 +617,21 @@ impl LatencyModel for TraceLatency {
     ) -> Duration {
         let cb = concurrency_bucket(num_running);
 
-        // Structural chunk interference: pending prefill tokens surcharge this
-        // gap by one chunk's compute time (clean donor gap + chunk * slope).
-        let surcharge_ms = if pacing.pending_stall_tokens > 0 {
-            let chunk = pacing.pending_stall_tokens.min(pacing.chunk_budget);
-            pacing.pending_stall_tokens -= chunk;
-            f64::from(chunk) * self.prefill_slope_ms_per_token
-        } else {
-            0.0
-        };
+        // A prefill admission noted by the engine spikes exactly one gap: draw
+        // it from the recorded stall distribution nearest the admitted chunk's
+        // size bucket. Without itl_ctx data the flag falls through to the clean
+        // path, whose donor gaps still contain the stalls.
+        if let Some(prefill_tokens) = pacing.pending_stall.take() {
+            let ppb = prompt_bucket(prefill_tokens as usize);
+            if let Some(stalls) =
+                nearest_grid_cell(&self.stalls_grid, ppb, cb, |cell: &Vec<f64>| {
+                    !cell.is_empty()
+                })
+            {
+                let ms = sample_inverse_cdf(rng, stalls);
+                return Duration::from_secs_f64(ms / 1000.0);
+            }
+        }
 
         // The resolved cell is deterministic for a given (context, cb), so the
         // cached donor index below always refers to the same pool.
@@ -659,8 +641,7 @@ impl LatencyModel for TraceLatency {
             cb,
             |cell: &DonorBucket| !cell.donors.is_empty(),
         ) else {
-            let base = self.inter_token_delay(rng, num_running);
-            return base + Duration::from_secs_f64(surcharge_ms / 1000.0);
+            return self.inter_token_delay(rng, num_running);
         };
         let donor_idx = match pacing.donors[cb] {
             Some(idx) => idx as usize,
@@ -671,7 +652,7 @@ impl LatencyModel for TraceLatency {
             }
         };
         let ms = sample_inverse_cdf(rng, &bucket.donors[donor_idx].gaps);
-        Duration::from_secs_f64((ms + surcharge_ms) / 1000.0)
+        Duration::from_secs_f64(ms / 1000.0)
     }
 }
 
@@ -1004,15 +985,26 @@ mod tests {
     }
 
     #[test]
-    fn structural_chunk_interference_surcharges_gaps() {
-        // Two prompt-size groups give the service fit a slope of 0.1 ms/token
-        // (ttft 10ms @ ~100 uncached, 110ms @ ~1100). Clean decode gaps are
-        // a constant 10ms.
-        let mut records = Vec::new();
-        for _ in 0..10 {
-            records.push(make_record(100, 6, 10.0, vec![10.0; 5], 4));
-            records.push(make_record(1100, 6, 110.0, vec![10.0; 5], 4));
-        }
+    fn stall_conditioning_draws_from_interfered_gaps_once() {
+        // One source request whose trace marks gaps 3 and 7 as prefill-interfered
+        // (150ms) among clean 10ms gaps.
+        let gaps = vec![10.0, 10.0, 10.0, 150.0, 10.0, 10.0, 10.0, 150.0, 10.0];
+        let prefill = vec![0u32, 0, 0, 800, 0, 0, 0, 800, 0];
+        let records = vec![TraceRecord {
+            prompt_tokens: 100,
+            cached_tokens: 0,
+            output_tokens: 10,
+            ttft_ms: 40.0,
+            itl_ms: Some(gaps),
+            itl_summary: None,
+            concurrency: 4,
+            arrival_ms: None,
+            itl_ctx: Some(crate::trace::ItlContext {
+                num_running: vec![4; 9],
+                prefill_tokens: prefill,
+            }),
+            block_hashes: None,
+        }];
         let trace =
             TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
@@ -1022,31 +1014,27 @@ mod tests {
             trace.paced_inter_token_delay(rng, 4, pacing).as_secs_f64() * 1000.0
         };
 
-        // Clean draws are the donor gap.
-        for _ in 0..10 {
+        // Clean draws never produce stall gaps: those left the donor pool.
+        for _ in 0..30 {
             let ms = draw(&mut rng, &mut pacing);
-            assert!((ms - 10.0).abs() < 0.5, "clean draw should be ~10ms: {ms}");
+            assert!(
+                (ms - 10.0).abs() < 1e-9,
+                "clean draw should be 10ms, got {ms}"
+            );
         }
 
-        // An 800-token prefill chunked at 8192 surcharges exactly one gap by
-        // 800 * 0.1 = 80ms, then the tokens are spent.
-        pacing.note_prefill(800, 8192);
+        // A noted prefill spikes exactly the next draw, then the flag is spent.
+        pacing.note_prefill(800);
         let stalled = draw(&mut rng, &mut pacing);
-        assert!((stalled - 90.0).abs() < 2.0, "expected ~90ms: {stalled}");
+        assert!(
+            (stalled - 150.0).abs() < 1e-9,
+            "stall draw should come from interfered gaps, got {stalled}"
+        );
         let after = draw(&mut rng, &mut pacing);
-        assert!((after - 10.0).abs() < 0.5, "tokens must be spent: {after}");
-
-        // A 10k prefill chunked at 4000 inflates ceil(10000/4000)=3 gaps:
-        // +400, +400, +200.
-        pacing.note_prefill(10_000, 4_000);
-        let g1 = draw(&mut rng, &mut pacing);
-        let g2 = draw(&mut rng, &mut pacing);
-        let g3 = draw(&mut rng, &mut pacing);
-        let g4 = draw(&mut rng, &mut pacing);
-        assert!((g1 - 410.0).abs() < 5.0, "chunk 1 ~410ms: {g1}");
-        assert!((g2 - 410.0).abs() < 5.0, "chunk 2 ~410ms: {g2}");
-        assert!((g3 - 210.0).abs() < 5.0, "remainder ~210ms: {g3}");
-        assert!((g4 - 10.0).abs() < 0.5, "spent: {g4}");
+        assert!(
+            (after - 10.0).abs() < 1e-9,
+            "flag must be consumed, got {after}"
+        );
     }
 
     #[test]

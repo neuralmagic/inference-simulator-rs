@@ -925,9 +925,8 @@ impl SimEngine {
                     active.prompt_len.saturating_sub(num_local_cached) as u32
                 };
                 if prefill_tokens > 0 {
-                    let chunk_budget = self.opt.max_num_batched_tokens as u32;
                     for running in self.active_requests.values_mut() {
-                        running.pacing.note_prefill(prefill_tokens, chunk_budget);
+                        running.pacing.note_prefill(prefill_tokens);
                     }
                 }
                 self.active_requests.insert(request_id, active);

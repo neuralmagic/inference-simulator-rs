@@ -22,7 +22,7 @@ while True:
 EOF
 
 loadgen() {
-    python /scripts/loadgen.py --url http://127.0.0.1:8000 --model Qwen/Qwen3-8B "$@"
+    python /scripts/loadgen.py --url http://127.0.0.1:8000 --model "${MODEL:-Qwen/Qwen3-8B}" "$@"
 }
 
 mark() {

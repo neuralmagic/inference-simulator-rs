@@ -1147,13 +1147,19 @@ async fn measure_one(
             return (None, Vec::new());
         }
     };
-    let mut token_times: Vec<Instant> = Vec::new();
+    // TTFT needs the client clock (it spans the send), but GAPS use the
+    // engine-side batch timestamps: client-receive stamps coalesce whenever
+    // the client task lags and buffered outputs drain at once, fabricating
+    // zero-gaps the engine never produced (measured 15.6% of gaps vs <=0.2%
+    // in tap-measured real captures).
+    let mut first_token_at: Option<Instant> = None;
+    let mut token_stamps: Vec<f64> = Vec::new();
     let result = tokio::time::timeout(timeout_dur, async {
         while let Some(item) = stream.next().await {
             let output = item.context("stream item error")?;
-            let now = Instant::now();
             if !output.new_token_ids.is_empty() {
-                token_times.push(now);
+                first_token_at.get_or_insert_with(Instant::now);
+                token_stamps.push(output.timestamp);
             }
             if output.finish_reason.is_some() {
                 break;
@@ -1173,12 +1179,10 @@ async fn measure_one(
             return (None, Vec::new());
         }
     }
-    let ttft = token_times
-        .first()
-        .map(|f| (*f - call_start).as_secs_f64() * 1000.0);
-    let gaps = token_times
+    let ttft = first_token_at.map(|f| (f - call_start).as_secs_f64() * 1000.0);
+    let gaps = token_stamps
         .windows(2)
-        .map(|w| (w[1] - w[0]).as_secs_f64() * 1000.0)
+        .map(|w| (w[1] - w[0]) * 1000.0)
         .collect();
     (ttft, gaps)
 }

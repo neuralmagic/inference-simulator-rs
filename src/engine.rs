@@ -462,11 +462,14 @@ struct PrefillWindow {
     /// Where the stream's next window may start: the prefill's full service time.
     end: Instant,
     /// End of the decode-stalling span: the budget-saturated FULL chunks' share of the
-    /// service time. A token due before this slips to it (real marked gaps distribute
-    /// uniformly up to about this span, matching slip-to-end of the full chunks). The
-    /// trailing partial chunk shares its step with decodes, so it stalls nothing; a
+    /// service time. Tokens due inside slip to the next chunk boundary within it, so one
+    /// prefill stretches one gap per chunk step per decode (real captures show exactly
+    /// that: a marked chunk-1 gap plus an unmarked chunk-2 gap, ~120ms each). The time
+    /// past this span (the partial chunk and per-request overhead) stalls nothing; a
     /// single-chunk prefill stalls nothing at all.
     stall_end: Instant,
+    /// Chunk-step count, spacing the boundaries inside the stalling span.
+    chunks: u32,
     /// Whether this prefill found the engine already loaded at admission: it queued
     /// behind the stream tail, or the running batch was past the heaviest load real
     /// captures show the engine hiding chunks at (zero decode elongation up to
@@ -989,6 +992,7 @@ impl SimEngine {
                         start,
                         end,
                         stall_end,
+                        chunks: uncached.div_ceil(budget) as u32,
                         stalls_decodes: start > now || num_running > CHUNK_HIDING_MAX_RUNNING,
                     });
                 }
@@ -1213,7 +1217,11 @@ impl SimEngine {
                         break;
                     }
                     if w.stalls_decodes {
-                        next = w.stall_end;
+                        let span = w.stall_end.duration_since(w.start).as_secs_f64();
+                        let into = due.duration_since(w.start).as_secs_f64();
+                        let n = w.chunks.max(1) as f64;
+                        let boundary = (into / span * n).ceil().clamp(1.0, n);
+                        next = w.start + Duration::from_secs_f64(span * boundary / n);
                     }
                     break;
                 }

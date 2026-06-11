@@ -272,11 +272,6 @@ struct ActiveRequest {
     /// block every running decode by the same amount: prefill chunks and decode steps run
     /// in one serial engine step stream, so a prefill delays everyone, not just itself.
     prefill_service: Duration,
-    /// Per-step interference owed to prefill chunks admitted while this request decodes.
-    /// Each admitted chunk pushes one surcharge; each emitted token pops one and stretches
-    /// that gap by it, smearing the prefill's service across the chunk window the way real
-    /// chunked prefill elongates the steps it rides in (instead of one giant gap).
-    step_surcharges: VecDeque<Duration>,
     /// When the next output token is due. Set to `now + first-token delay` at admission, then
     /// advanced by the inter-token delay after each emitted token. The engine loop sleeps
     /// until the earliest deadline across all active requests, so this is the timing model.
@@ -383,7 +378,6 @@ impl ActiveRequest {
             block_ids,
             lora_name,
             prefill_service: first_delay,
-            step_surcharges: VecDeque::new(),
             next_at: Instant::now() + (first_delay + step_wait).div_f64(time_scale),
         })
     }
@@ -492,6 +486,11 @@ pub(crate) struct SimEngine {
     /// is still in flight. These count toward `running_capacity` and `scheduled_token_demand`
     /// to prevent over-admission while pulls are outstanding.
     pending_pulls: BTreeMap<String, PendingPull>,
+    /// The engine's serial prefill stream as busy windows of (scaled) wall time, in order.
+    /// Prefill chunks and decode steps share one step stream, so a decode token due inside
+    /// a window slips past it: its gap absorbs whatever chunk compute drains within it.
+    /// Windows whose end has passed are dropped at the next admission or step.
+    prefill_busy: VecDeque<(Instant, Instant)>,
     /// Sender half for pull completion results. Cloned into each `spawn_blocking` task.
     pull_completion_tx: mpsc::UnboundedSender<PullCompletion>,
     /// Receiver half; wrapped in Option so `take_internal_rx` can hand it to the loop once.
@@ -924,27 +923,35 @@ impl SimEngine {
             num_local_cached,
             block_ids.clone(),
         ) {
-            Ok(active) => {
-                // This admission runs its prefill as chunked steps in the
-                // engine's single serial step stream, so every running
-                // decode's next few gaps stretch by one chunk's service time
-                // each (the prefill's total service spread over its chunks).
-                // Remote-prefill requests (P/D decode side) burned their
-                // prefill on another node and merely join the batch; full
-                // cache hits run no chunk. Either way they block nothing.
-                let blocks_engine = !active.remote_prefill
-                    && active.prompt_len > num_local_cached
-                    && !self.active_requests.is_empty();
-                if blocks_engine {
-                    let budget = (self.opt.max_num_batched_tokens as usize).max(1);
-                    let uncached = active.prompt_len - num_local_cached;
-                    let chunks = uncached.div_ceil(budget);
-                    let per_chunk = active.prefill_service.div_f64(chunks as f64);
-                    for running in self.active_requests.values_mut() {
-                        running
-                            .step_surcharges
-                            .extend(std::iter::repeat_n(per_chunk, chunks));
-                    }
+            Ok(mut active) => {
+                // This admission's prefill chunks drain through the engine's
+                // single serial step stream: append a busy window at the
+                // stream's tail. Decodes whose tokens fall inside it slip past
+                // it (see `step`), and the prefill's own first token waits for
+                // its slot. Remote-prefill requests (P/D decode side) burned
+                // their prefill on another node and merely join the batch;
+                // full cache hits run no chunk. Either way they occupy nothing.
+                let now = Instant::now();
+                while self
+                    .prefill_busy
+                    .front()
+                    .is_some_and(|&(_, end)| end <= now)
+                {
+                    self.prefill_busy.pop_front();
+                }
+                if !active.remote_prefill && active.prompt_len > num_local_cached {
+                    let time_scale = if self.opt.time_scale > 0.0 {
+                        self.opt.time_scale
+                    } else {
+                        1.0
+                    };
+                    let start = match self.prefill_busy.back() {
+                        Some(&(_, end)) if end > now => end,
+                        _ => now,
+                    };
+                    let end = start + active.prefill_service.div_f64(time_scale);
+                    active.next_at += start.saturating_duration_since(now);
+                    self.prefill_busy.push_back((start, end));
                 }
                 self.active_requests.insert(request_id, active);
                 None
@@ -1141,16 +1148,28 @@ impl SimEngine {
                     num_running,
                     &mut request.pacing,
                 );
-                let surcharge = request
-                    .step_surcharges
-                    .pop_front()
-                    .unwrap_or(Duration::ZERO);
                 let time_scale = if self.opt.time_scale > 0.0 {
                     self.opt.time_scale
                 } else {
                     1.0
                 };
-                request.next_at = now + (gap + surcharge).div_f64(time_scale);
+                // Walk the gap through the serial prefill stream: the token
+                // needs `gap` of chunk-free engine time, so each busy window
+                // it crosses pushes it out by that window's remainder.
+                let mut remaining = gap.div_f64(time_scale);
+                let mut pos = now;
+                for &(start, end) in &self.prefill_busy {
+                    if end <= pos {
+                        continue;
+                    }
+                    let free = start.saturating_duration_since(pos);
+                    if remaining <= free {
+                        break;
+                    }
+                    remaining -= free;
+                    pos = end;
+                }
+                request.next_at = pos + remaining;
             }
 
             let (outs, finished_set) = by_client
@@ -1319,6 +1338,7 @@ impl SimEngine {
             active_requests: BTreeMap::new(),
             waiting: VecDeque::new(),
             pending_pulls: BTreeMap::new(),
+            prefill_busy: VecDeque::new(),
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
         })
@@ -1412,6 +1432,7 @@ mod tests {
             active_requests: BTreeMap::new(),
             waiting: VecDeque::new(),
             pending_pulls: BTreeMap::new(),
+            prefill_busy: VecDeque::new(),
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
             opt,

@@ -406,6 +406,18 @@ impl TraceLatency {
                     };
                     if !gaps.is_empty() {
                         gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        if record.itl_ctx.is_some() {
+                            // The tap marks only the FIRST gap of a chunked
+                            // prefill, so later chunk steps of the same prefill
+                            // leak into the clean set as huge "clean" gaps.
+                            // Admission now blocks the engine for the prefill's
+                            // service time, so donors must hold genuine decode
+                            // steps only: gaps far past the record's own median
+                            // are mislabeled chunk steps, not decode.
+                            let median = gaps[gaps.len() / 2];
+                            let cut = gaps.partition_point(|&g| g <= 4.0 * median);
+                            gaps.truncate(cut);
+                        }
                         let weight = gaps.len() as f64;
                         donors_grid[ctx_pb][cb].push(Donor { gaps }, weight);
                     }

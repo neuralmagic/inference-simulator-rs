@@ -47,9 +47,9 @@ for phase in $PHASES; do
         ;;
     multiturn)
         echo "==> multiturn 0.4 sessions/s x 5 turns, ~10k-token shared prefix (240s)"
-        loadgen --pattern multiturn --rate 0.4 --turns 5 \
+        loadgen --pattern multiturn --rate "${MT_RATE:-0.4}" --turns 5 \
             --prefix-tokens 6500 --prompt-tokens 128 --output-tokens 128 \
-            --duration 240 --seed 7 \
+            --duration 240 --seed "${MT_SEED:-7}" \
             --out /trace/multiturn-loadgen.json
         ;;
     *)

@@ -971,7 +971,16 @@ impl SimEngine {
                 churn,
             },
         ) {
-            Ok(active) => {
+            Ok(mut active) => {
+                // A prompt-matching source pins the request to a recorded stream
+                // here; clamping max_tokens makes a live client's stream end at
+                // the recorded length with the recorded finish reason.
+                if let Some(recorded_len) = self
+                    .token_source
+                    .on_request_added(&active.request_id, &active.prompt_token_ids)
+                {
+                    active.max_tokens = active.max_tokens.min(recorded_len);
+                }
                 if let ReqPhase::Prefill { remaining } = &active.phase {
                     // Budget-scale admissions mark the batch as churning for
                     // the donor conditioning (see `DecodePacing`).
@@ -2615,6 +2624,55 @@ mod tests {
             .flat_map(|o| o.new_token_ids.clone())
             .collect();
         assert_eq!(all_tokens, recorded, "stream is content-identical");
+        assert_eq!(
+            outputs.last().unwrap().finish_reason,
+            Some(EngineCoreFinishReason::Stop),
+            "stream ends with the recorded finish reason, not Length"
+        );
+    }
+
+    #[test]
+    fn prefix_match_at_engine_level_clamps_live_max_tokens_to_recorded_stream() {
+        use crate::trace::{TraceFinishReason, TraceRecord, prompt_block_hashes};
+
+        let prompt: Vec<u32> = (0..8).collect();
+        let recorded = vec![900u32, 901, 902];
+        let records = vec![TraceRecord {
+            prompt_tokens: prompt.len(),
+            output_tokens: recorded.len(),
+            ttft_ms: 1.0,
+            itl_ms: Some(vec![1.0; recorded.len() - 1]),
+            block_hashes: prompt_block_hashes(&prompt, 4),
+            output_token_ids: Some(recorded.clone()),
+            finish_reason: Some(TraceFinishReason::Stop),
+            ..Default::default()
+        }];
+
+        let (mut engine, mut rx) = test_engine(test_opt());
+        engine.token_source = Box::new(crate::tokens::PrefixMatchTokens::from_records(
+            &records, 4, 100,
+        ));
+
+        // A live client: arbitrary request id, its own (huge) max_tokens.
+        let req = EngineCoreRequest {
+            request_id: "chatcmpl-3f2a".to_string(),
+            prompt_token_ids: Some(prompt),
+            sampling_params: Some(EngineCoreSamplingParams {
+                max_tokens: 4096,
+                ..EngineCoreSamplingParams::for_test()
+            }),
+            ..Default::default()
+        };
+        add(&mut engine, &mut rx, req);
+        let outputs = drain(&mut engine, &mut rx);
+        let all_tokens: Vec<u32> = outputs
+            .iter()
+            .flat_map(|o| o.new_token_ids.clone())
+            .collect();
+        assert_eq!(
+            all_tokens, recorded,
+            "stream ends at the recorded length, no random padding"
+        );
         assert_eq!(
             outputs.last().unwrap().finish_reason,
             Some(EngineCoreFinishReason::Stop),

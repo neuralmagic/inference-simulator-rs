@@ -6,8 +6,11 @@
 //! serves the output ids recorded in a trace (tap `--record-tokens`), making replayed
 //! streams content-identical to the capture.
 
+use std::collections::HashMap;
+
 use rand::Rng as _;
 use rand::rngs::StdRng;
+use tracing::{debug, warn};
 use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
 use crate::trace::TraceRecord;
@@ -27,6 +30,15 @@ pub(crate) struct TokenCtx<'a> {
 /// still not draw from it (callers rely on a fixed draw order for determinism).
 pub(crate) trait TokenSource: Send {
     fn next_tokens(&mut self, ctx: &TokenCtx<'_>, n: usize, rng: &mut StdRng) -> Vec<u32>;
+
+    /// Called at admission, before any generation. Sources that pin a request
+    /// to a recorded stream by inspecting its prompt do the matching here and
+    /// return the recorded output length, which the engine uses to clamp
+    /// `max_tokens` so a live client's stream ends exactly where the capture
+    /// did. The default matches nothing.
+    fn on_request_added(&mut self, _request_id: &str, _prompt_token_ids: &[u32]) -> Option<usize> {
+        None
+    }
 
     /// Called when a request finishes or is aborted, so stateful sources can drop any
     /// per-request bookkeeping. The default is a no-op.
@@ -120,6 +132,146 @@ impl TokenSource for ReplayTokens {
             tokens.extend(self.fallback.next_tokens(ctx, n - tokens.len(), rng));
         }
         tokens
+    }
+
+    fn finish_reason(&self, request_id: &str) -> Option<EngineCoreFinishReason> {
+        self.record(request_id).and_then(|r| r.finish_reason)
+    }
+}
+
+/// Serves recorded outputs to *live* requests by matching each incoming
+/// prompt's block-hash chain against the trace, instead of trusting request
+/// ids. This is what lets a real client (an agent loop re-run offline) talk to
+/// the sim through a real frontend and get back the captured streams.
+///
+/// Matching: the incoming prompt is hashed with [`crate::trace::prompt_block_hashes`]
+/// (same chain the tap stored in `TraceRecord::block_hashes`). Because block
+/// hashes are chained, one hash value identifies the entire prefix up to its
+/// block, so the deepest incoming hash that any record contains IS the
+/// longest-common-prefix match. Noise at the prompt tail (a timing string in
+/// the last tool output) only shortens the match depth; it doesn't change
+/// which record wins.
+///
+/// Each record is consumed by its first match so duplicate prompts map 1:1 to
+/// duplicate records in arrival order. When every candidate at the deepest
+/// depth is already consumed (a client retry after an abort), the earliest one
+/// is re-served rather than falling back to random tokens.
+pub(crate) struct PrefixMatchTokens {
+    records: Vec<RecordedOutput>,
+    /// Every hash in every record's chain, mapped to the records containing it
+    /// (ascending = arrival order, the tie-break).
+    by_hash: HashMap<u64, Vec<usize>>,
+    /// Live request id -> matched record, assigned at admission.
+    assigned: HashMap<String, usize>,
+    consumed: Vec<bool>,
+    block_size: usize,
+    fallback: RandomTokens,
+}
+
+impl PrefixMatchTokens {
+    /// Build from records in arrival order. Records without `block_hashes` or
+    /// recorded token ids can never match and are not indexed.
+    pub(crate) fn from_records(
+        records: &[TraceRecord],
+        block_size: usize,
+        vocab_size: u32,
+    ) -> PrefixMatchTokens {
+        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, record) in records.iter().enumerate() {
+            let matchable = record
+                .output_token_ids
+                .as_ref()
+                .is_some_and(|t| !t.is_empty());
+            if !matchable {
+                continue;
+            }
+            for &hash in record.block_hashes.iter().flatten() {
+                by_hash.entry(hash).or_default().push(i);
+            }
+        }
+        PrefixMatchTokens {
+            records: records
+                .iter()
+                .map(|r| RecordedOutput {
+                    token_ids: r.output_token_ids.clone().unwrap_or_default(),
+                    finish_reason: r.finish_reason.map(EngineCoreFinishReason::from),
+                })
+                .collect(),
+            by_hash,
+            assigned: HashMap::new(),
+            consumed: vec![false; records.len()],
+            block_size,
+            fallback: RandomTokens { vocab_size },
+        }
+    }
+
+    fn record(&self, request_id: &str) -> Option<&RecordedOutput> {
+        self.assigned
+            .get(request_id)
+            .and_then(|&i| self.records.get(i))
+    }
+}
+
+impl TokenSource for PrefixMatchTokens {
+    fn on_request_added(&mut self, request_id: &str, prompt_token_ids: &[u32]) -> Option<usize> {
+        let Some(chain) = crate::trace::prompt_block_hashes(prompt_token_ids, self.block_size)
+        else {
+            warn!(
+                request_id,
+                prompt_tokens = prompt_token_ids.len(),
+                "prompt shorter than one block; cannot prefix-match, serving random tokens"
+            );
+            return None;
+        };
+        // Deepest hash first: chaining makes the first hit the longest-prefix match.
+        for (depth, hash) in chain.iter().enumerate().rev() {
+            let Some(candidates) = self.by_hash.get(hash) else {
+                continue;
+            };
+            let idx = candidates
+                .iter()
+                .copied()
+                .find(|&i| !self.consumed[i])
+                .or_else(|| candidates.first().copied())?;
+            self.consumed[idx] = true;
+            self.assigned.insert(request_id.to_string(), idx);
+            debug!(
+                request_id,
+                record = idx,
+                matched_blocks = depth + 1,
+                prompt_blocks = chain.len(),
+                "prefix-matched request to trace record"
+            );
+            return Some(self.records[idx].token_ids.len());
+        }
+        warn!(
+            request_id,
+            prompt_blocks = chain.len(),
+            "no trace record shares a prompt prefix; serving random tokens"
+        );
+        None
+    }
+
+    fn next_tokens(&mut self, ctx: &TokenCtx<'_>, n: usize, rng: &mut StdRng) -> Vec<u32> {
+        let recorded = match self.record(ctx.request_id) {
+            Some(record) => {
+                let start = ctx.num_generated.min(record.token_ids.len());
+                let end = (ctx.num_generated + n).min(record.token_ids.len());
+                &record.token_ids[start..end]
+            }
+            None => &[],
+        };
+        let mut tokens = recorded.to_vec();
+        if tokens.len() < n {
+            tokens.extend(self.fallback.next_tokens(ctx, n - tokens.len(), rng));
+        }
+        tokens
+    }
+
+    fn on_request_finished(&mut self, request_id: &str) {
+        // The record stays consumed: a later identical prompt is a genuine
+        // duplicate and should take the next record, not replay this one.
+        self.assigned.remove(request_id);
     }
 
     fn finish_reason(&self, request_id: &str) -> Option<EngineCoreFinishReason> {
@@ -285,6 +437,144 @@ mod tests {
     fn default_finish_reason_is_none() {
         let src = RandomTokens { vocab_size: 10 };
         assert_eq!(src.finish_reason("anything"), None);
+    }
+
+    /// Two multi-turn records over a shared prefix: turn 1's prompt is blocks
+    /// A|B, turn 2's prompt extends it to A|B|C|D (the agentic append-only
+    /// shape). Block size 4.
+    fn prefix_records() -> (Vec<u32>, Vec<u32>, crate::tokens::PrefixMatchTokens) {
+        use crate::trace::{TraceFinishReason, TraceRecord, prompt_block_hashes};
+        let turn1: Vec<u32> = (0..8).collect();
+        let turn2: Vec<u32> = (0..16).collect();
+        let records = vec![
+            TraceRecord {
+                prompt_tokens: turn1.len(),
+                output_tokens: 3,
+                block_hashes: prompt_block_hashes(&turn1, 4),
+                output_token_ids: Some(vec![100, 101, 102]),
+                finish_reason: Some(TraceFinishReason::Stop),
+                ..Default::default()
+            },
+            TraceRecord {
+                prompt_tokens: turn2.len(),
+                output_tokens: 2,
+                block_hashes: prompt_block_hashes(&turn2, 4),
+                output_token_ids: Some(vec![200, 201]),
+                finish_reason: Some(TraceFinishReason::Length),
+                ..Default::default()
+            },
+        ];
+        let src = crate::tokens::PrefixMatchTokens::from_records(&records, 4, 50);
+        (turn1, turn2, src)
+    }
+
+    fn drain(src: &mut dyn TokenSource, request_id: &str, prompt: &[u32], n: usize) -> Vec<u32> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let ctx = TokenCtx {
+            request_id,
+            prompt_token_ids: prompt,
+            num_generated: 0,
+        };
+        src.next_tokens(&ctx, n, &mut rng)
+    }
+
+    #[test]
+    fn prefix_match_serves_recorded_ids_and_reports_length() {
+        use vllm_engine_core_client::protocol::EngineCoreFinishReason;
+        let (turn1, _, mut src) = prefix_records();
+        assert_eq!(src.on_request_added("live-abc", &turn1), Some(3));
+        assert_eq!(drain(&mut src, "live-abc", &turn1, 3), vec![100, 101, 102]);
+        assert_eq!(
+            src.finish_reason("live-abc"),
+            Some(EngineCoreFinishReason::Stop)
+        );
+    }
+
+    #[test]
+    fn prefix_match_prefers_deepest_record() {
+        // Turn 2's prompt also contains turn 1's chain as a prefix; the
+        // deeper record must win, not the first indexed one.
+        let (_, turn2, mut src) = prefix_records();
+        assert_eq!(src.on_request_added("live-t2", &turn2), Some(2));
+        assert_eq!(drain(&mut src, "live-t2", &turn2, 2), vec![200, 201]);
+    }
+
+    #[test]
+    fn prefix_match_survives_tail_divergence() {
+        // Same first three blocks as turn 2, but the last block differs (a
+        // timing string in the final tool output). Still matches turn 2.
+        let (_, turn2, mut src) = prefix_records();
+        let mut noisy = turn2.clone();
+        for t in &mut noisy[12..] {
+            *t += 1000;
+        }
+        assert_eq!(src.on_request_added("live-noisy", &noisy), Some(2));
+        assert_eq!(drain(&mut src, "live-noisy", &noisy, 2), vec![200, 201]);
+    }
+
+    #[test]
+    fn prefix_match_consumes_records_in_arrival_order_and_reserves_when_dry() {
+        use crate::trace::{TraceFinishReason, TraceRecord, prompt_block_hashes};
+        let prompt: Vec<u32> = (0..8).collect();
+        let record = |ids: Vec<u32>| TraceRecord {
+            prompt_tokens: prompt.len(),
+            output_tokens: ids.len(),
+            block_hashes: prompt_block_hashes(&prompt, 4),
+            output_token_ids: Some(ids),
+            finish_reason: Some(TraceFinishReason::Stop),
+            ..Default::default()
+        };
+        let records = vec![record(vec![1, 2]), record(vec![3, 4])];
+        let mut src = crate::tokens::PrefixMatchTokens::from_records(&records, 4, 50);
+        // Identical prompts consume distinct records in arrival order.
+        assert_eq!(src.on_request_added("a", &prompt), Some(2));
+        assert_eq!(src.on_request_added("b", &prompt), Some(2));
+        assert_eq!(drain(&mut src, "a", &prompt, 2), vec![1, 2]);
+        assert_eq!(drain(&mut src, "b", &prompt, 2), vec![3, 4]);
+        // All consumed: a retry re-serves the earliest match instead of going random.
+        src.on_request_finished("a");
+        src.on_request_finished("b");
+        assert_eq!(src.on_request_added("retry", &prompt), Some(2));
+        assert_eq!(drain(&mut src, "retry", &prompt, 2), vec![1, 2]);
+    }
+
+    #[test]
+    fn prefix_match_unmatched_requests_fall_back_to_random() {
+        let (_, _, mut src) = prefix_records();
+        // Shares no block with the trace.
+        let alien: Vec<u32> = (5000..5016).collect();
+        assert_eq!(src.on_request_added("alien", &alien), None);
+        let tokens = drain(&mut src, "alien", &alien, 4);
+        assert_eq!(tokens.len(), 4);
+        assert!(tokens.iter().all(|&t| t < 50));
+        // Shorter than one block: no chain to match on.
+        assert_eq!(src.on_request_added("tiny", &[1, 2]), None);
+    }
+
+    #[test]
+    fn prefix_match_skips_records_without_tokens_or_hashes() {
+        use crate::trace::{TraceFinishReason, TraceRecord, prompt_block_hashes};
+        let prompt: Vec<u32> = (0..8).collect();
+        let records = vec![
+            // Hash-only capture (no --record-tokens): must never match.
+            TraceRecord {
+                prompt_tokens: prompt.len(),
+                output_tokens: 2,
+                block_hashes: prompt_block_hashes(&prompt, 4),
+                finish_reason: Some(TraceFinishReason::Stop),
+                ..Default::default()
+            },
+            // Tokens but no hashes (short prompt at capture time): unreachable.
+            TraceRecord {
+                prompt_tokens: 2,
+                output_tokens: 2,
+                output_token_ids: Some(vec![7, 8]),
+                finish_reason: Some(TraceFinishReason::Stop),
+                ..Default::default()
+            },
+        ];
+        let mut src = crate::tokens::PrefixMatchTokens::from_records(&records, 4, 50);
+        assert_eq!(src.on_request_added("x", &prompt), None);
     }
 
     #[test]

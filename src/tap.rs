@@ -34,9 +34,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use vllm_engine_core_client::EngineId;
-use vllm_engine_core_client::mock_engine::{
-    MockEngineConfig, MockEngineSockets, connect_to_frontend,
-};
+use vllm_engine_core_client::mock_engine::MockEngineSockets;
 use vllm_engine_core_client::protocol::handshake::{
     EngineCoreReadyResponse, HandshakeAddresses, HandshakeInitMessage, ReadyMessage,
 };
@@ -117,10 +115,12 @@ struct UpstreamEngine {
     input: RouterSocket,
     output: PullSocket,
     ready_message: ReadyMessage,
-    /// Post-initialization config from the engine's input-socket registration
-    /// (max_model_len, num_gpu_blocks, dtype, vllm_version). Relayed verbatim
-    /// to the downstream frontend so it validates against the real engine.
-    ready_response: EngineCoreReadyResponse,
+    /// The engine's input-socket registration payload (python
+    /// `EngineCoreReadyResponse`), kept as raw bytes and relayed verbatim to
+    /// the downstream frontend: re-encoding through the crate's struct drops
+    /// fields the python frontend requires (`block_size`), and raw relay is
+    /// immune to schema drift entirely.
+    ready_response_payload: Vec<u8>,
 }
 
 /// Run the upstream handshake: bind the handshake socket, wait for the engine's
@@ -234,6 +234,7 @@ async fn upstream_handshake(config: &TapConfig) -> Result<UpstreamEngine> {
     }
     // A decode failure here means the engine speaks an incompatible protocol
     // version; fail loudly instead of recording a trace against a broken pair.
+    // The decoded copy is observation-only; the raw bytes are what get relayed.
     let ready_response: EngineCoreReadyResponse = decode_msgpack(&reg_frames[1])
         .map_err(|e| anyhow!("decoding engine registration ready response: {e}"))?;
     debug!(?ready_response, "engine registered on tap input socket");
@@ -242,27 +243,27 @@ async fn upstream_handshake(config: &TapConfig) -> Result<UpstreamEngine> {
         input: input_socket,
         output: output_socket,
         ready_message,
-        ready_response,
+        ready_response_payload: reg_frames[1].to_vec(),
     })
 }
 
 /// Connect downstream to the real frontend as an engine, presenting the real
-/// engine's handshake payloads.
+/// engine's handshake payloads verbatim.
 async fn downstream_connect(
     frontend_handshake: &str,
     ready_message: &ReadyMessage,
-    ready_response: EngineCoreReadyResponse,
+    ready_response_payload: &[u8],
 ) -> Result<MockEngineSockets> {
-    let config = MockEngineConfig {
-        local: ready_message.local.unwrap_or(false),
-        headless: ready_message.headless.unwrap_or(true),
-        ready_response,
-        ..MockEngineConfig::default()
-    };
-
-    connect_to_frontend(frontend_handshake, EngineId::from_engine_index(0), config)
-        .await
-        .map_err(|e| anyhow!("connecting to frontend: {e}"))
+    crate::frontend_connect::connect_to_frontend_raw(
+        frontend_handshake,
+        EngineId::from_engine_index(0),
+        ready_message.local.unwrap_or(false),
+        ready_message.headless.unwrap_or(true),
+        ready_response_payload,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .map_err(|e| anyhow!("connecting to frontend: {e}"))
 }
 
 /// Run the tap proxy: forward frames between the real frontend and the real
@@ -279,14 +280,18 @@ pub async fn run_tap<W: Write>(
         input: mut upstream_input,
         output: mut upstream_output,
         ready_message,
-        ready_response,
+        ready_response_payload,
     } = upstream_handshake(&config).await?;
 
     info!("upstream engine connected, connecting downstream to frontend");
 
     // Step 2: Connect downstream to the real frontend.
-    let MockEngineSockets { data_sockets, .. } =
-        downstream_connect(&config.frontend_handshake, &ready_message, ready_response).await?;
+    let MockEngineSockets { data_sockets, .. } = downstream_connect(
+        &config.frontend_handshake,
+        &ready_message,
+        &ready_response_payload,
+    )
+    .await?;
 
     // Single client, single engine: take the first data socket pair.
     let (mut downstream_dealer, mut downstream_push) =

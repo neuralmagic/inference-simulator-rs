@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use vllm_engine_core_client::EngineId;
 use vllm_engine_core_client::mock_engine::{
-    MockEngineConfig, MockEngineSockets, connect_to_frontend, default_ready_response,
+    DEFAULT_MOCK_MAX_MODEL_LEN, MockEngineSockets, default_ready_response,
 };
 use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
@@ -26,6 +26,7 @@ pub mod calibrate;
 pub mod dataplane;
 mod engine;
 mod engine_core;
+mod frontend_connect;
 mod io;
 pub mod kvevents;
 pub mod latency;
@@ -60,6 +61,18 @@ impl FailureType {
             FailureType::Repetition => EngineCoreFinishReason::Repetition,
         }
     }
+}
+
+/// How `--replay-tokens` resolves an incoming request to its trace record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReplayMatch {
+    /// Trailing `-<index>` of the request id (the arrival-replay harness names
+    /// requests `replay-{i}`). Only works when we generate the requests.
+    Index,
+    /// Longest block-hash prefix of the incoming prompt against the records'
+    /// `block_hashes`, consume-once. Works for live clients (an agent loop
+    /// re-run offline against the sim), which name requests however they like.
+    Prefix,
 }
 
 /// Waiting-queue ordering, matching vLLM's `--scheduling-policy`.
@@ -107,6 +120,13 @@ pub struct Opt {
     /// fall back to random tokens.
     #[arg(long, default_value = "")]
     pub replay_tokens: String,
+
+    /// How `--replay-tokens` maps incoming requests to trace records: `index`
+    /// trusts the request id's trailing `-<i>` (our own replay harness),
+    /// `prefix` matches the incoming prompt's block-hash chain against the
+    /// records (live clients, e.g. an agent re-run offline against the sim).
+    #[arg(long, value_enum, default_value_t = ReplayMatch::Index)]
+    pub replay_match: ReplayMatch,
 
     /// Base seed for deterministic random token generation.
     #[arg(long, default_value_t = 0)]
@@ -357,12 +377,12 @@ impl Opt {
                 vocab_size: self.vocab_size,
             }));
         }
-        let (_, records) = trace::read_trace_file(std::path::Path::new(&self.replay_tokens))?;
+        let (meta, records) = trace::read_trace_file(std::path::Path::new(&self.replay_tokens))?;
         let subset = trace::replay_subset(records);
         if subset.is_empty() {
             bail!(
-                "--replay-tokens trace {} has no records with arrival_ms (nothing to map \
-                 request indices onto)",
+                "--replay-tokens trace {} has no records with arrival_ms (nothing to \
+                 establish the replay order)",
                 self.replay_tokens
             );
         }
@@ -373,10 +393,30 @@ impl Opt {
                 self.replay_tokens
             );
         }
-        Ok(Box::new(tokens::ReplayTokens::from_records(
-            &subset,
-            self.vocab_size,
-        )))
+        match self.replay_match {
+            ReplayMatch::Index => Ok(Box::new(tokens::ReplayTokens::from_records(
+                &subset,
+                self.vocab_size,
+            ))),
+            ReplayMatch::Prefix => {
+                if !subset
+                    .iter()
+                    .any(|r| r.block_hashes.as_ref().is_some_and(|h| !h.is_empty()))
+                {
+                    bail!(
+                        "--replay-match prefix needs block_hashes in trace {}; the tap \
+                         records them by default for prompts of at least one block",
+                        self.replay_tokens
+                    );
+                }
+                let block_size = meta.block_size.unwrap_or(self.tokens_per_block);
+                Ok(Box::new(tokens::PrefixMatchTokens::from_records(
+                    &subset,
+                    block_size,
+                    self.vocab_size,
+                )))
+            }
+        }
     }
 
     /// Whether any of the timing knobs that are mutually exclusive with `--latency-trace`
@@ -430,21 +470,31 @@ impl Opt {
 async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) -> Result<()> {
     // Advertise the sim's actual configured limits in the registration ready
     // response so the frontend validates against what this engine enforces.
-    let mut ready_response = default_ready_response();
-    ready_response.num_gpu_blocks = opt.kv_cache_size;
-    if opt.max_model_len > 0 {
-        ready_response.max_model_len = opt.max_model_len;
+    // This is sim-owned (not the crate's EngineCoreReadyResponse) because the
+    // python frontend requires `block_size`, which the crate's struct lacks.
+    let defaults = default_ready_response();
+    let ready_payload = frontend_connect::SimReadyResponse {
+        max_model_len: if opt.max_model_len > 0 {
+            opt.max_model_len
+        } else {
+            DEFAULT_MOCK_MAX_MODEL_LEN
+        },
+        num_gpu_blocks: opt.kv_cache_size,
+        block_size: opt.tokens_per_block as u64,
+        dp_stats_address: None,
+        dtype: defaults.dtype,
+        vllm_version: defaults.vllm_version,
     }
-    let config = MockEngineConfig {
-        ready_response,
-        ..MockEngineConfig::default()
-    };
+    .encode()?;
 
     // A shutdown signal during the handshake means there is nothing to drain; just leave.
-    let connect = connect_to_frontend(
+    let connect = frontend_connect::connect_to_frontend_raw(
         &opt.handshake_address,
         EngineId::from_engine_index(engine_index),
-        config,
+        false,
+        true,
+        &ready_payload,
+        std::time::Duration::from_secs(5),
     );
     let MockEngineSockets { data_sockets, .. } = tokio::select! {
         biased;

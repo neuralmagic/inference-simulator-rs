@@ -87,21 +87,35 @@ impl Default for DecodePacing {
     }
 }
 
+/// One decode step's draw for a request: how long the step takes and how many
+/// tokens its output chunk delivers. Autoregressive steps deliver one token;
+/// traces captured under speculative decoding or diffusion blocks deliver the
+/// recorded chunk sizes, jointly with the gaps they were observed against.
+#[derive(Debug, Clone, Copy)]
+pub struct StepDraw {
+    pub delay: Duration,
+    pub tokens: u32,
+}
+
 /// Strategy for pacing token emission (TTFT and inter-token delays).
 pub trait LatencyModel: Send {
     fn first_token_delay(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration;
     fn inter_token_delay(&self, rng: &mut StdRng, num_running: u64) -> Duration;
 
-    /// Inter-token delay with per-request pacing state. Stateless models fall
-    /// back to the marginal distribution; hierarchical models use `pacing` to
-    /// keep a request's gaps internally correlated.
-    fn paced_inter_token_delay(
+    /// Decode-step draw with per-request pacing state. Stateless models fall
+    /// back to the marginal distribution and one token per step; hierarchical
+    /// models use `pacing` to keep a request's gaps internally correlated and
+    /// return each gap's recorded chunk size alongside it.
+    fn paced_step(
         &self,
         rng: &mut StdRng,
         num_running: u64,
         _pacing: &mut DecodePacing,
-    ) -> Duration {
-        self.inter_token_delay(rng, num_running)
+    ) -> StepDraw {
+        StepDraw {
+            delay: self.inter_token_delay(rng, num_running),
+            tokens: 1,
+        }
     }
 
     /// Step-time cost of `chunk_tokens` prefill tokens starting at `kv_depth`
@@ -364,12 +378,16 @@ pub fn concurrency_label(bucket: usize) -> String {
     }
 }
 
-/// One source request's gap distribution, used as a pacing donor.
+/// One source request's per-step distribution, used as a pacing donor.
 #[derive(Debug, Clone)]
 struct Donor {
-    /// The request's own ITL gaps, sorted for inverse-CDF sampling. Summary-only
-    /// records collapse to a single repeated mean.
-    gaps: Vec<f64>,
+    /// The request's own decode steps as (gap_ms, chunk tokens) pairs, sorted
+    /// by gap for inverse-CDF sampling. Chunk tokens are 1 for autoregressive
+    /// captures; spec-decode and diffusion captures carry the burst sizes,
+    /// kept joint with their gaps (a longer verify pass and a bigger
+    /// acceptance burst come from the same step). Summary-only records
+    /// collapse to a single repeated mean with one token.
+    steps: Vec<(f64, u32)>,
 }
 
 /// Donor pool with token-count weighting, so the marginal per-token
@@ -811,7 +829,18 @@ impl TraceLatency {
             if let Some(itls) = &record.itl_ms {
                 if !itls.is_empty() {
                     itl_by_concurrency[cb].extend(itls.iter().copied());
-                    let mut gaps: Vec<f64> = match &record.itl_ctx {
+                    // Tokens delivered by the chunk closing each gap (1 unless
+                    // the capture saw multi-token steps), kept joint with the
+                    // gap through sorting and sampling.
+                    let chunk_tokens = |i: usize| {
+                        record
+                            .itl_tokens
+                            .as_ref()
+                            .and_then(|t| t.get(i))
+                            .copied()
+                            .unwrap_or(1)
+                    };
+                    let mut steps: Vec<(f64, u32)> = match &record.itl_ctx {
                         Some(ctx) => {
                             let (stalled, clean): (Vec<usize>, Vec<usize>) =
                                 (0..itls.len()).partition(|&i| ctx.prefill_tokens[i] > 0);
@@ -819,12 +848,18 @@ impl TraceLatency {
                                 let ppb = prompt_bucket(ctx.prefill_tokens[i] as usize);
                                 stalls_grid[ppb][cb].push(itls[i]);
                             }
-                            clean.iter().map(|&i| itls[i]).collect()
+                            clean.iter().map(|&i| (itls[i], chunk_tokens(i))).collect()
                         }
-                        None => itls.clone(),
+                        None => itls
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &gap)| (gap, chunk_tokens(i)))
+                            .collect(),
                     };
-                    if !gaps.is_empty() {
-                        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    if !steps.is_empty() {
+                        steps.sort_by(|a, b| {
+                            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                        });
                         if record.itl_ctx.is_some() {
                             // The tap marks only the FIRST gap of a chunked
                             // prefill, so later chunk steps of the same prefill
@@ -833,12 +868,14 @@ impl TraceLatency {
                             // service time, so donors must hold genuine decode
                             // steps only: gaps far past the record's own median
                             // are mislabeled chunk steps, not decode.
-                            let median = gaps[gaps.len() / 2];
-                            let cut = gaps.partition_point(|&g| g <= 4.0 * median);
-                            gaps.truncate(cut);
+                            let median = steps[steps.len() / 2].0;
+                            let cut = steps.partition_point(|&(gap, _)| gap <= 4.0 * median);
+                            steps.truncate(cut);
                         }
-                        let weight = gaps.len() as f64;
-                        donors_grid[ctx_pb][cb].push(Donor { gaps }, weight);
+                        let weight: f64 = steps.iter().map(|&(_, t)| f64::from(t)).sum();
+                        if weight > 0.0 {
+                            donors_grid[ctx_pb][cb].push(Donor { steps }, weight);
+                        }
                     }
                 }
             } else if let Some(summary) = &record.itl_summary
@@ -849,7 +886,7 @@ impl TraceLatency {
                 }
                 donors_grid[ctx_pb][cb].push(
                     Donor {
-                        gaps: vec![summary.mean_ms],
+                        steps: vec![(summary.mean_ms, 1)],
                     },
                     summary.count as f64,
                 );
@@ -942,6 +979,25 @@ pub(crate) fn sample_inverse_cdf(rng: &mut StdRng, samples: &[f64]) -> f64 {
     let hi = (lo + 1).min(samples.len() - 1);
     let frac = pos - lo as f64;
     samples[lo] * (1.0 - frac) + samples[hi] * frac
+}
+
+/// Inverse-CDF draw over (gap_ms, tokens) step samples sorted by gap: the gap
+/// interpolates between neighbors like `sample_inverse_cdf`, the token count
+/// comes from the nearer sample (chunk sizes are discrete; interpolating them
+/// would invent sizes the capture never produced).
+fn sample_step_inverse_cdf(rng: &mut StdRng, steps: &[(f64, u32)]) -> (f64, u32) {
+    debug_assert!(!steps.is_empty());
+    if steps.len() == 1 {
+        return steps[0];
+    }
+    let u: f64 = rng.random::<f64>();
+    let pos = u * (steps.len() - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = (lo + 1).min(steps.len() - 1);
+    let frac = pos - lo as f64;
+    let gap = steps[lo].0 * (1.0 - frac) + steps[hi].0 * frac;
+    let tokens = if frac < 0.5 { steps[lo].1 } else { steps[hi].1 };
+    (gap, tokens)
 }
 
 /// Find the nearest cell with data by Manhattan distance on (prompt bucket,
@@ -1058,21 +1114,24 @@ impl LatencyModel for TraceLatency {
     /// Hierarchical sampling conditioned on (context bucket, concurrency
     /// bucket): pin the request to one source request ("donor") per
     /// concurrency bucket, picked token-count-weighted on first use, then draw
-    /// gaps from that donor's own distribution. Within-request correlation
-    /// matches the source (a slow request stays slow), so per-request decode
-    /// totals reproduce instead of concentrating around the grand mean.
-    fn paced_inter_token_delay(
+    /// (gap, chunk tokens) steps from that donor's own distribution. Within-
+    /// request correlation matches the source (a slow request stays slow), so
+    /// per-request decode totals reproduce instead of concentrating around the
+    /// grand mean.
+    fn paced_step(
         &self,
         rng: &mut StdRng,
         num_running: u64,
         pacing: &mut DecodePacing,
-    ) -> Duration {
+    ) -> StepDraw {
         let cb = concurrency_bucket(num_running);
 
         // A prefill admission noted by the engine spikes exactly one gap: draw
         // it from the recorded stall distribution nearest the admitted chunk's
         // size bucket. Without itl_ctx data the flag falls through to the clean
-        // path, whose donor gaps still contain the stalls.
+        // path, whose donor gaps still contain the stalls. Stall samples drop
+        // their chunk sizes at build time (only the gap is interference data),
+        // so a stall step delivers one token.
         if let Some(prefill_tokens) = pacing.pending_stall.take() {
             let ppb = prompt_bucket(prefill_tokens as usize);
             if let Some(stalls) =
@@ -1081,7 +1140,10 @@ impl LatencyModel for TraceLatency {
                 })
             {
                 let ms = sample_inverse_cdf(rng, stalls);
-                return Duration::from_secs_f64(ms / 1000.0);
+                return StepDraw {
+                    delay: Duration::from_secs_f64(ms / 1000.0),
+                    tokens: 1,
+                };
             }
         }
 
@@ -1096,7 +1158,10 @@ impl LatencyModel for TraceLatency {
                 !cell.donors.is_empty()
             })
         else {
-            return self.inter_token_delay(rng, num_running);
+            return StepDraw {
+                delay: self.inter_token_delay(rng, num_running),
+                tokens: 1,
+            };
         };
         let donor_idx = match pacing.donors[cb] {
             Some(idx) => idx as usize,
@@ -1106,8 +1171,11 @@ impl LatencyModel for TraceLatency {
                 idx
             }
         };
-        let ms = sample_inverse_cdf(rng, &bucket.donors[donor_idx].gaps);
-        Duration::from_secs_f64(ms / 1000.0)
+        let (ms, tokens) = sample_step_inverse_cdf(rng, &bucket.donors[donor_idx].steps);
+        StepDraw {
+            delay: Duration::from_secs_f64(ms / 1000.0),
+            tokens,
+        }
     }
 
     fn budget_full_chunk_floor(&self) -> Duration {
@@ -1433,6 +1501,67 @@ mod tests {
         }
     }
 
+    /// A record whose gaps came from multi-token steps (spec decode /
+    /// diffusion blocks): per-chunk gaps with their chunk sizes.
+    fn make_spec_record(prompt: usize, gaps: Vec<f64>, chunk_tokens: Vec<u32>) -> TraceRecord {
+        let output = 1 + chunk_tokens.iter().map(|&t| t as usize).sum::<usize>();
+        TraceRecord {
+            itl_tokens: Some(chunk_tokens),
+            ..make_record(prompt, output, 40.0, gaps, 1)
+        }
+    }
+
+    #[test]
+    fn paced_step_replays_recorded_chunk_sizes_jointly_with_gaps() {
+        // Two donors at disjoint (gap, chunk) levels: a fast 5ms/2-token
+        // request and a slow 50ms/8-token one. Draws must stay joint: a
+        // request pinned to the fast donor sees 2-token chunks at 5ms, never
+        // 8-token chunks at 5ms.
+        let records = vec![
+            make_spec_record(100, vec![5.0; 9], vec![2; 9]),
+            make_spec_record(100, vec![50.0; 9], vec![8; 9]),
+        ];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+
+        let mut seen_fast = false;
+        let mut seen_slow = false;
+        for _ in 0..50 {
+            let mut pacing = DecodePacing::default();
+            for _ in 0..20 {
+                let draw = trace.paced_step(&mut rng, 1, &mut pacing);
+                let ms = draw.delay.as_secs_f64() * 1000.0;
+                let fast = (ms - 5.0).abs() < 1e-9 && draw.tokens == 2;
+                let slow = (ms - 50.0).abs() < 1e-9 && draw.tokens == 8;
+                assert!(
+                    fast || slow,
+                    "draw must reproduce a recorded (gap, chunk) pair, got ({ms}ms, {} tokens)",
+                    draw.tokens
+                );
+                seen_fast |= fast;
+                seen_slow |= slow;
+            }
+        }
+        assert!(
+            seen_fast && seen_slow,
+            "across requests both donors must be picked"
+        );
+    }
+
+    #[test]
+    fn autoregressive_traces_always_draw_single_token_steps() {
+        let records = vec![make_record(100, 10, 40.0, vec![10.0; 9], 1)];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let mut pacing = DecodePacing::default();
+        for _ in 0..30 {
+            let draw = trace.paced_step(&mut rng, 1, &mut pacing);
+            assert_eq!(draw.tokens, 1);
+        }
+    }
+
     #[test]
     fn trace_empty_records_is_error() {
         let result = TraceLatency::from_records(TraceMeta::default(), &[], zero_knob(), 8192);
@@ -1591,7 +1720,7 @@ mod tests {
         let mut pacing = DecodePacing::default();
 
         let draw = |rng: &mut rand::rngs::StdRng, pacing: &mut DecodePacing| -> f64 {
-            trace.paced_inter_token_delay(rng, 4, pacing).as_secs_f64() * 1000.0
+            trace.paced_step(rng, 4, pacing).delay.as_secs_f64() * 1000.0
         };
 
         // Clean draws never produce stall gaps: those left the donor pool.
@@ -1637,7 +1766,8 @@ mod tests {
             let draws: Vec<f64> = (0..20)
                 .map(|_| {
                     trace
-                        .paced_inter_token_delay(&mut rng, 4, &mut pacing)
+                        .paced_step(&mut rng, 4, &mut pacing)
+                        .delay
                         .as_secs_f64()
                         * 1000.0
                 })

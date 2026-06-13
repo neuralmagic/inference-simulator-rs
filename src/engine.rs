@@ -481,8 +481,11 @@ type PullCompletion = (String, Result<u64>);
 /// decode elongation all fall out of this one composer.
 struct EngineStep {
     end: Instant,
-    /// Requests generating one output chunk in this step.
-    decoders: Vec<String>,
+    /// Requests generating one output chunk in this step, with the token
+    /// count drawn for the chunk: 1 for autoregressive pacing, the recorded
+    /// burst size when the latency model replays multi-token steps (spec
+    /// decode, diffusion blocks).
+    decoders: Vec<(String, u32)>,
     /// Per-prefill chunk assignments (request id, chunk tokens) for this step.
     chunks: Vec<(String, usize)>,
 }
@@ -1123,22 +1126,54 @@ impl SimEngine {
     }
 
     /// Compose the next engine step, anchored at the previous step's end.
-    /// Decodes claim one budget token each, then prefills chunk to
-    /// `min(remaining, budget left)` in admission order (vLLM's schedule).
-    /// One decode-base draw paces the whole batch: real batches step
-    /// together, and the pacer is the largest-context decoder, whose donor
-    /// gaps were captured in exactly such batches.
+    /// Decodes claim their drawn step tokens in the budget (one each for
+    /// autoregressive pacing; the recorded chunk size when a trace replays
+    /// multi-token steps), then prefills chunk to `min(remaining, budget
+    /// left)` in admission order (vLLM's schedule). One decode-base draw
+    /// paces the whole batch: real batches step together, and the pacer is
+    /// the largest-context decoder, whose donor gaps were captured in exactly
+    /// such batches. Non-pacer draws keep only their token counts.
     fn compose_step(&mut self, anchor: Instant) {
-        let decoders: Vec<String> = self
+        let decoder_ids: Vec<String> = self
             .active_requests
             .values()
             .filter(|r| matches!(r.phase, ReqPhase::Decode) && r.is_generating())
             .map(|r| r.request_id.clone())
             .collect();
 
+        let mut decoders: Vec<(String, u32)> = Vec::with_capacity(decoder_ids.len());
+        let mut decode_base = Duration::ZERO;
+        if !decoder_ids.is_empty() {
+            let num_running = (self.active_requests.len() + self.pending_pulls.len()) as u64;
+            let mut pacer: Option<usize> = None;
+            let mut deepest = 0;
+            for (i, rid) in decoder_ids.iter().enumerate() {
+                if let Some(request) = self.active_requests.get(rid) {
+                    let bucket = request.pacing.context_bucket();
+                    if pacer.is_none() || bucket > deepest {
+                        pacer = Some(i);
+                        deepest = bucket;
+                    }
+                }
+            }
+            for (i, rid) in decoder_ids.into_iter().enumerate() {
+                let Some(request) = self.active_requests.get_mut(&rid) else {
+                    continue;
+                };
+                let draw =
+                    self.latency
+                        .paced_step(&mut request.rng, num_running, &mut request.pacing);
+                if pacer == Some(i) {
+                    decode_base = draw.delay;
+                }
+                decoders.push((rid, draw.tokens));
+            }
+        }
+
         let budget = (self.opt.max_num_batched_tokens as usize).max(1);
         let threshold = self.opt.long_prefill_token_threshold as usize;
-        let mut left = budget.saturating_sub(decoders.len());
+        let decode_claim: usize = decoders.iter().map(|&(_, t)| t.max(1) as usize).sum();
+        let mut left = budget.saturating_sub(decode_claim);
         let mut chunks = Vec::new();
         self.prefill_order.retain(|rid| {
             self.active_requests
@@ -1176,30 +1211,6 @@ impl SimEngine {
             chunk_cost = chunk_cost.max(self.latency.budget_full_chunk_floor());
         }
 
-        let mut decode_base = Duration::ZERO;
-        if !decoders.is_empty() {
-            let num_running = (self.active_requests.len() + self.pending_pulls.len()) as u64;
-            let mut pacer: Option<&String> = None;
-            let mut deepest = 0;
-            for rid in &decoders {
-                if let Some(request) = self.active_requests.get(rid) {
-                    let bucket = request.pacing.context_bucket();
-                    if pacer.is_none() || bucket > deepest {
-                        pacer = Some(rid);
-                        deepest = bucket;
-                    }
-                }
-            }
-            if let Some(rid) = pacer
-                && let Some(request) = self.active_requests.get_mut(rid)
-            {
-                decode_base = self.latency.paced_inter_token_delay(
-                    &mut request.rng,
-                    num_running,
-                    &mut request.pacing,
-                );
-            }
-        }
         // The chunk hides under the batch's decode compute until it
         // dominates; small chunks elongate nothing.
         let duration = decode_base.max(chunk_cost);
@@ -1252,14 +1263,22 @@ impl SimEngine {
             Box::new(RandomTokens { vocab_size: 0 }),
         );
 
-        for rid in &decoders {
+        for (rid, drawn) in &decoders {
             let Some(request) = self.active_requests.get_mut(rid) else {
                 continue;
+            };
+            // A multi-token draw (trace replay of spec decode or diffusion
+            // blocks) IS the chunk; otherwise the configured chunk size
+            // batches single-token steps into one output as before.
+            let chunk_tokens = if *drawn > 1 {
+                *drawn as usize
+            } else {
+                chunk_size
             };
             request.generate(
                 token_source.as_mut(),
                 end,
-                chunk_size,
+                chunk_tokens,
                 time_scale,
                 self.emit_seq,
             );
@@ -2289,6 +2308,111 @@ mod tests {
             (Duration::from_millis(78)..=Duration::from_millis(86)).contains(&gap),
             "mixed step should run ~81.9ms, got {gap:?}"
         );
+    }
+
+    /// TraceLatency over a spec-decode-shaped capture: every decode step took
+    /// 10ms and delivered a 4-token chunk.
+    fn spec_trace_latency(opt: &Opt) -> crate::latency::TraceLatency {
+        let records: Vec<crate::trace::TraceRecord> = (0..4)
+            .map(|_| crate::trace::TraceRecord {
+                prompt_tokens: 4,
+                output_tokens: 49,
+                ttft_ms: 1.0,
+                itl_ms: Some(vec![10.0; 12]),
+                itl_tokens: Some(vec![4; 12]),
+                concurrency: 1,
+                ..Default::default()
+            })
+            .collect();
+        crate::latency::TraceLatency::from_records(
+            crate::trace::TraceMeta::default(),
+            &records,
+            opt.latency_model(),
+            opt.max_num_batched_tokens as usize,
+        )
+        .expect("spec trace builds a latency model")
+    }
+
+    /// Sleep-step the engine until idle, collecting non-empty output chunk
+    /// sizes. Bounded so a stalled engine fails instead of hanging.
+    fn drain_paced(
+        engine: &mut SimEngine,
+        chunks: &mut Vec<usize>,
+        until: impl Fn(&SimEngine) -> bool,
+    ) {
+        for _ in 0..200 {
+            if until(engine) {
+                return;
+            }
+            if let Some(deadline) = engine.earliest_deadline() {
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+            }
+            for output in engine.step() {
+                for o in output.outputs.outputs {
+                    if !o.new_token_ids.is_empty() {
+                        chunks.push(o.new_token_ids.len());
+                    }
+                }
+            }
+        }
+        panic!("engine did not reach the target state in 200 paced steps");
+    }
+
+    #[test]
+    fn spec_trace_replay_emits_recorded_chunk_sizes() {
+        let opt = test_opt();
+        let latency = spec_trace_latency(&opt);
+        let (mut engine, mut rx) = test_engine(opt);
+        engine.latency = Box::new(latency);
+
+        let start = Instant::now();
+        add(&mut engine, &mut rx, request("r1", 4, 9));
+        let mut chunks = Vec::new();
+        drain_paced(&mut engine, &mut chunks, |e| e.active_requests.is_empty());
+
+        // First token from the prefill step, then the recorded 4-token bursts
+        // (the last capped by max_tokens).
+        assert_eq!(chunks, vec![1, 4, 4]);
+        // Two decode steps at the recorded 10ms pace gate the wall clock; the
+        // old one-token-per-step engine would have taken 8 steps.
+        assert!(
+            start.elapsed() >= Duration::from_millis(15),
+            "decode must pace at the recorded per-chunk gaps"
+        );
+    }
+
+    #[test]
+    fn spec_decoders_claim_their_chunk_tokens_in_the_budget() {
+        let mut opt = test_opt();
+        opt.max_num_batched_tokens = 100;
+        let latency = spec_trace_latency(&opt);
+        let (mut engine, mut rx) = test_engine(opt);
+        engine.latency = Box::new(latency);
+
+        // r1 prefills (4 tokens), then decodes 4-token steps.
+        add(&mut engine, &mut rx, request("r1", 4, 100));
+        let mut chunks = Vec::new();
+        drain_paced(&mut engine, &mut chunks, |e| {
+            e.active_requests
+                .get("r1")
+                .is_some_and(|r| matches!(r.phase, ReqPhase::Decode))
+                && e.current_step.is_some()
+        });
+        let step = engine.current_step.as_ref().expect("decode step composed");
+        assert_eq!(step.decoders, vec![("r1".to_string(), 4)]);
+
+        // A 200-token prefill chunks to the budget minus the decoder's
+        // 4-token claim (the old engine charged decoders 1 token flat).
+        add(&mut engine, &mut rx, request("r2", 200, 1));
+        let deadline = engine.earliest_deadline().expect("step in flight");
+        std::thread::sleep(
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+        );
+        engine.step();
+        let step = engine.current_step.as_ref().expect("mixed step composed");
+        assert_eq!(step.chunks, vec![("r2".to_string(), 96)]);
     }
 
     /// Build a request bound to a LoRA adapter (as the frontend would after the model name

@@ -21,6 +21,7 @@ use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use vllm_engine_core_client::protocol::EngineCoreFinishReason;
+use vllm_engine_core_client::protocol::stats::SchedulerStats;
 
 /// Metadata header optionally present as the first line of a trace file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -120,6 +121,15 @@ pub struct TraceRecord {
     pub ttft_ms: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub itl_ms: Option<Vec<f64>>,
+    /// Tokens delivered by the chunk that closed each gap, parallel to
+    /// `itl_ms`. Absent means one token per gap (every gap is a plain
+    /// autoregressive step). Speculative decoding and diffusion-block engines
+    /// emit several tokens per step as one chunk; each such chunk contributes
+    /// ONE `itl_ms` gap (the full step time) and its token count here, so the
+    /// burst structure survives capture. The first chunk has no gap; its size
+    /// is `output_tokens - sum(itl_tokens)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub itl_tokens: Option<Vec<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub itl_summary: Option<ItlSummary>,
     #[serde(default = "default_concurrency")]
@@ -167,6 +177,7 @@ impl Default for TraceRecord {
             output_tokens: 0,
             ttft_ms: 0.0,
             itl_ms: None,
+            itl_tokens: None,
             itl_summary: None,
             concurrency: default_concurrency(),
             arrival_ms: None,
@@ -368,6 +379,23 @@ fn validate_record(record: &TraceRecord, line_num: usize) -> Result<()> {
             );
         }
     }
+    if let Some(ref tokens) = record.itl_tokens {
+        let gaps = record.itl_ms.as_ref().map(Vec::len).unwrap_or(0);
+        if tokens.len() != gaps {
+            bail!(
+                "line {line_num}: itl_tokens (len={}) must parallel itl_ms (len={gaps})",
+                tokens.len(),
+            );
+        }
+        let chunk_total: u64 = tokens.iter().map(|&t| u64::from(t)).sum();
+        if tokens.contains(&0) || chunk_total >= record.output_tokens as u64 {
+            bail!(
+                "line {line_num}: itl_tokens must be positive and sum below output_tokens={} \
+                 (the first chunk owns the remainder), got sum={chunk_total}",
+                record.output_tokens,
+            );
+        }
+    }
     if let Some(ref ids) = record.output_token_ids
         && ids.len() != record.output_tokens
     {
@@ -420,6 +448,52 @@ pub fn append_record(writer: &mut impl Write, record: &TraceRecord) -> Result<()
     serde_json::to_writer(&mut *writer, record)?;
     writeln!(writer)?;
     Ok(())
+}
+
+/// One scheduler-stats snapshot observed during capture, written to the
+/// step-stats sidecar stream (one JSONL line per engine output message that
+/// carried stats). These are step-level and batch-level: nothing here can be
+/// attributed to a single request, which is why they live next to the trace
+/// instead of inside `TraceRecord`. Under speculative decoding or diffusion
+/// blocks, `scheduler.spec_decoding_stats` carries the per-step draft and
+/// acceptance counts (including per-position acceptance), the raw material
+/// for fitting an acceptance model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepStatsRecord {
+    /// Milliseconds since capture start (same zero point as
+    /// `TraceRecord::arrival_ms`).
+    pub ts_ms: f64,
+    /// The engine's scheduler stats, verbatim from the wire.
+    pub scheduler: SchedulerStats,
+}
+
+/// Append one step-stats snapshot to the sidecar stream.
+pub fn append_step_stats(writer: &mut impl Write, record: &StepStatsRecord) -> Result<()> {
+    serde_json::to_writer(&mut *writer, record)?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+/// Read a step-stats sidecar stream (plain or gzipped JSONL), skipping blank
+/// lines.
+pub fn read_step_stats_file(path: &Path) -> Result<Vec<StepStatsRecord>> {
+    read_step_stats(open_trace_reader(path)?)
+}
+
+/// Read step-stats records from any JSONL reader, skipping blank lines.
+pub fn read_step_stats(reader: impl BufRead) -> Result<Vec<StepStatsRecord>> {
+    let mut records = Vec::new();
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("reading step-stats line {}", i + 1))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let record: StepStatsRecord = serde_json::from_str(trimmed)
+            .with_context(|| format!("step-stats line {}: invalid record", i + 1))?;
+        records.push(record);
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
@@ -560,6 +634,67 @@ mod tests {
         let bad = br#"{"prompt_tokens":10,"output_tokens":3,"ttft_ms":10.0,"itl_ms":[5.0,6.0],"itl_ctx":{"num_running":[4],"prefill_tokens":[0,800]},"concurrency":4}"#;
         let err = read_trace(io::BufReader::new(bad.as_slice())).unwrap_err();
         assert!(format!("{err:#}").contains("itl_ctx"));
+    }
+
+    #[test]
+    fn itl_tokens_round_trips_and_validates() {
+        // 1 (first chunk) + 4 + 1 = 6 output tokens over two gaps.
+        let input = br#"{"prompt_tokens":10,"output_tokens":6,"ttft_ms":10.0,"itl_ms":[5.0,6.0],"itl_tokens":[4,1],"concurrency":1}"#;
+        let (_, records) = read_trace(io::BufReader::new(input.as_slice())).unwrap();
+        assert_eq!(records[0].itl_tokens, Some(vec![4, 1]));
+
+        // Absent itl_tokens parses as None (all chunks carried one token).
+        let plain = br#"{"prompt_tokens":10,"output_tokens":3,"ttft_ms":10.0,"itl_ms":[5.0,6.0],"concurrency":1}"#;
+        let (_, records) = read_trace(io::BufReader::new(plain.as_slice())).unwrap();
+        assert_eq!(records[0].itl_tokens, None);
+
+        // Length must parallel itl_ms.
+        let bad_len = br#"{"prompt_tokens":10,"output_tokens":6,"ttft_ms":10.0,"itl_ms":[5.0,6.0],"itl_tokens":[4],"concurrency":1}"#;
+        let err = read_trace(io::BufReader::new(bad_len.as_slice())).unwrap_err();
+        assert!(format!("{err:#}").contains("itl_tokens"));
+
+        // Chunk totals must leave at least one token for the first chunk.
+        let bad_sum = br#"{"prompt_tokens":10,"output_tokens":5,"ttft_ms":10.0,"itl_ms":[5.0,6.0],"itl_tokens":[4,1],"concurrency":1}"#;
+        let err = read_trace(io::BufReader::new(bad_sum.as_slice())).unwrap_err();
+        assert!(format!("{err:#}").contains("itl_tokens"));
+
+        // Zero-token chunks cannot exist.
+        let bad_zero = br#"{"prompt_tokens":10,"output_tokens":6,"ttft_ms":10.0,"itl_ms":[5.0,6.0],"itl_tokens":[4,0],"concurrency":1}"#;
+        let err = read_trace(io::BufReader::new(bad_zero.as_slice())).unwrap_err();
+        assert!(format!("{err:#}").contains("itl_tokens"));
+    }
+
+    #[test]
+    fn step_stats_round_trip() {
+        use vllm_engine_core_client::protocol::stats::SpecDecodingStats;
+
+        let record = StepStatsRecord {
+            ts_ms: 123.5,
+            scheduler: SchedulerStats {
+                num_running_reqs: 3,
+                num_waiting_reqs: 1,
+                kv_cache_usage: 0.25,
+                spec_decoding_stats: Some(SpecDecodingStats {
+                    num_spec_tokens: 3,
+                    num_drafts: 3,
+                    num_draft_tokens: 9,
+                    num_accepted_tokens: 5,
+                    num_accepted_tokens_per_pos: vec![3, 1, 1],
+                }),
+                ..Default::default()
+            },
+        };
+        let mut buf = Vec::new();
+        append_step_stats(&mut buf, &record).unwrap();
+        append_step_stats(&mut buf, &record).unwrap();
+
+        let records = read_step_stats(io::BufReader::new(buf.as_slice())).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].ts_ms, 123.5);
+        assert_eq!(records[0].scheduler.num_running_reqs, 3);
+        let spec = records[0].scheduler.spec_decoding_stats.as_ref().unwrap();
+        assert_eq!(spec.num_accepted_tokens, 5);
+        assert_eq!(spec.num_accepted_tokens_per_pos, vec![3, 1, 1]);
     }
 
     #[test]

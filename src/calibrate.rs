@@ -778,7 +778,8 @@ fn request_total_report(
                         pacing.note_prefill(ctx.prefill_tokens[i]);
                     }
                     model
-                        .paced_inter_token_delay(&mut rng, r.concurrency, &mut pacing)
+                        .paced_step(&mut rng, r.concurrency, &mut pacing)
+                        .delay
                         .as_secs_f64()
                         * 1000.0
                 })

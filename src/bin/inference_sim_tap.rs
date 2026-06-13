@@ -28,7 +28,8 @@
 //! - Single engine, single client (client_index 0).
 //! - `parallel_config_hash` is not relayed downstream (only relevant for DP > 1).
 //! - No coordinator pass-through.
-//! - Multi-token output chunks: ITL is divided evenly across the tokens in the chunk.
+//! - Multi-token output chunks (spec decode, diffusion blocks): one ITL gap
+//!   per chunk, with token counts in the record's `itl_tokens`.
 //! - Aborted requests are silently discarded (no trace record emitted).
 
 use std::path::Path;
@@ -104,6 +105,14 @@ struct TapOpt {
         num_args = 0..=1
     )]
     record_tokens: TokenRecording,
+
+    /// Path to also write per-step scheduler-stats snapshots (JSONL, one line
+    /// per engine output message that carried stats; gzip when the path ends
+    /// in `.gz`). Includes spec-decoding draft/acceptance counts when the
+    /// engine runs with speculative decoding. Requires the engine's stats
+    /// logging to be enabled, otherwise the file stays empty.
+    #[arg(long)]
+    step_stats_out: Option<String>,
 }
 
 fn init_tracing() {
@@ -170,15 +179,23 @@ async fn run_main(opt: TapOpt) -> Result<()> {
         engine_handshake: opt.engine_handshake,
         input_address: opt.input_address,
         output_address: opt.output_address,
-        model: opt.model,
         block_size: opt.block_size,
         record_tokens: opt.record_tokens,
     };
 
+    let mut step_writer = opt
+        .step_stats_out
+        .as_deref()
+        .map(|path| TraceWriter::create(Path::new(path)))
+        .transpose()?;
+
     let shutdown = shutdown_signal();
-    // Finalize the trace even when the proxy dies on a transport error: a
+    // Finalize the writers even when the proxy dies on a transport error: a
     // gzip stream without its trailer reads as truncated.
-    let result = run_tap(config, &mut writer, shutdown).await;
+    let result = run_tap(config, &mut writer, step_writer.as_mut(), shutdown).await;
     writer.finish()?;
+    if let Some(step_writer) = step_writer {
+        step_writer.finish()?;
+    }
     result
 }

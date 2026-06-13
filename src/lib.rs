@@ -29,6 +29,7 @@ mod engine_core;
 mod io;
 pub mod kvevents;
 pub mod lora;
+mod replay_steps;
 mod sched;
 mod tokens;
 
@@ -124,10 +125,22 @@ pub struct Opt {
     #[arg(long, default_value = "")]
     pub replay_tokens: String,
 
-    /// How `--replay-tokens` maps incoming requests to trace records: `index`
-    /// trusts the request id's trailing `-<i>` (our own replay harness),
-    /// `prefix` matches the incoming prompt's block-hash chain against the
-    /// records (live clients, e.g. an agent re-run offline against the sim).
+    /// JSONL trace whose recorded per-chunk decode timing (`itl_ms` gaps and
+    /// `itl_tokens` burst sizes) is replayed VERBATIM, the timing/framing
+    /// analogue of `--replay-tokens`. This is the *replay* timing axis;
+    /// `--latency-trace` is the *modeled* one (gaps and bursts sampled from a
+    /// fitted model). Each matched request emits its recorded chunk sizes
+    /// (speculative-decoding bursts, diffusion blocks) at its recorded gaps and
+    /// stops at the recorded length; unmatched requests stay on the configured
+    /// latency model. Requests resolve to records via `--replay-match`.
+    #[arg(long, default_value = "")]
+    pub replay_steps: String,
+
+    /// How `--replay-tokens` and `--replay-steps` map incoming requests to
+    /// trace records: `index` trusts the request id's trailing `-<i>` (our own
+    /// replay harness), `prefix` matches the incoming prompt's block-hash chain
+    /// against the records (live clients, e.g. an agent re-run offline against
+    /// the sim).
     #[arg(long, value_enum, default_value_t = ReplayMatch::Index)]
     pub replay_match: ReplayMatch,
 
@@ -164,12 +177,15 @@ pub struct Opt {
     // === Latency model (all milliseconds; 0 = instant, the default) ===
     // Ported from llm-d-inference-sim. The real frontend measures TTFT/ITL from when we
     // emit tokens, so these knobs drive both response timing and the vllm:* latency metrics.
-    /// Path to a JSONL trace file for replay-based latency. Mutually exclusive with the
+    /// Path to a JSONL trace file for MODELED latency. Mutually exclusive with the
     /// timing knobs below (time_to_first_token, inter_token_latency, prefill_*). When set,
-    /// first-token and inter-token delays are sampled from recorded observations rather
-    /// than synthesized from knob parameters. KV-transfer timing for do_remote_prefill
-    /// requests still uses the kv_cache_transfer_* knobs (the trace does not cover P/D
-    /// transfer latencies).
+    /// first-token and inter-token delays are SAMPLED from a model fitted to the recorded
+    /// observations (conditioned on concurrency, context depth, prompt size) rather than
+    /// synthesized from knob parameters or played back verbatim, so a model fit on one
+    /// workload transfers to another. For bit-exact per-request timing/framing replay
+    /// instead, use `--replay-steps`. KV-transfer timing for do_remote_prefill requests
+    /// still uses the kv_cache_transfer_* knobs (the trace does not cover P/D transfer
+    /// latencies).
     #[arg(long, default_value = "")]
     pub latency_trace: String,
 
@@ -418,6 +434,53 @@ impl Opt {
                     block_size,
                     self.vocab_size,
                 )))
+            }
+        }
+    }
+
+    /// Build the verbatim decode-schedule source from `--replay-steps`, or
+    /// `None` when the flag is unset (decode then follows the configured latency
+    /// model). Returns an error if the trace is unreadable or carries no
+    /// per-chunk timing to replay.
+    pub(crate) fn build_step_source(&self) -> Result<Option<Box<dyn replay_steps::StepSource>>> {
+        if self.replay_steps.is_empty() {
+            return Ok(None);
+        }
+        let (meta, records) = trace::read_trace_file(std::path::Path::new(&self.replay_steps))?;
+        let subset = trace::replay_subset(records);
+        if subset.is_empty() {
+            bail!(
+                "--replay-steps trace {} has no records with arrival_ms (nothing to \
+                 establish the replay order)",
+                self.replay_steps
+            );
+        }
+        if !subset.iter().any(|r| r.itl_ms.is_some()) {
+            bail!(
+                "--replay-steps trace {} has no itl_ms; there is no per-chunk timing to \
+                 replay",
+                self.replay_steps
+            );
+        }
+        match self.replay_match {
+            ReplayMatch::Index => Ok(Some(Box::new(replay_steps::IndexSteps::from_records(
+                subset,
+            )))),
+            ReplayMatch::Prefix => {
+                if !subset
+                    .iter()
+                    .any(|r| r.block_hashes.as_ref().is_some_and(|h| !h.is_empty()))
+                {
+                    bail!(
+                        "--replay-match prefix needs block_hashes in trace {}; the tap \
+                         records them by default for prompts of at least one block",
+                        self.replay_steps
+                    );
+                }
+                let block_size = meta.block_size.unwrap_or(self.tokens_per_block);
+                Ok(Some(Box::new(replay_steps::PrefixSteps::from_records(
+                    subset, block_size,
+                ))))
             }
         }
     }

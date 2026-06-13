@@ -320,6 +320,165 @@ def cache_effect_figure(traces: list[tuple[str, Path]], out: Path) -> None:
     print(f"wrote {out}")
 
 
+def load_chunk_tokens(path: Path) -> np.ndarray:
+    """Pool per-decode-chunk token counts from a trace JSONL. `itl_tokens` is
+    parallel to `itl_ms` (the chunk that closed each gap); records that omit it
+    decoded one token per gap, so they contribute that many 1s. The first
+    (prefill) chunk has no gap and is excluded, so captured and replayed traces
+    compare apples to apples."""
+    sizes: list[int] = []
+    with open(path) as f:
+        for line in f:
+            r = json.loads(line)
+            if "meta" in r:
+                continue
+            toks = r.get("itl_tokens")
+            if toks:
+                sizes.extend(int(t) for t in toks)
+            elif r.get("itl_ms"):
+                sizes.extend([1] * len(r["itl_ms"]))
+    return np.array(sizes)
+
+
+def load_accept_per_pos(path: Path) -> np.ndarray:
+    """Sum `num_accepted_tokens_per_pos` across a step-stats sidecar JSONL,
+    giving total accepted draft tokens per draft position (position 0 = the
+    first speculated token). Length is the configured speculative budget K."""
+    total: np.ndarray | None = None
+    with open(path) as f:
+        for line in f:
+            rec = json.loads(line)
+            spec = (rec.get("scheduler") or {}).get("spec_decoding_stats")
+            if not spec:
+                continue
+            per_pos = spec.get("num_accepted_tokens_per_pos") or []
+            if not per_pos:
+                continue
+            arr = np.array(per_pos, dtype=float)
+            if total is None:
+                total = np.zeros(len(arr))
+            if len(arr) > len(total):
+                grown = np.zeros(len(arr))
+                grown[: len(total)] = total
+                total = grown
+            total[: len(arr)] += arr
+    return total if total is not None else np.array([])
+
+
+def median_gap_by_chunk_size(path: Path, k_max: int) -> np.ndarray:
+    """Median per-chunk gap grouped by how many tokens that chunk delivered.
+    Speculative decoding verifies all K drafts in one target forward pass, so
+    the step time barely moves with the accepted count - this is the joint
+    `(gap, tokens)` structure the replay must reproduce, the part a flattened
+    gap/N replay destroys. NaN for sizes the trace never produced."""
+    buckets: dict[int, list[float]] = {}
+    with open(path) as f:
+        for line in f:
+            r = json.loads(line)
+            if "meta" in r:
+                continue
+            gaps = r.get("itl_ms")
+            toks = r.get("itl_tokens")
+            if not gaps:
+                continue
+            if not toks:
+                toks = [1] * len(gaps)
+            for g, t in zip(gaps, toks):
+                buckets.setdefault(int(t), []).append(g)
+    return np.array(
+        [float(np.median(buckets[k])) if buckets.get(k) else np.nan for k in range(1, k_max + 1)]
+    )
+
+
+def chunk_pmf(sizes: np.ndarray, k_max: int) -> tuple[np.ndarray, np.ndarray]:
+    """Probability mass over chunk sizes 1..k_max."""
+    xs = np.arange(1, k_max + 1)
+    counts = np.array([(sizes == k).sum() for k in xs], dtype=float)
+    total = counts.sum()
+    return xs, (counts / total if total else counts)
+
+
+def spec_fidelity_figure(
+    traces: dict[str, Path], steps: dict[str, Path], out: Path
+) -> None:
+    """Prove multi-token-step (speculative decoding / diffusion) replay: the
+    modeled stream reproduces the capture's per-chunk burst sizes (Deltas) and
+    per-chunk pacing, and the scheduler-stats integration round-trips the
+    per-position acceptance. A flattened replay would collapse panel A to all
+    1s and pace panel B ~Kx too fast."""
+    cap_sizes = load_chunk_tokens(traces["real"])
+    rep_sizes = load_chunk_tokens(traces["replay"])
+
+    have_c = bool(steps)
+    ncols = 3 if have_c else 2
+    fig, axes = plt.subplots(1, ncols, figsize=(6.5 * ncols, 5))
+
+    # Panel A: per-chunk token-count distribution (the burst structure).
+    ax_a = axes[0]
+    k_max = int(max(cap_sizes.max(initial=1), rep_sizes.max(initial=1)))
+    xs, cap_pmf = chunk_pmf(cap_sizes, k_max)
+    _, rep_pmf = chunk_pmf(rep_sizes, k_max)
+    w = 0.4
+    ax_a.bar(xs - w / 2, cap_pmf, w, label="captured (real engine)", color=C_CAP)
+    ax_a.bar(xs + w / 2, rep_pmf, w, label="replayed (verbatim)", color=C_MOD)
+    ax_a.set_xticks(xs)
+    ax_a.set_xlabel("tokens delivered per decode step")
+    ax_a.set_ylabel("fraction of decode steps")
+    title(ax_a, "Multi-token output (Deltas) per step")
+    ax_a.legend()
+    style_axes(ax_a)
+
+    # Panel B: median step time vs tokens delivered. The spec-decode signature
+    # is a flat line (one forward pass verifies all K drafts), and the replay
+    # reproduces it; the dashed curve is what a gap/N-flattened replay would do.
+    ax_b = axes[1]
+    cap_gap = median_gap_by_chunk_size(traces["real"], k_max)
+    rep_gap = median_gap_by_chunk_size(traces["replay"], k_max)
+    ax_b.bar(xs - w / 2, np.nan_to_num(cap_gap), w, label="captured (real engine)", color=C_CAP)
+    ax_b.bar(xs + w / 2, np.nan_to_num(rep_gap), w, label="replayed (verbatim)", color=C_MOD)
+    step = float(cap_gap[~np.isnan(cap_gap)][0]) if np.any(~np.isnan(cap_gap)) else 1.0
+    ax_b.plot(
+        xs, step / xs, "o--", color=C_MUT, lw=1.5, ms=5,
+        label="gap/N (flattened replay)",
+    )
+    ax_b.set_xticks(xs)
+    ax_b.set_ylim(0, max(np.nanmax(cap_gap), step) * 1.45)
+    ax_b.set_xlabel("tokens delivered per decode step")
+    ax_b.set_ylabel("median step time (ms)")
+    title(ax_b, "Step time is flat in burst size")
+    ax_b.legend(loc="upper center", ncol=2)
+    style_axes(ax_b)
+
+    # Panel C: per-position acceptance from the SchedulerStats sidecar (the
+    # scheduler-stats integration, end to end).
+    if have_c:
+        ax_c = axes[2]
+        cap_pos = load_accept_per_pos(steps["real"])
+        pos = np.arange(1, len(cap_pos) + 1)
+        if "replay" in steps:
+            rep_pos = load_accept_per_pos(steps["replay"])
+            n = max(len(cap_pos), len(rep_pos))
+            pos = np.arange(1, n + 1)
+            cap_y = np.zeros(n)
+            cap_y[: len(cap_pos)] = cap_pos
+            rep_y = np.zeros(n)
+            rep_y[: len(rep_pos)] = rep_pos
+            ax_c.bar(pos - w / 2, cap_y, w, label="captured (real engine)", color=C_CAP)
+            ax_c.bar(pos + w / 2, rep_y, w, label="replayed (sim-emitted)", color=C_MOD)
+        else:
+            ax_c.bar(pos, cap_pos, 0.6, label="captured (real engine)", color=C_CAP)
+        ax_c.set_xticks(pos)
+        ax_c.set_xlabel("draft position")
+        ax_c.set_ylabel("accepted draft tokens")
+        title(ax_c, "Speculation acceptance (SchedulerStats)")
+        ax_c.legend()
+        style_axes(ax_c)
+
+    fig.tight_layout()
+    fig.savefig(out)
+    print(f"wrote {out}")
+
+
 def parse_labeled_trace(spec: str) -> tuple[str, Path]:
     label, _, path = spec.partition("=")
     if not path:
@@ -359,6 +518,28 @@ def main() -> None:
         default="multiturn-cache-effect.png",
         help="output filename for the --cache-effect figure",
     )
+    p.add_argument(
+        "--spec-fidelity",
+        type=parse_labeled_trace,
+        action="append",
+        metavar="LABEL=PATH",
+        help="repeatable; multi-token-step (spec-decode/diffusion) replay proof "
+        "from real=tap-trace.jsonl and replay=dump.jsonl (both need itl_tokens "
+        "for the burst panel)",
+    )
+    p.add_argument(
+        "--spec-steps",
+        type=parse_labeled_trace,
+        action="append",
+        metavar="LABEL=PATH",
+        help="repeatable; SchedulerStats sidecars for the acceptance panel, "
+        "real=step-stats.jsonl and optional replay=step-stats.jsonl",
+    )
+    p.add_argument(
+        "--spec-fidelity-out",
+        default="spec-decode-fidelity.png",
+        help="output filename for the --spec-fidelity figure",
+    )
     p.add_argument("--out-dir", type=Path, default=Path("."))
     args = p.parse_args()
 
@@ -374,8 +555,22 @@ def main() -> None:
         if not {"real", "replay"} <= labels:
             p.error("--cache-effect needs at least real=... and replay=...")
         cache_effect_figure(args.cache_effect, args.out_dir / args.cache_effect_out)
-    if not (args.samples and args.trace) and not args.compare and not args.cache_effect:
-        p.error("nothing to do: pass --samples/--trace, --compare, and/or --cache-effect")
+    if args.spec_fidelity:
+        traces = dict(args.spec_fidelity)
+        if not {"real", "replay"} <= set(traces):
+            p.error("--spec-fidelity needs at least real=... and replay=...")
+        steps = dict(args.spec_steps or [])
+        spec_fidelity_figure(traces, steps, args.out_dir / args.spec_fidelity_out)
+    if (
+        not (args.samples and args.trace)
+        and not args.compare
+        and not args.cache_effect
+        and not args.spec_fidelity
+    ):
+        p.error(
+            "nothing to do: pass --samples/--trace, --compare, --cache-effect, "
+            "and/or --spec-fidelity"
+        )
 
 
 if __name__ == "__main__":

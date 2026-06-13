@@ -40,6 +40,9 @@ seed-averaged `nocachelo{2,3,4}`.
 | `h200-multiturn-cached.jsonl` | warm multiturn (agentic prefix-cache scenario) |
 | `h200-coldfloor.jsonl` | cold-floor probe |
 | `h200-tokens-tap.jsonl` | first `--record-tokens` capture (2026-06-11, guidellm, trivia prompts): CARRIES MODEL CONTENT; drives `tests/real_trace_replay.rs` |
+| `h200-qwen3-spec-ngram-tap.jsonl` | spec-decode capture (2026-06-13, ngram K=4): multi-token `itl_tokens` bursts; CARRIES MODEL CONTENT (`--record-tokens`); source of `docs/images/spec-decode-fidelity.png` |
+| `h200-qwen3-spec-ngram-step-stats.jsonl` | step-stats sidecar for the above: per-step `SchedulerStats` incl. `spec_decoding_stats` (per-position acceptance) |
+| `h200-qwen3-spec-ngram-replay.jsonl` | `calibrate-e2e --replay-arrivals --dump-trace` of the spec capture; the modeled curve in the fidelity figure |
 
 ## h200-qwen3-30ba3b/ (Qwen3-30B-A3B MoE cross-model check)
 

@@ -61,6 +61,13 @@ spec:
             - --gpu-memory-utilization=0.90
             - --max-model-len=16384
             - --enforce-eager
+            # ngram speculative decoding: zero extra weights, ungated, works
+            # under eager. Acceptance varies 1..K per step, so the engine emits
+            # genuine multi-token output chunks and per-step spec_decoding_stats
+            # (captured by the tap's --step-stats-out sidecar below). The point
+            # is exercising the multi-token-step + scheduler-stats path, not
+            # acceptance fidelity.
+            - '--speculative-config={"method":"ngram","num_speculative_tokens":4,"prompt_lookup_max":4,"prompt_lookup_min":2}'
           # No HF_TOKEN on purpose: Qwen3-8B is ungated and anonymous pulls run at
           # full CDN speed from this cluster, while the namespace's hf-token-secret
           # holds an expired token that turns every hub request into a 401.
@@ -88,7 +95,7 @@ spec:
             - { mountPath: /models, name: model-cache }
         # --- Recording tap ---------------------------------------------------------------
         - name: tap
-          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v5
+          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v8
           command: ["/usr/local/bin/inference-sim-tap"]
           # Handshake/data addresses use the binary's defaults (frontend
           # :5570, engine :5580, data :29560/:29561), matching the frontend
@@ -101,6 +108,11 @@ spec:
             # Content capture: records output_token_ids per request. The trace
             # then carries user/model content - handle accordingly.
             - --record-tokens
+            # Per-step SchedulerStats sidecar: with spec decode on, every
+            # token-step's spec_decoding_stats (per-position acceptance) lands
+            # here, the ground truth the sim's emitted spec stats are gated
+            # against.
+            - --step-stats-out=/trace/step-stats.jsonl
           env:
             - { name: RUST_LOG, value: info }
           resources:
@@ -110,7 +122,7 @@ spec:
             - { mountPath: /trace, name: trace }
         # --- Rust frontend: OpenAI server, no local engine --------------------------------
         - name: frontend
-          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v5
+          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v8
           command: ["/usr/local/bin/vllm-rs", "serve"]
           args:
             - Qwen/Qwen3-8B

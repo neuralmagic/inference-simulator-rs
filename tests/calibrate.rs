@@ -280,6 +280,90 @@ async fn replay_arrivals_constant_trace() {
     result.expect("replay_arrivals_constant_trace timed out (120s)");
 }
 
+// Test (c2): the dump path round-trips multi-token burst structure.
+//
+// A spec-decode-shaped trace (4-token bursts) replayed open-loop must come back
+// out of `outcome.measured` with `itl_tokens` populated. Before the measure-path
+// fix, `measure_one` discarded chunk sizes and every dumped record looked
+// autoregressive (one token per message), which silently flattened spec-decode
+// and diffusion replays in `calibrate-e2e --dump-trace`.
+
+#[tokio::test]
+async fn replay_dump_round_trips_burst_structure() {
+    use inference_simulator_rs::trace::{TraceMeta, TraceRecord};
+
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let n = 12usize;
+        // 1 prefill token + 7 four-token bursts = 29 output tokens.
+        let records: Vec<TraceRecord> = (0..n)
+            .map(|i| TraceRecord {
+                prompt_tokens: 128,
+                cached_tokens: 0,
+                output_tokens: 29,
+                ttft_ms: 80.0,
+                itl_ms: Some(vec![20.0; 7]),
+                itl_tokens: Some(vec![4; 7]),
+                itl_summary: None,
+                concurrency: 1,
+                arrival_ms: Some(i as f64 * 300.0),
+                itl_ctx: None,
+                ..Default::default()
+            })
+            .collect();
+        let path =
+            std::env::temp_dir().join(format!("inf-sim-replay-burst-{}.jsonl", std::process::id()));
+        calibrate::write_demo_trace(&path, &TraceMeta::default(), &records).expect("writing trace");
+
+        let cfg = calibrate::ReplayArrivalsConfig {
+            trace_path: &path,
+            latency_trace: None,
+            max_requests: None,
+            tolerance: 0.25,
+            driver: calibrate::SimDriver::TraceReplay,
+            ipc_tag: "test-burst".to_string(),
+            extra_sim_args: Vec::new(),
+            pacing: calibrate::SessionPacing::OpenLoop,
+            prompts: calibrate::PromptReplay::SharedPrefixes,
+            time_scale: 1.0,
+        };
+        let outcome = calibrate::replay_arrivals(&cfg)
+            .await
+            .expect("replay should run");
+        assert_eq!(
+            outcome.requests_completed, n,
+            "all requests should complete"
+        );
+
+        // Every dumped record must carry the burst structure: itl_tokens
+        // present, with multi-token chunks, summing (plus the first chunk) to
+        // the true output total. A flattened dump would leave itl_tokens None.
+        for rec in &outcome.measured {
+            let itl_tokens = rec
+                .itl_tokens
+                .as_ref()
+                .expect("dumped record must preserve per-chunk token counts");
+            assert!(
+                itl_tokens.iter().any(|&t| t > 1),
+                "replayed bursts must survive the dump, got {itl_tokens:?}"
+            );
+            let chunk_sum: usize = itl_tokens.iter().map(|&t| t as usize).sum();
+            assert!(
+                rec.output_tokens > chunk_sum,
+                "output_tokens ({}) must exceed the post-first-chunk sum ({chunk_sum})",
+                rec.output_tokens
+            );
+            assert_eq!(
+                rec.itl_ms.as_ref().map(Vec::len),
+                Some(itl_tokens.len()),
+                "itl_tokens must stay parallel to itl_ms"
+            );
+        }
+    })
+    .await;
+
+    result.expect("replay_dump_round_trips_burst_structure timed out (120s)");
+}
+
 // Test (d): replay refuses traces without an arrival schedule, before
 // spinning anything up.
 

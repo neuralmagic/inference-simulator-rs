@@ -20,7 +20,7 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::stats::{
-    BaseCacheStats, PrefillStats, PrefixCacheStats, SchedulerStats,
+    BaseCacheStats, PrefillStats, PrefixCacheStats, SchedulerStats, SpecDecodingStats,
 };
 use vllm_engine_core_client::protocol::utility::{
     EngineCoreUtilityRequest, UtilityCallId, UtilityOutput, UtilityResultEnvelope,
@@ -35,6 +35,7 @@ use crate::kvevents::KvEventTx;
 use crate::kvparams::{extract_kv_params, kv_flag};
 use crate::latency::{Churn, DecodePacing, FirstTokenCtx, LatencyModel};
 use crate::lora::LoraRegistry;
+use crate::replay_steps::{ScriptedDecode, StepSource};
 use crate::sched::{self, Scheduler};
 use crate::tokens::{RandomTokens, TokenCtx, TokenSource};
 use crate::{Opt, SchedulingPolicy};
@@ -262,6 +263,11 @@ struct ActiveRequest {
     emit_offset: Duration,
     /// Generated output chunks awaiting their emission deadlines, in step order.
     pending_emits: VecDeque<PendingEmit>,
+    /// Verbatim decode schedule from `--replay-steps`: when present, each decode
+    /// step pops its recorded `(gap, tokens)` instead of drawing from the
+    /// latency model, so burst sizes (and gaps, at concurrency 1) replay
+    /// bit-for-bit. `None` leaves the request on the modeled latency path.
+    scripted_decode: Option<ScriptedDecode>,
 }
 
 /// Admission-scoped facts about a request entering the batch, gathered by the
@@ -375,6 +381,7 @@ impl ActiveRequest {
             emitted: 0,
             emit_offset,
             pending_emits: VecDeque::new(),
+            scripted_decode: None,
         })
     }
 
@@ -476,6 +483,13 @@ pub(crate) struct SimEngine {
     opt: Opt,
     latency: Box<dyn LatencyModel>,
     token_source: Box<dyn TokenSource>,
+    /// Verbatim decode-schedule source (`--replay-steps`), or `None` for the
+    /// modeled latency path. Matched per request at admission.
+    step_source: Option<Box<dyn StepSource>>,
+    /// Configured speculative budget K for `spec_decoding_stats`, taken from
+    /// whichever timing source paces multi-token steps (the `--latency-trace`
+    /// model or the `--replay-steps` schedule). `None` for autoregressive.
+    spec_tokens: Option<u32>,
     scheduler: Box<dyn Scheduler>,
     /// Wrapped in `Arc<Mutex>` so `spawn_blocking` pull tasks can call `pull_prefilled` off
     /// the engine loop. The mutex is effectively uncontended: `advertise_prefilled` and
@@ -519,6 +533,11 @@ pub(crate) struct SimEngine {
     pull_completion_tx: mpsc::UnboundedSender<PullCompletion>,
     /// Receiver half; wrapped in Option so `take_internal_rx` can hand it to the loop once.
     pull_completion_rx: Option<mpsc::UnboundedReceiver<PullCompletion>>,
+    /// Speculative-decoding accounting for the step(s) completed in the current
+    /// `step()` call, folded from the decoders' burst sizes. `None` unless the
+    /// latency model paces multi-token steps; reset at the top of each `step()`
+    /// and reported verbatim in `scheduler_stats`.
+    pending_spec: Option<SpecDecodingStats>,
 }
 
 impl SimEngine {
@@ -965,6 +984,17 @@ impl SimEngine {
                 {
                     active.max_tokens = active.max_tokens.min(recorded_len);
                 }
+                // Verbatim decode replay: pin the request to its recorded
+                // schedule and clamp max_tokens so the stream ends where the
+                // capture did.
+                if let Some(schedule) = self
+                    .step_source
+                    .as_mut()
+                    .and_then(|s| s.take_schedule(&active.request_id, &active.prompt_token_ids))
+                {
+                    active.max_tokens = active.max_tokens.min(schedule.output_tokens());
+                    active.scripted_decode = Some(schedule);
+                }
                 if let ReqPhase::Prefill { remaining } = &active.phase {
                     // Budget-scale admissions mark the batch as churning for
                     // the donor conditioning (see `DecodePacing`).
@@ -1141,9 +1171,19 @@ impl SimEngine {
                 let Some(request) = self.active_requests.get_mut(&rid) else {
                     continue;
                 };
-                let draw =
-                    self.latency
-                        .paced_step(&mut request.rng, num_running, &mut request.pacing);
+                // A `--replay-steps` request pops its recorded (gap, tokens)
+                // verbatim; otherwise the latency model draws it.
+                let draw = match request
+                    .scripted_decode
+                    .as_mut()
+                    .and_then(|s| s.steps.pop_front())
+                {
+                    Some(step) => step,
+                    None => {
+                        self.latency
+                            .paced_step(&mut request.rng, num_running, &mut request.pacing)
+                    }
+                };
                 if pacer == Some(i) {
                     decode_base = draw.delay;
                 }
@@ -1266,6 +1306,8 @@ impl SimEngine {
             self.emit_seq += 1;
         }
 
+        self.fold_spec_stats(&decoders);
+
         for (rid, take) in &chunks {
             let Some(request) = self.active_requests.get_mut(rid) else {
                 continue;
@@ -1289,10 +1331,17 @@ impl SimEngine {
                 },
             );
             request.phase = ReqPhase::Decode;
+            // A `--replay-steps` request emits its recorded first-chunk size
+            // (1 for autoregressive/spec decode, a full block for diffusion);
+            // otherwise the configured output framing applies.
+            let first_chunk = request
+                .scripted_decode
+                .as_ref()
+                .map_or(chunk_size, |s| s.first_chunk_tokens as usize);
             request.generate(
                 token_source.as_mut(),
                 end,
-                chunk_size,
+                first_chunk,
                 time_scale,
                 self.emit_seq,
             );
@@ -1313,6 +1362,9 @@ impl SimEngine {
     fn step(&mut self) -> Vec<EngineOutput> {
         let now = Instant::now();
         let mut admit_outputs = Vec::new();
+
+        // Speculative accounting accrues over the step(s) this call completes.
+        self.pending_spec = None;
 
         // Complete due steps; each completion composes the next one anchored
         // at its end, so a lagging loop catches up within one call.
@@ -1468,6 +1520,36 @@ impl SimEngine {
         result
     }
 
+    /// Fold one completed step's decode draws into the running speculative
+    /// accounting. Each decode draw is one draft attempt against a K-token
+    /// budget; a burst of N delivered tokens is 1 target token plus (N-1)
+    /// accepted drafts, credited to draft positions 0..N-1. No-op unless the
+    /// latency model paces multi-token steps (autoregressive replay reports no
+    /// spec stats, matching a real engine with speculative decoding off).
+    fn fold_spec_stats(&mut self, decoders: &[(String, u32)]) {
+        let Some(k) = self.spec_tokens else {
+            return;
+        };
+        if decoders.is_empty() {
+            return;
+        }
+        let k = k as usize;
+        let acc = self.pending_spec.get_or_insert_with(|| SpecDecodingStats {
+            num_spec_tokens: k as u64,
+            num_accepted_tokens_per_pos: vec![0; k],
+            ..Default::default()
+        });
+        for &(_, drawn) in decoders {
+            let accepted = (drawn.saturating_sub(1) as usize).min(k);
+            acc.num_drafts += 1;
+            acc.num_draft_tokens += k as u64;
+            acc.num_accepted_tokens += accepted as u64;
+            for slot in acc.num_accepted_tokens_per_pos.iter_mut().take(accepted) {
+                *slot += 1;
+            }
+        }
+    }
+
     /// Snapshot of scheduler state for the frontend's `vllm:*` gauges: the running batch size,
     /// the waiting-queue depth, KV-cache utilization, and the prefix-cache hit counters.
     ///
@@ -1492,6 +1574,7 @@ impl SimEngine {
                 },
                 ..Default::default()
             },
+            spec_decoding_stats: self.pending_spec.clone(),
             ..Default::default()
         }
     }
@@ -1532,6 +1615,13 @@ impl SimEngine {
         };
         let latency: Box<dyn LatencyModel> = opt.build_latency()?;
         let token_source: Box<dyn TokenSource> = opt.build_token_source()?;
+        let step_source: Option<Box<dyn StepSource>> = opt.build_step_source()?;
+        // Verbatim replay carries its own burst budget; otherwise the modeled
+        // latency model reports K. Either source emits spec_decoding_stats.
+        let spec_tokens = step_source
+            .as_ref()
+            .and_then(|s| s.spec_tokens())
+            .or_else(|| latency.spec_tokens());
         let scheduler: Box<dyn Scheduler> = match opt.scheduling_policy {
             SchedulingPolicy::Fcfs => Box::new(sched::Fcfs),
             SchedulingPolicy::Priority => Box::new(sched::Priority),
@@ -1549,6 +1639,8 @@ impl SimEngine {
             opt,
             latency,
             token_source,
+            step_source,
+            spec_tokens,
             scheduler,
             data_plane: Arc::new(StdMutex::new(make_data_plane(role, cfg))),
             pool,
@@ -1566,6 +1658,7 @@ impl SimEngine {
             recent_big_admissions: VecDeque::new(),
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
+            pending_spec: None,
         })
     }
 }
@@ -1678,6 +1771,8 @@ mod tests {
             engine_index: 0,
             latency,
             token_source,
+            step_source: None,
+            spec_tokens: None,
             scheduler,
             data_plane: Arc::new(StdMutex::new(make_data_plane(PdRole::Both, cfg))),
             pool,
@@ -1693,6 +1788,7 @@ mod tests {
             recent_big_admissions: VecDeque::new(),
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
+            pending_spec: None,
             opt,
         };
         let rx = engine.pull_completion_rx.take().unwrap();
@@ -2362,6 +2458,110 @@ mod tests {
             start.elapsed() >= Duration::from_millis(15),
             "decode must pace at the recorded per-chunk gaps"
         );
+    }
+
+    #[test]
+    fn replay_steps_emits_recorded_chunk_sizes_verbatim() {
+        use crate::replay_steps::{IndexSteps, StepSource};
+        use crate::trace::TraceRecord;
+
+        // Record 0: first chunk 1, then verbatim bursts 2 and 3 (output 6).
+        let rec = TraceRecord {
+            prompt_tokens: 4,
+            output_tokens: 6,
+            ttft_ms: 1.0,
+            itl_ms: Some(vec![5.0, 6.0]),
+            itl_tokens: Some(vec![2, 3]),
+            ..Default::default()
+        };
+        let step_source = IndexSteps::from_records(vec![rec]);
+        assert_eq!(step_source.spec_tokens(), Some(2)); // max chunk 3 - 1
+
+        let opt = test_opt();
+        let (mut engine, mut rx) = test_engine(opt);
+        engine.step_source = Some(Box::new(step_source));
+        engine.spec_tokens = Some(2);
+
+        // Index match keys off the request id's trailing -0.
+        add(&mut engine, &mut rx, request("replay-0", 4, 6));
+        let mut chunks = Vec::new();
+        drain_paced(&mut engine, &mut chunks, |e| e.active_requests.is_empty());
+
+        // Prefill first token, then the recorded 2- and 3-token bursts, verbatim
+        // (the modeled latency would have emitted single tokens).
+        assert_eq!(chunks, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn spec_trace_replay_emits_consistent_spec_decoding_stats() {
+        let opt = test_opt();
+        let latency = spec_trace_latency(&opt);
+        // K = max recorded chunk (4) - 1: a 4-token burst is 1 target token
+        // plus 3 accepted drafts.
+        assert_eq!(latency.spec_tokens(), Some(3));
+        let (mut engine, mut rx) = test_engine(opt);
+        engine.latency = Box::new(latency);
+        // Construction read spec_tokens off the default latency; refresh it now
+        // that the spec latency is injected (production sets this in `new`).
+        engine.spec_tokens = engine.latency.spec_tokens();
+
+        add(&mut engine, &mut rx, request("r1", 4, 9));
+
+        // Drive to idle, accumulating the spec stats every step() reports. The
+        // prefill (first-token) step has no decoders, so it must carry no spec
+        // stats; the two 4-token decode bursts each report one draft with three
+        // accepted tokens.
+        let mut total = SpecDecodingStats::default();
+        let mut spec_steps = 0u64;
+        for _ in 0..200 {
+            if engine.active_requests.is_empty() {
+                break;
+            }
+            if let Some(deadline) = engine.earliest_deadline() {
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+            }
+            let outputs = engine.step();
+            // Within one step() call every client sees the same stats clone;
+            // count it once.
+            if let Some(out) = outputs.first()
+                && let Some(stats) = &out.outputs.scheduler_stats
+                && let Some(spec) = &stats.spec_decoding_stats
+            {
+                spec_steps += 1;
+                assert_eq!(spec.num_spec_tokens, 3, "K is reported every spec step");
+                // sum(per_pos) == num_accepted_tokens is the structural
+                // invariant: each accepted draft is credited to exactly one
+                // position.
+                assert_eq!(
+                    spec.num_accepted_tokens_per_pos.iter().sum::<u64>(),
+                    spec.num_accepted_tokens,
+                    "per-position counts must sum to total accepted"
+                );
+                total.num_drafts += spec.num_drafts;
+                total.num_draft_tokens += spec.num_draft_tokens;
+                total.num_accepted_tokens += spec.num_accepted_tokens;
+                if total.num_accepted_tokens_per_pos.is_empty() {
+                    total.num_accepted_tokens_per_pos =
+                        vec![0; spec.num_accepted_tokens_per_pos.len()];
+                }
+                for (acc, v) in total
+                    .num_accepted_tokens_per_pos
+                    .iter_mut()
+                    .zip(&spec.num_accepted_tokens_per_pos)
+                {
+                    *acc += v;
+                }
+            }
+        }
+
+        assert!(spec_steps >= 2, "both decode bursts report spec stats");
+        // Two decode bursts, each one draft of 4 delivered = 3 accepted.
+        assert_eq!(total.num_drafts, 2);
+        assert_eq!(total.num_draft_tokens, 6, "2 drafts * K=3");
+        assert_eq!(total.num_accepted_tokens, 6, "2 bursts * 3 accepted");
+        assert_eq!(total.num_accepted_tokens_per_pos, vec![2, 2, 2]);
     }
 
     #[test]

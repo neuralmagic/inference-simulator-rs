@@ -140,6 +140,15 @@ pub trait LatencyModel: Send {
     fn first_token_overhead(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration {
         self.first_token_delay(rng, ctx)
     }
+
+    /// Configured speculative token count (K) when this model paces multi-token
+    /// steps, or `None` for one-token-per-step (autoregressive) models. Drives
+    /// the engine's emitted `spec_decoding_stats`: a step delivering N tokens is
+    /// reported as 1 target token + (N-1) accepted drafts against a K-token
+    /// budget.
+    fn spec_tokens(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// All timing knobs, in milliseconds (except the unitless `time_factor_under_load`).
@@ -784,6 +793,12 @@ pub struct TraceLatency {
     /// The capture's per-step token budget; chunk-step charging in
     /// `first_token_overhead` mirrors the engine's chunking against it.
     budget_tokens: usize,
+    /// Configured speculative token count (K), derived from the widest
+    /// multi-token step the capture produced: a burst of N delivered tokens is
+    /// 1 target token + (N-1) accepted drafts, so K = max(chunk) - 1. `None`
+    /// for purely autoregressive captures, which keeps the engine's emitted
+    /// `spec_decoding_stats` at `None` (matching a real engine with spec off).
+    spec_tokens: Option<u32>,
     #[allow(dead_code)]
     meta: TraceMeta,
 }
@@ -952,6 +967,15 @@ impl TraceLatency {
 
         let chunk_cost = fit_chunk_cost(records, max_batched_tokens);
 
+        // The widest burst the capture saw fixes the speculative budget K.
+        let max_chunk = records
+            .iter()
+            .filter_map(|r| r.itl_tokens.as_ref())
+            .flat_map(|t| t.iter().copied())
+            .max()
+            .unwrap_or(1);
+        let spec_tokens = (max_chunk > 1).then(|| max_chunk - 1);
+
         Ok(TraceLatency {
             service_fit,
             service_by_prompt,
@@ -962,6 +986,7 @@ impl TraceLatency {
             chunk_cost,
             full_step_floor_ms: fit_full_step_floor(records, &chunk_cost, max_batched_tokens),
             budget_tokens: max_batched_tokens.max(1),
+            spec_tokens,
             meta,
         })
     }
@@ -1180,6 +1205,10 @@ impl LatencyModel for TraceLatency {
 
     fn budget_full_chunk_floor(&self) -> Duration {
         Duration::from_secs_f64(self.full_step_floor_ms / 1000.0)
+    }
+
+    fn spec_tokens(&self) -> Option<u32> {
+        self.spec_tokens
     }
 
     fn prefill_chunk_cost(&self, chunk_tokens: usize, kv_depth: usize) -> Duration {
@@ -1560,6 +1589,26 @@ mod tests {
             let draw = trace.paced_step(&mut rng, 1, &mut pacing);
             assert_eq!(draw.tokens, 1);
         }
+    }
+
+    #[test]
+    fn spec_tokens_derived_from_widest_burst() {
+        // K = max recorded chunk - 1 (a burst of N is 1 target + N-1 drafts).
+        let records = vec![
+            make_spec_record(100, vec![5.0; 9], vec![2; 9]),
+            make_spec_record(100, vec![50.0; 9], vec![8; 9]),
+        ];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        assert_eq!(trace.spec_tokens(), Some(7));
+    }
+
+    #[test]
+    fn spec_tokens_none_for_autoregressive() {
+        let records = vec![make_record(100, 10, 40.0, vec![10.0; 9], 1)];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        assert_eq!(trace.spec_tokens(), None);
     }
 
     #[test]

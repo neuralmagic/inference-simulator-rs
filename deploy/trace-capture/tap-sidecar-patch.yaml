@@ -28,7 +28,7 @@ spec:
     spec:
       containers:
         - name: tap
-          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v5
+          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v8
           command: ["/usr/local/bin/inference-sim-tap"]
           # Addresses default to the sidecar convention: frontend handshake
           # tcp://127.0.0.1:5570, engine handshake tcp://127.0.0.1:5580 (plus
@@ -42,6 +42,11 @@ spec:
             # - --tp=1
             # opt-in content capture (output_token_ids; carries user/model content)
             # - --record-tokens
+            # opt-in per-step SchedulerStats sidecar (one line per token-step).
+            # Required to capture speculative decoding's spec_decoding_stats
+            # (per-position acceptance) when the engine restated below runs with
+            # --speculative-config.
+            # - --step-stats-out=/trace/step-stats.jsonl
           env:
             - { name: RUST_LOG, value: info }
           resources:
@@ -59,6 +64,9 @@ spec:
         #     - --data-parallel-address=127.0.0.1
         #     - --data-parallel-rpc-port=5580   # was 5570 (the frontend); now the tap
         #     - ...the rest of your existing args, unchanged
+        #     # For a speculative-decoding capture, add a spec config and enable
+        #     # the tap's --step-stats-out above, e.g. (ngram needs no draft model):
+        #     - --speculative-config={"method":"ngram","num_speculative_tokens":4,"prompt_lookup_max":4,"prompt_lookup_min":2}
       volumes:
         - name: trace
           emptyDir: {}

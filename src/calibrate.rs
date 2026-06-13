@@ -1154,12 +1154,15 @@ fn source_completion_ms(r: &TraceRecord) -> f64 {
 }
 
 /// Send one replayed request and collect client-side timing. Returns
-/// (ttft_ms, gaps_ms); a None ttft means the request failed or timed out.
+/// (ttft_ms, gaps_ms, chunk_tokens), where `chunk_tokens` is the token count of
+/// every token-bearing message in order (parallel to the message stream, so it
+/// is one longer than `gaps_ms`). Multi-token messages preserve the replayed
+/// burst structure; a None ttft means the request failed or timed out.
 async fn measure_one(
     client: &vllm_engine_core_client::EngineCoreClient,
     request: vllm_engine_core_client::protocol::EngineCoreRequest,
     timeout_dur: std::time::Duration,
-) -> (Option<f64>, Vec<f64>) {
+) -> (Option<f64>, Vec<f64>, Vec<u32>) {
     use std::time::Instant;
 
     use futures::StreamExt as _;
@@ -1170,7 +1173,7 @@ async fn measure_one(
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("{rid}: call failed: {e:#}");
-            return (None, Vec::new());
+            return (None, Vec::new(), Vec::new());
         }
     };
     // TTFT needs the client clock (it spans the send), but GAPS use the
@@ -1180,12 +1183,14 @@ async fn measure_one(
     // in tap-measured real captures).
     let mut first_token_at: Option<Instant> = None;
     let mut token_stamps: Vec<f64> = Vec::new();
+    let mut chunk_tokens: Vec<u32> = Vec::new();
     let result = tokio::time::timeout(timeout_dur, async {
         while let Some(item) = stream.next().await {
             let output = item.context("stream item error")?;
             if !output.new_token_ids.is_empty() {
                 first_token_at.get_or_insert_with(Instant::now);
                 token_stamps.push(output.timestamp);
+                chunk_tokens.push(output.new_token_ids.len() as u32);
             }
             if output.finish_reason.is_some() {
                 break;
@@ -1198,11 +1203,11 @@ async fn measure_one(
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             tracing::warn!("{rid}: stream error: {e:#}");
-            return (None, Vec::new());
+            return (None, Vec::new(), Vec::new());
         }
         Err(_) => {
             tracing::warn!("{rid}: timed out after {timeout_dur:?}");
-            return (None, Vec::new());
+            return (None, Vec::new(), Vec::new());
         }
     }
     let ttft = first_token_at.map(|f| (f - call_start).as_secs_f64() * 1000.0);
@@ -1210,7 +1215,7 @@ async fn measure_one(
         .windows(2)
         .map(|w| (w[1] - w[0]) * 1000.0)
         .collect();
-    (ttft, gaps)
+    (ttft, gaps, chunk_tokens)
 }
 
 /// Outcome of an open-loop arrival replay: the calibration report plus
@@ -1238,6 +1243,9 @@ struct ReplayedRequest {
     send_lag_ms: f64,
     ttft_ms: Option<f64>,
     gaps_ms: Vec<f64>,
+    /// Token count per token-bearing message, in order (one longer than
+    /// `gaps_ms`). Preserves multi-token burst structure for the dumped trace.
+    chunk_tokens: Vec<u32>,
 }
 
 /// Reactive wire-level validation: replay a trace's recorded arrival schedule
@@ -1458,7 +1466,8 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
                 }),
                 ..Default::default()
             };
-            let (ttft_ms, mut gaps_ms) = measure_one(&client, request, timeout_dur).await;
+            let (ttft_ms, mut gaps_ms, chunk_tokens) =
+                measure_one(&client, request, timeout_dur).await;
             let ttft_ms = ttft_ms.map(|t| t * time_scale);
             if time_scale != 1.0 {
                 for g in &mut gaps_ms {
@@ -1475,6 +1484,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
                 send_lag_ms,
                 ttft_ms,
                 gaps_ms,
+                chunk_tokens,
             }
         }));
     }
@@ -1511,12 +1521,26 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
         if !m.gaps_ms.is_empty() {
             replay_totals.push(m.gaps_ms.iter().sum());
         }
+        // `chunk_tokens` is parallel to the message stream; `itl_tokens` is
+        // parallel to the GAPS (the chunk that closed each gap), so it drops the
+        // first message. Mirror the tap's rule: omit when every chunk was a
+        // single token, keeping plain autoregressive dumps unchanged.
+        let itl_tokens = m
+            .chunk_tokens
+            .get(1..)
+            .and_then(|t| t.iter().any(|&c| c > 1).then(|| t.to_vec()));
+        let output_tokens = if m.chunk_tokens.is_empty() {
+            m.gaps_ms.len() + 1
+        } else {
+            m.chunk_tokens.iter().map(|&c| c as usize).sum()
+        };
         measured_records.push(TraceRecord {
             prompt_tokens: rec.prompt_tokens,
             cached_tokens: 0,
-            output_tokens: m.gaps_ms.len() + 1,
+            output_tokens,
             ttft_ms: ttft,
             itl_ms: (!m.gaps_ms.is_empty()).then(|| m.gaps_ms.clone()),
+            itl_tokens,
             itl_summary: None,
             concurrency: rec.concurrency,
             arrival_ms: rec.arrival_ms,

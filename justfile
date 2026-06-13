@@ -9,7 +9,7 @@
 #   just calibrate /tmp/trace-capture-h200/tap-trace.jsonl
 #   just plots /tmp/trace-capture-h200/tap-trace.jsonl docs/images
 
-image := "quay.io/wseaton/mock-engine-nixl:trace-capture-v7"
+image := "quay.io/wseaton/mock-engine-nixl:trace-capture-v8"
 namespace := "weaton-dev"
 deploy := "trace-capture-h200"
 

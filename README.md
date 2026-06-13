@@ -548,7 +548,8 @@ pacing is knob composition rather than a mode switch:
 
 | Mode | Invocation |
 | --- | --- |
-| Timing-accurate | `--replay-tokens trace.gz --latency-trace trace.gz` plus scheduler args matching the capture (`--max-num-seqs`, `--max-num-batched-tokens`, ...) |
+| Timing-modeled | `--replay-tokens trace.gz --latency-trace trace.gz` plus scheduler args matching the capture (`--max-num-seqs`, `--max-num-batched-tokens`, ...): gaps and burst sizes SAMPLED from a model fitted to the trace |
+| Timing-verbatim | `--replay-tokens trace.gz --replay-steps trace.gz`: each request replays its EXACT recorded per-chunk sizes and gaps (the fidelity ceiling; see the spec-decode section) |
 | As fast as possible | `--replay-tokens trace.gz` and nothing else: all timing knobs default to 0, the instant model |
 | Compressed but shaped | `--replay-tokens trace.gz --latency-trace trace.gz --time-scale 100`: same interleavings and relative ordering, 100x faster wall clock |
 | Synthetic timing | `--replay-tokens trace.gz --time-to-first-token 50 --inter-token-latency 10` |
@@ -558,3 +559,83 @@ delay (`--max-num-seqs` and the token budget produce real queueing and
 backpressure semantics at infinite speed - bump them for pure pass-through),
 and `--output-token-chunk-size` controls output framing if the client under
 test should also see multi-token chunks.
+
+### Speculative decoding and diffusion: multi-token steps
+
+Speculative decoding (and diffusion, which vLLM serves through the same
+spec-decode block path) breaks the one-token-per-step assumption: a single
+engine step delivers a *burst* of tokens - 1 verified token plus the accepted
+drafts, or a whole diffusion block. The capture and replay path preserves that
+structure end to end.
+
+On the capture side the tap records, per output chunk, one `itl_ms` gap and the
+number of tokens that chunk delivered in a parallel `itl_tokens` array (omitted
+for plain autoregressive captures, so old traces are unchanged). The first
+chunk has no gap; its size is `output_tokens - sum(itl_tokens)`. With
+`--step-stats-out` the tap also writes a per-step `SchedulerStats` sidecar,
+which under speculative decoding carries `spec_decoding_stats` (per-position
+acceptance) straight off the real engine.
+
+There are two ways to put that burst structure back on the wire, and they are
+deliberately different (the "replay vs modeled" distinction that runs through
+this whole section):
+
+- **Modeled** (`--latency-trace`): the latency model draws the recorded
+  `(gap, tokens)` pairs *jointly* from donor pools fitted to the capture. A step
+  the capture saw deliver four tokens replays as one four-token message after a
+  *sampled* gap, never four messages at gap/4. It reproduces the burst
+  *distribution* (so it transfers to a workload it was not fit on), not any
+  request's exact sequence, so expect small sampling drift.
+- **Replay** (`--replay-steps`): each matched request emits its *own* recorded
+  chunk sizes at its own recorded gaps, bit-for-bit (the timing analogue of
+  `--replay-tokens`; requests resolve to records via `--replay-match`). This is
+  the fidelity ceiling, exact but non-transferable. Use it to validate the
+  pipeline or to drive a downstream consumer with a known-exact stream.
+
+Either way the simulator re-derives `spec_decoding_stats` from the bursts it
+emits (speculative budget `K = max(itl_tokens) - 1`, a burst of N tokens
+reported as 1 target token plus N-1 accepted drafts), so its scheduler stats
+line up with the capture's instead of being left empty. Autoregressive traces
+report no spec stats, matching a real engine with speculation off.
+
+Capture a speculative-decoding trace (the rig adds ngram spec decode, which
+needs no draft model; see `deploy/trace-capture/h200-capture.yaml`), then
+replay it and plot the proof:
+
+```bash
+# 1. Capture: real engine with ngram spec decode behind the tap (writes
+#    tap-trace.jsonl + step-stats.jsonl). See deploy/trace-capture/README.md.
+just capture-up && bash deploy/trace-capture/run-capture.sh && just capture-down
+
+# 2. Replay the recorded schedule with VERBATIM per-request bursts and gaps
+#    (--replay-steps); the dump carries the replayed itl_tokens.
+cargo run --release --bin inference-sim-trace -- calibrate-e2e \
+    /tmp/trace-capture-h200/tap-trace.jsonl --replay-arrivals \
+    --sim-arg=--replay-steps=/tmp/trace-capture-h200/tap-trace.jsonl \
+    --dump-trace /tmp/spec-replay.jsonl
+
+# 3. Plot capture vs replay: burst sizes, per-chunk pacing, acceptance.
+uv run scripts/plot_calibration.py \
+    --spec-fidelity real=/tmp/trace-capture-h200/tap-trace.jsonl \
+    --spec-fidelity replay=/tmp/spec-replay.jsonl \
+    --spec-steps real=/tmp/trace-capture-h200/step-stats.jsonl \
+    --out-dir docs/images
+```
+
+![Speculative decoding replay fidelity](docs/images/spec-decode-fidelity.png)
+
+The figure is the verbatim `--replay-steps` path (a 4096-record Qwen3-8B run;
+ngram on this workload accepts often, so ~45% of steps deliver the full 5
+tokens). Left: the distribution of tokens delivered per decode step, captured vs
+replayed, identical because the replay plays each request's recorded sizes back
+exactly (the modeled path tracks the same distribution with small sampling
+drift; a flattened replay would collapse everything to a single token). Middle:
+the joint structure flattening destroys. Speculation verifies all K drafts in
+one target forward pass, so the median step time is ~flat in the burst size
+(~12ms whether the step delivered 1 or 5 tokens), and the dashed line is the
+~gap/N a flattened replay would wrongly produce (2.4ms at 5 tokens). Right:
+per-position draft acceptance read back from the `SchedulerStats` sidecar, the
+scheduler-stats integration end to end (pass a second `--spec-steps replay=...`
+to overlay the simulator's own emitted stats). The pieces are also covered
+without a GPU by `tests/spec_replay_fidelity.rs` and `replay_steps`/engine unit
+tests (verbatim bursts, gaps, and the `spec_decoding_stats` accounting).

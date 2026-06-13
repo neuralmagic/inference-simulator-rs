@@ -53,8 +53,14 @@ echo "==> fetching tap trace"
 kubectl -n "$NS" exec "deploy/$DEPLOY" -c tap -- cat /trace/trace.jsonl \
     > "$OUT_DIR/tap-trace.jsonl"
 
+echo "==> fetching step-stats sidecar (per-step SchedulerStats incl. spec_decoding_stats)"
+kubectl -n "$NS" exec "deploy/$DEPLOY" -c tap -- cat /trace/step-stats.jsonl \
+    > "$OUT_DIR/step-stats.jsonl" 2>/dev/null || \
+    echo "  (no step-stats.jsonl; tap built without --step-stats-out support?)"
+
 echo "==> done"
 echo "  tap trace:    $OUT_DIR/tap-trace.jsonl ($(wc -l < "$OUT_DIR/tap-trace.jsonl" | tr -d ' ') lines)"
+echo "  step stats:   $OUT_DIR/step-stats.jsonl"
 echo "  client trace: $OUT_DIR/client-trace.jsonl"
 echo "  client JSON:  $OUT_DIR/c1-loadgen.json $OUT_DIR/c16-loadgen.json"
 echo

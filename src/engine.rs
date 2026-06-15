@@ -321,6 +321,12 @@ impl ActiveRequest {
             return Err(EngineCoreFinishReason::Error);
         };
         let max_tokens = sampling_params.max_tokens as usize;
+        let min_tokens = sampling_params.min_tokens as usize;
+        // The frontend populates the EOS token only when the request can stop on
+        // it (i.e. `ignore_eos` was not set). Its absence means "generate exactly
+        // max_tokens" (ignore_eos benchmarks, fixture replays), so EOS modeling
+        // must not shorten those streams.
+        let eos_terminable = sampling_params.eos_token_id.is_some();
 
         if let Some(kv) = &incoming_kv {
             info!(request_id, %kv, "received kv_transfer_params from frontend");
@@ -341,6 +347,28 @@ impl ActiveRequest {
         }
 
         let mut rng = StdRng::seed_from_u64(request_seed(opt.seed, engine_index, &request_id));
+
+        // A modeled trace-replay request arrives with max_tokens clamped to
+        // max_model_len (the frontend's ceiling when the client leaves the count
+        // unset), but a real engine emits EOS far earlier. Cap generation at a
+        // length drawn from the capture's recorded output-length distribution,
+        // bounded by the request's own [min_tokens, max_tokens]. Knob models
+        // return None and the requested max_tokens stands. Verbatim replay
+        // (--replay-steps / --replay-tokens) pins each request to its own recorded
+        // length downstream, so the marginal sampler must not pre-empt it.
+        let verbatim = !opt.replay_steps.is_empty() || !opt.replay_tokens.is_empty();
+        let max_tokens = if verbatim || !eos_terminable {
+            max_tokens
+        } else {
+            match latency.sample_output_len(&mut rng) {
+                Some(sampled) => {
+                    let lo = min_tokens.max(1);
+                    sampled.clamp(lo, max_tokens.max(lo))
+                }
+                None => max_tokens,
+            }
+        };
+
         let pacing = DecodePacing::for_prompt(prompt_len, churn);
 
         // A remote-prefill request (P/D decode side) runs no local chunks;
@@ -1872,6 +1900,70 @@ mod tests {
         let tokens: usize = outputs.iter().map(|o| o.new_token_ids.len()).sum();
         assert_eq!(tokens, 3);
         assert!(outputs.last().unwrap().finished());
+    }
+
+    /// Instant model that caps every request's output at a fixed length, the
+    /// way a trace model emulates EOS from its recorded distribution.
+    struct CappingLatency(usize);
+
+    impl crate::latency::LatencyModel for CappingLatency {
+        fn first_token_delay(&self, _rng: &mut StdRng, _ctx: &FirstTokenCtx) -> Duration {
+            Duration::ZERO
+        }
+        fn inter_token_delay(&self, _rng: &mut StdRng, _num_running: u64) -> Duration {
+            Duration::ZERO
+        }
+        fn sample_output_len(&self, _rng: &mut StdRng) -> Option<usize> {
+            Some(self.0)
+        }
+    }
+
+    /// A request the frontend marked EOS-terminable (eos_token_id set, i.e.
+    /// ignore_eos was not requested), so the modeled EOS sampler applies.
+    fn eos_request(id: &str, prompt_len: usize, max_tokens: u32) -> EngineCoreRequest {
+        let mut req = request(id, prompt_len, max_tokens);
+        req.sampling_params.as_mut().unwrap().eos_token_id = Some(2);
+        req
+    }
+
+    #[test]
+    fn trace_output_len_caps_generation_below_requested_max() {
+        // The frontend hands the engine a max_model_len-scale max_tokens, but the
+        // model emits EOS far earlier. A model that samples a 5-token output must
+        // cap generation at 5, not run the full 4000.
+        let (mut engine, mut rx) = test_engine(test_opt());
+        engine.latency = Box::new(CappingLatency(5));
+        add(&mut engine, &mut rx, eos_request("r1", 4, 4000));
+        let outputs = drain(&mut engine, &mut rx);
+        let tokens: usize = outputs.iter().map(|o| o.new_token_ids.len()).sum();
+        assert_eq!(tokens, 5, "output must be capped to the sampled EOS length");
+        assert!(outputs.last().unwrap().finished());
+    }
+
+    #[test]
+    fn trace_output_len_never_exceeds_requested_max() {
+        // A request that asks for fewer tokens than the sampled length still stops
+        // at its own max_tokens: the sampled length is a ceiling-emulating EOS, not
+        // a floor.
+        let (mut engine, mut rx) = test_engine(test_opt());
+        engine.latency = Box::new(CappingLatency(50));
+        add(&mut engine, &mut rx, eos_request("r1", 4, 3));
+        let outputs = drain(&mut engine, &mut rx);
+        let tokens: usize = outputs.iter().map(|o| o.new_token_ids.len()).sum();
+        assert_eq!(tokens, 3, "request max_tokens stays the hard ceiling");
+    }
+
+    #[test]
+    fn ignore_eos_request_runs_full_max_tokens() {
+        // No eos_token_id (ignore_eos / fixture replay): the EOS sampler must not
+        // fire, so the request generates its full requested length even when the
+        // model would have sampled a shorter EOS.
+        let (mut engine, mut rx) = test_engine(test_opt());
+        engine.latency = Box::new(CappingLatency(5));
+        add(&mut engine, &mut rx, request("r1", 4, 40));
+        let outputs = drain(&mut engine, &mut rx);
+        let tokens: usize = outputs.iter().map(|o| o.new_token_ids.len()).sum();
+        assert_eq!(tokens, 40, "ignore_eos must honor max_tokens exactly");
     }
 
     #[test]

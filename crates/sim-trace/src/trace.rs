@@ -38,6 +38,13 @@ pub struct TraceMeta {
     /// fingerprints). Hashes are chained per block, mooncake-style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_size: Option<usize>,
+    /// Hash of the deployment config this trace was captured under (the CI
+    /// profile-once/replay-many cache key). Stamped by the tap at capture and
+    /// checked by the sim at replay, so a trace cannot be replayed against a
+    /// config it was not recorded for. `None` on traces captured before this
+    /// field existed, or outside the cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_hash: Option<String>,
     /// Freeform key-value pairs for any fields not covered above.
     #[serde(default, skip_serializing_if = "HashMap::is_empty", flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -216,6 +223,37 @@ pub fn open_trace_reader(path: &Path) -> Result<Box<dyn BufRead>> {
 pub fn read_trace_file(path: &Path) -> Result<(TraceMeta, Vec<TraceRecord>)> {
     read_trace(open_trace_reader(path)?)
         .with_context(|| format!("parsing trace file: {}", path.display()))
+}
+
+/// Read only the metadata header of a trace, without parsing records. Returns a
+/// default (empty) meta when the file has no `{"meta": ...}` header line. Used
+/// for cheap provenance checks (e.g. config-hash verification at replay).
+pub fn read_trace_meta(path: &Path) -> Result<TraceMeta> {
+    read_meta(open_trace_reader(path)?)
+        .with_context(|| format!("reading trace meta: {}", path.display()))
+}
+
+/// Parse just the meta header from a reader: scan to the first non-blank line,
+/// and parse it as meta only if it carries a `"meta"` key (otherwise it is a
+/// record and the trace has no header).
+fn read_meta(reader: impl BufRead) -> Result<TraceMeta> {
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("reading line {}", idx + 1))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(trimmed)
+            .with_context(|| format!("line {}: invalid JSON", idx + 1))?;
+        if value.get("meta").is_some() {
+            let wrapper: MetaWrapper = serde_json::from_value(value)
+                .with_context(|| format!("line {}: invalid meta object", idx + 1))?;
+            return Ok(wrapper.meta);
+        }
+        // First non-blank line is a record: no header.
+        return Ok(TraceMeta::default());
+    }
+    Ok(TraceMeta::default())
 }
 
 /// A trace file writer: plain JSONL, or gzip when the path ends in `.gz`.
@@ -438,6 +476,7 @@ mod tests {
             max_num_seqs: Some(128),
             source: Some("guidellm".to_string()),
             block_size: None,
+            config_hash: None,
             extra: HashMap::new(),
         }
     }
@@ -496,6 +535,77 @@ mod tests {
         let (parsed_meta, parsed_records) = read_trace(io::BufReader::new(buf.as_slice())).unwrap();
         assert_eq!(parsed_meta, meta);
         assert_eq!(parsed_records, records);
+    }
+
+    #[test]
+    fn config_hash_round_trips() {
+        let meta = TraceMeta {
+            config_hash: Some("deadbeef".to_string()),
+            ..sample_meta()
+        };
+        let mut buf = Vec::new();
+        write_trace(&mut buf, &meta, &sample_records()).unwrap();
+        // It serializes under the plain `config_hash` key (not nested in extra).
+        let text = String::from_utf8(buf.clone()).unwrap();
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .contains("\"config_hash\":\"deadbeef\"")
+        );
+
+        let (parsed, _) = read_trace(io::BufReader::new(buf.as_slice())).unwrap();
+        assert_eq!(parsed.config_hash.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn read_meta_reads_header_only() {
+        let meta = TraceMeta {
+            config_hash: Some("abc123".to_string()),
+            ..sample_meta()
+        };
+        let mut buf = Vec::new();
+        write_trace(&mut buf, &meta, &sample_records()).unwrap();
+
+        let parsed = read_meta(io::BufReader::new(buf.as_slice())).unwrap();
+        assert_eq!(parsed, meta);
+    }
+
+    #[test]
+    fn read_meta_headerless_is_default() {
+        // A trace whose first line is a record (no `{"meta": ...}`) has no header.
+        let mut buf = Vec::new();
+        write_trace(&mut buf, &TraceMeta::default(), &sample_records()).unwrap();
+        let parsed = read_meta(io::BufReader::new(buf.as_slice())).unwrap();
+        assert_eq!(parsed, TraceMeta::default());
+        assert!(parsed.config_hash.is_none());
+    }
+
+    #[test]
+    fn read_meta_empty_is_default() {
+        let parsed = read_meta(io::BufReader::new(b"".as_slice())).unwrap();
+        assert_eq!(parsed, TraceMeta::default());
+    }
+
+    #[test]
+    fn read_trace_meta_file_gz() {
+        // The cheap file reader works through gzip too (config-hash check reads
+        // the .gz traces stored in S3).
+        let meta = TraceMeta {
+            config_hash: Some("hash-in-gz".to_string()),
+            ..sample_meta()
+        };
+        let path = std::env::temp_dir().join(format!(
+            "inference-sim-meta-gz-test-{}.jsonl.gz",
+            std::process::id()
+        ));
+        let mut writer = TraceWriter::create(&path).unwrap();
+        write_trace(&mut writer, &meta, &sample_records()).unwrap();
+        writer.finish().unwrap();
+
+        let parsed = read_trace_meta(&path).unwrap();
+        assert_eq!(parsed.config_hash.as_deref(), Some("hash-in-gz"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

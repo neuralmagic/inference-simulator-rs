@@ -144,6 +144,14 @@ pub struct Opt {
     #[arg(long, value_enum, default_value_t = ReplayMatch::Index)]
     pub replay_match: ReplayMatch,
 
+    /// Refuse to replay unless every provided trace's recorded `config_hash`
+    /// matches this value. The CI profile-once/replay-many cache stamps the
+    /// hash at capture (tap `--config-hash`); checking it here stops a trace
+    /// from being replayed against a config it was not captured for. Empty
+    /// (default) disables the check.
+    #[arg(long, default_value = "")]
+    pub expect_config_hash: String,
+
     /// Base seed for deterministic random token generation.
     #[arg(long, default_value_t = 0)]
     pub seed: u64,
@@ -497,6 +505,45 @@ impl Opt {
             || self.prefill_time_std_dev != 0
     }
 
+    /// Verify each provided trace was captured under the expected config hash.
+    /// No-op when `--expect-config-hash` is empty. Bails if a trace is missing
+    /// the hash or carries a different one, so a stale/wrong trace cannot be
+    /// replayed against a config it was not recorded for.
+    pub fn verify_config_hash(&self) -> Result<()> {
+        if self.expect_config_hash.is_empty() {
+            return Ok(());
+        }
+        // The three replay inputs are usually the same file; dedupe so we read
+        // each trace's header once.
+        let mut paths: Vec<&str> = [
+            self.replay_tokens.as_str(),
+            self.replay_steps.as_str(),
+            self.latency_trace.as_str(),
+        ]
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect();
+        paths.sort_unstable();
+        paths.dedup();
+
+        for path in paths {
+            let meta = trace::read_trace_meta(std::path::Path::new(path))?;
+            match meta.config_hash.as_deref() {
+                Some(found) if found == self.expect_config_hash => {}
+                Some(found) => bail!(
+                    "config-hash mismatch for trace {path}: expected {}, trace was captured under {found}",
+                    self.expect_config_hash
+                ),
+                None => bail!(
+                    "trace {path} has no config_hash but --expect-config-hash {} was set \
+                     (recapture with the tap's --config-hash, or drop the check)",
+                    self.expect_config_hash
+                ),
+            }
+        }
+        Ok(())
+    }
+
     /// Build the latency model: either trace-replay (from `--latency-trace`) or
     /// knob-based. Returns an error if both are configured or if the trace file is
     /// unreadable.
@@ -644,6 +691,8 @@ pub async fn run(opt: Opt, shutdown: CancellationToken) -> Result<()> {
     // transport setup, so a bad config fails immediately instead of after the 30s
     // frontend handshake timeout. Engines rebuild their own copy in SimEngine::new.
     opt.build_latency()?;
+    // Refuse a trace captured under a different config before doing any work.
+    opt.verify_config_hash()?;
 
     info!(?opt, "starting mock engine");
 
@@ -672,4 +721,74 @@ pub async fn run(opt: Opt, shutdown: CancellationToken) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use clap::Parser;
+
+    use crate::Opt;
+
+    /// Write a one-line trace header with (or without) a config_hash.
+    fn write_trace_header(tag: &str, hash: Option<&str>) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "sim-confighash-test-{}-{tag}.jsonl",
+            std::process::id()
+        ));
+        let meta = match hash {
+            Some(h) => format!("{{\"meta\":{{\"source\":\"tap\",\"config_hash\":\"{h}\"}}}}\n"),
+            None => "{\"meta\":{\"source\":\"tap\"}}\n".to_string(),
+        };
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(meta.as_bytes()).unwrap();
+        path
+    }
+
+    fn opt_replaying(trace: &std::path::Path, expect: &str) -> Opt {
+        Opt::parse_from([
+            "inference-sim",
+            "--latency-trace",
+            trace.to_str().unwrap(),
+            "--expect-config-hash",
+            expect,
+        ])
+    }
+
+    #[test]
+    fn verify_config_hash_disabled_is_noop() {
+        // Without --expect-config-hash the trace is never read for this check.
+        let opt = Opt::parse_from(["inference-sim", "--latency-trace", "/does/not/exist.jsonl"]);
+        assert!(opt.verify_config_hash().is_ok());
+    }
+
+    #[test]
+    fn verify_config_hash_match_ok() {
+        let p = write_trace_header("match", Some("abc123"));
+        assert!(opt_replaying(&p, "abc123").verify_config_hash().is_ok());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn verify_config_hash_mismatch_bails() {
+        let p = write_trace_header("mismatch", Some("abc123"));
+        let err = opt_replaying(&p, "different")
+            .verify_config_hash()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mismatch"), "got: {err}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn verify_config_hash_missing_in_trace_bails() {
+        let p = write_trace_header("missing", None);
+        let err = opt_replaying(&p, "abc123")
+            .verify_config_hash()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no config_hash"), "got: {err}");
+        let _ = std::fs::remove_file(&p);
+    }
 }

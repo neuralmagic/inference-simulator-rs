@@ -88,6 +88,13 @@ struct TapOpt {
     #[arg(long)]
     tp: Option<u32>,
 
+    /// Config hash recorded in the trace metadata line. This is the CI
+    /// profile-once/replay-many cache key; the sim checks it at replay
+    /// (`--expect-config-hash`) so a trace cannot be replayed against a config
+    /// it was not captured for.
+    #[arg(long)]
+    config_hash: Option<String>,
+
     /// Token-block size for prompt prefix fingerprints (block_hashes in the
     /// trace). Should match the engine's prefix-cache block size.
     #[arg(long, default_value_t = 16)]
@@ -172,6 +179,7 @@ async fn run_main(opt: TapOpt) -> Result<()> {
         opt.gpu.as_deref(),
         opt.tp,
         opt.block_size,
+        opt.config_hash.as_deref(),
     )?;
 
     let config = TapConfig {

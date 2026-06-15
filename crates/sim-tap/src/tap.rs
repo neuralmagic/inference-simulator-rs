@@ -766,6 +766,7 @@ pub fn write_meta<W: Write>(
     gpu: Option<&str>,
     tp: Option<u32>,
     block_size: usize,
+    config_hash: Option<&str>,
 ) -> Result<()> {
     let meta = TraceMeta {
         source: Some("tap".to_string()),
@@ -777,6 +778,7 @@ pub fn write_meta<W: Write>(
         gpu: gpu.map(str::to_string),
         tp,
         block_size: Some(block_size),
+        config_hash: config_hash.map(str::to_string),
         ..TraceMeta::default()
     };
     let wrapper = serde_json::json!({"meta": meta});

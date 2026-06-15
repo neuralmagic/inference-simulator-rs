@@ -146,6 +146,7 @@ pub fn convert_guidellm(
         max_num_seqs: None,
         source: Some("guidellm".to_string()),
         block_size: None,
+        config_hash: None,
         extra: HashMap::new(),
     };
 

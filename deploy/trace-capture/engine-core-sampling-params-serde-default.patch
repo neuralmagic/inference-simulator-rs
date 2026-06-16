@@ -1,0 +1,80 @@
+--- a/rust/src/engine-core-client/src/protocol/mod.rs
++++ b/rust/src/engine-core-client/src/protocol/mod.rs
+@@ -42,6 +42,14 @@
+ 
+ fn default_repetition_penalty() -> f32 {
+     1.0
++}
++
++fn default_temperature() -> f32 {
++    1.0
++}
++
++fn default_max_tokens() -> u32 {
++    16
+ }
+ 
+ mod classified_outputs;
+@@ -251,6 +259,7 @@
+ pub struct EngineCoreSamplingParams {
+     /// Controls randomness. Lower values are more deterministic; zero means
+     /// greedy sampling.
++    #[serde(default = "default_temperature")]
+     pub temperature: f32,
+     /// Cumulative probability threshold for nucleus sampling.
+     #[serde(default = "default_top_p")]
+@@ -259,8 +268,10 @@
+     #[serde(default)]
+     pub top_k: u32,
+     /// Random seed used by the sampler when present.
++    #[serde(default)]
+     pub seed: Option<i64>,
+     /// Maximum number of tokens to generate per output sequence.
++    #[serde(default = "default_max_tokens")]
+     pub max_tokens: u32,
+     /// Minimum number of tokens to generate before EOS or stop-token handling.
+     #[serde(default)]
+@@ -268,36 +279,41 @@
+     /// Number of log probabilities to return per generated token.
+     ///
+     /// `None` disables sample logprobs. `-1` requests the full vocabulary.
++    #[serde(default)]
+     pub logprobs: Option<i32>,
+     /// Number of log probabilities to return per prompt token.
+     ///
+     /// `None` disables prompt logprobs. `-1` requests the full vocabulary.
++    #[serde(default)]
+     pub prompt_logprobs: Option<i32>,
+     /// Minimum probability threshold for token sampling.
+     #[serde(default)]
+     pub min_p: f32,
+     /// Frequency penalty applied by the sampler.
++    #[serde(default)]
+     pub frequency_penalty: f32,
+     /// Presence penalty applied by the sampler.
++    #[serde(default)]
+     pub presence_penalty: f32,
+     /// Repetition penalty applied by the sampler.
+     #[serde(default = "default_repetition_penalty")]
+     pub repetition_penalty: f32,
+     /// Token IDs that stop generation.
++    #[serde(default)]
+     pub stop_token_ids: Vec<u32>,
+     /// Primary EOS token ID used by engine-core's dedicated EOS stop path.
+     ///
+     /// This mirrors Python's internal `_eos_token_id` field and is derived by
+     /// the frontend from tokenizer/model metadata rather than supplied directly
+     /// by end users.
+-    #[serde(rename = "_eos_token_id")]
++    #[serde(default, rename = "_eos_token_id")]
+     pub eos_token_id: Option<u32>,
+     /// Complete stop-token set used by engine-core for `min_tokens` masking.
+     ///
+     /// This mirrors Python's internal `_all_stop_token_ids` field and should
+     /// contain explicit `stop_token_ids` plus any frontend-derived EOS token
+     /// IDs.
+-    #[serde(rename = "_all_stop_token_ids")]
++    #[serde(default, rename = "_all_stop_token_ids")]
+     pub all_stop_token_ids: BTreeSet<u32>,
+     /// Logit biases to apply during sampling.
+     /// Keys are token IDs

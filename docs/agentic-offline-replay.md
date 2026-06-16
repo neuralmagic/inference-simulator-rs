@@ -62,7 +62,7 @@ all (Responses-API-only wire protocol).
 
 ## Capture (one GPU run)
 
-Standard tap sidecar setup (`deploy/trace-capture/README.md`), with token
+Standard tap sidecar setup (manifests in `deploy/trace-capture/`), with token
 recording on and the **python** vLLM frontend, which serves `/v1/messages`
 for Claude Code (vllm-rs doesn't yet; the protocol-pin image c9340e6f3
 already ships the anthropic entrypoint including the billing-header strip):

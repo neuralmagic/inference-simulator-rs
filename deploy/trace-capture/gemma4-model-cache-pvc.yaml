@@ -1,0 +1,13 @@
+# RWX cache for gemma-4-26B-A4B-it-FP8-Dynamic weights (~27 GB FP8), so redeploys
+# skip the pull. Same storage class as dg-model-cache.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gemma4-model-cache
+  namespace: your-namespace
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: shared-vast
+  resources:
+    requests:
+      storage: 100Gi

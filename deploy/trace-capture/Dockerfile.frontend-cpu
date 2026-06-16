@@ -15,6 +15,10 @@
 FROM python:3.12-slim
 
 ARG VLLM_COMMIT=c9340e6f350a009cf835878abad2a0e379b9e6a4
+# The exact wheel version string at ${VLLM_COMMIT}'s CPU index (it embeds the
+# short sha, so it MUST move with VLLM_COMMIT). Find it at
+# https://wheels.vllm.ai/${VLLM_COMMIT}/cpu/vllm/ . Default = the c9340e6f pin.
+ARG VLLM_VERSION=0.22.1rc1.dev431+gc9340e6f3.cpu
 
 # numactl: CpuPlatform probes it at import; curl for debugging.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -29,6 +33,6 @@ RUN uv pip install --system \
         --extra-index-url https://wheels.vllm.ai/${VLLM_COMMIT}/cpu/ \
         --extra-index-url https://download.pytorch.org/whl/cpu \
         --index-strategy unsafe-best-match \
-        "vllm==0.22.1rc1.dev431+gc9340e6f3.cpu"
+        "vllm==${VLLM_VERSION}"
 
 ENTRYPOINT ["vllm"]

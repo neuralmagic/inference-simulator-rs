@@ -1,0 +1,17 @@
+# Slim build of JUST the recording tap (inference-sim-tap), pinned to whatever
+# vllm-engine-core-client rev Cargo.toml currently points at. The tap is a
+# pure-Rust ZMQ proxy (zeromq = zmq.rs, no libzmq) and does NOT need the nixl
+# feature, so we skip the heavy Fedora/UCX/libnixl builder in ./Dockerfile.
+#
+#   podman build --platform linux/amd64 -f Dockerfile.tap \
+#     -t quay.io/wseaton/mock-engine-nixl:tap-16e91176 .
+FROM rust:1.95-bookworm AS builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release -p sim-tap
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/inference-sim-tap /usr/local/bin/inference-sim-tap
+ENTRYPOINT ["/usr/local/bin/inference-sim-tap"]

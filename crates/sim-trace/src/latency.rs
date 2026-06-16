@@ -149,6 +149,15 @@ pub trait LatencyModel: Send {
     fn spec_tokens(&self) -> Option<u32> {
         None
     }
+
+    /// A realistic output length (in tokens) for a request entering decode, drawn
+    /// from the capture's recorded output-length distribution. The engine caps
+    /// generation at this, emulating the EOS the real model emits well before the
+    /// frontend's `max_model_len` ceiling. `None` (the default, knob models) means
+    /// "no override": the engine generates the request's full `max_tokens`.
+    fn sample_output_len(&self, _rng: &mut StdRng) -> Option<usize> {
+        None
+    }
 }
 
 /// All timing knobs, in milliseconds (except the unitless `time_factor_under_load`).
@@ -799,6 +808,9 @@ pub struct TraceLatency {
     /// for purely autoregressive captures, which keeps the engine's emitted
     /// `spec_decoding_stats` at `None` (matching a real engine with spec off).
     spec_tokens: Option<u32>,
+    /// Sorted recorded output lengths (tokens) across all records, the empirical
+    /// EOS-termination distribution sampled by `sample_output_len`.
+    output_lens: Vec<f64>,
     #[allow(dead_code)]
     meta: TraceMeta,
 }
@@ -976,6 +988,14 @@ impl TraceLatency {
             .unwrap_or(1);
         let spec_tokens = (max_chunk > 1).then(|| max_chunk - 1);
 
+        // Empirical output-length distribution (emulated EOS): every record's
+        // recorded output token count, sorted for inverse-CDF sampling.
+        let mut output_lens: Vec<f64> = records
+            .iter()
+            .map(|r| r.output_tokens.max(1) as f64)
+            .collect();
+        output_lens.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
         Ok(TraceLatency {
             service_fit,
             service_by_prompt,
@@ -987,6 +1007,7 @@ impl TraceLatency {
             full_step_floor_ms: fit_full_step_floor(records, &chunk_cost, max_batched_tokens),
             budget_tokens: max_batched_tokens.max(1),
             spec_tokens,
+            output_lens,
             meta,
         })
     }
@@ -1209,6 +1230,13 @@ impl LatencyModel for TraceLatency {
 
     fn spec_tokens(&self) -> Option<u32> {
         self.spec_tokens
+    }
+
+    fn sample_output_len(&self, rng: &mut StdRng) -> Option<usize> {
+        if self.output_lens.is_empty() {
+            return None;
+        }
+        Some(sample_inverse_cdf(rng, &self.output_lens).round().max(1.0) as usize)
     }
 
     fn prefill_chunk_cost(&self, chunk_tokens: usize, kv_depth: usize) -> Duration {
@@ -1658,6 +1686,38 @@ mod tests {
                 "itl out of range: {ms}"
             );
         }
+    }
+
+    #[test]
+    fn sample_output_len_stays_within_recorded_distribution() {
+        // Output lengths span 6..=1193 (the real-capture range that exposed the
+        // EOS gap). Every draw must land inside it, never the max_model_len-scale
+        // value the request carries.
+        let records = vec![
+            make_record(770, 6, 10.0, vec![5.0; 5], 1),
+            make_record(780, 163, 12.0, vec![5.0; 50], 1),
+            make_record(790, 1193, 14.0, vec![5.0; 100], 1),
+        ];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for _ in 0..1000 {
+            let n = trace
+                .sample_output_len(&mut rng)
+                .expect("trace has output lengths");
+            assert!(
+                (6..=1193).contains(&n),
+                "sampled output len out of range: {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn knob_model_does_not_override_output_len() {
+        // No trace -> no EOS distribution -> the engine keeps the request's
+        // max_tokens (None means "don't override").
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        assert_eq!(zero_knob().sample_output_len(&mut rng), None);
     }
 
     #[test]

@@ -86,7 +86,6 @@ flate2 = { workspace = true }
 # Fork patch: adds missing `#[serde(default)]` to EngineCoreSamplingParams so the
 # tap decodes real Python-encoded requests (msgspec omit_defaults drops fields at
 # their default, e.g. `temperature`). Branch off the deployed engine rev
-# 16e91176; upstream PR pending. See
-# deploy/trace-capture/diffusiongemma-mm-frame-findings.md.
+# 16e91176; upstream PR: https://github.com/vllm-project/vllm/pull/45848.
 [patch."https://github.com/vllm-project/vllm.git"]
 vllm-engine-core-client = { git = "https://github.com/wseaton/vllm.git", rev = "492e15503a1098192a366beccab09396e084a21e" }

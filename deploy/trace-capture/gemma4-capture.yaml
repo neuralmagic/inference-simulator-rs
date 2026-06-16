@@ -36,7 +36,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: trace-capture-gemma4
-  namespace: weaton-dev
+  namespace: your-namespace
   labels:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: gemma-4-26B-A4B
@@ -53,7 +53,7 @@ spec:
         llm-d.ai/guide: trace-capture-g4
         llm-d.ai/model: gemma-4-26B-A4B
     spec:
-      serviceAccountName: modelexpress-p2p-nvidia-gpu-vllm-sa
+      serviceAccountName: your-gpu-serviceaccount
       containers:
         # --- Real engine: headless gemma-4 at the protocol-pinned commit ----------
         - name: engine

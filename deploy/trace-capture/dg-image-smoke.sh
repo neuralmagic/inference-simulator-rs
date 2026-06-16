@@ -12,7 +12,7 @@
 # which predates #45417's "unset HF default max_new_tokens" fix.
 set -euo pipefail
 
-NS="${NS:-weaton-dev}"
+NS="${NS:-your-namespace}"
 DEPLOY="${DEPLOY:-trace-capture-diffusiongemma}"
 MODEL="${MODEL:-RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic}"
 IMAGE_URL="${IMAGE_URL:-https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/640px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg}"

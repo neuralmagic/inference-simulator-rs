@@ -11,7 +11,7 @@
 # predates #45417's "unset HF default max_new_tokens" fix.
 set -euo pipefail
 
-NS="${NS:-weaton-dev}"
+NS="${NS:-your-namespace}"
 DEPLOY="${DEPLOY:-trace-capture-gemma4}"
 MODEL="${MODEL:-RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic}"
 PROMPT="${PROMPT:-What is the dominant color of this image? Answer in one sentence.}"

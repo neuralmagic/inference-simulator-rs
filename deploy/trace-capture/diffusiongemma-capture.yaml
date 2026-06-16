@@ -27,8 +27,8 @@
 #     max_new_tokens" fix, so requests MUST set max_tokens explicitly.
 #
 #   - Model RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic is UNGATED
-#     (gated:false), so no HF_TOKEN -- anonymous CDN pull, and we dodge the
-#     namespace's expired hf-token-secret. FP8 is native on H200 (Hopper).
+#     (gated:false), so no HF_TOKEN -- anonymous CDN pull. FP8 is native on
+#     H200 (Hopper).
 #
 # RISKS TO WATCH on first bring-up:
 #   - DiffusionGemma uses model-runner-v2 (VLLM_USE_V2_MODEL_RUNNER=1) + the
@@ -44,7 +44,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: trace-capture-diffusiongemma
-  namespace: weaton-dev
+  namespace: your-namespace
   labels:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: diffusiongemma-26B-A4B
@@ -61,7 +61,7 @@ spec:
         llm-d.ai/guide: trace-capture-dg
         llm-d.ai/model: diffusiongemma-26B-A4B
     spec:
-      serviceAccountName: modelexpress-p2p-nvidia-gpu-vllm-sa
+      serviceAccountName: your-gpu-serviceaccount
       containers:
         # --- Real engine: headless diffusiongemma at the protocol-pinned commit ----------
         - name: engine

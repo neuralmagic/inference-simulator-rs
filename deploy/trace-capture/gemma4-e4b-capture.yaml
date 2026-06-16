@@ -19,7 +19,7 @@
 #     arch to gemma4_mm, so NO newer rev needed.
 #   - Tap reused at the same protocol rev (tap-16e91176-mmfix); NO TAP REBUILD.
 #   - google/gemma-4-E4B-it config + weights are anonymously accessible (gated:none),
-#     so no HF_TOKEN (the namespace hf-token-secret is expired anyway). vision
+#     so no HF_TOKEN (ungated). vision
 #     soft-tokens=280, image_token_id=258880.
 #
 # Ops: handshake once in order; if any container restarts, DELETE the pod. Idle GPU
@@ -29,7 +29,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: trace-capture-gemma4-e4b
-  namespace: weaton-dev
+  namespace: your-namespace
   labels:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: gemma-4-E4B
@@ -46,7 +46,7 @@ spec:
         llm-d.ai/guide: trace-capture-g4e4b
         llm-d.ai/model: gemma-4-E4B
     spec:
-      serviceAccountName: modelexpress-p2p-nvidia-gpu-vllm-sa
+      serviceAccountName: your-gpu-serviceaccount
       containers:
         # --- Real engine: headless gemma-4-E4B at the protocol-pinned commit ------
         - name: engine

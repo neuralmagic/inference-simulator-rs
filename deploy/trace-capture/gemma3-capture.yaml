@@ -19,8 +19,8 @@
 #     newer rev needed.
 #   - Tap reused at the SAME protocol rev (tap-16e91176-mmfix); protocol crate
 #     unchanged, so NO TAP REBUILD.
-#   - RedHatAI/gemma-3-27b-it-FP8-dynamic is UNGATED, anonymous CDN pull (dodges
-#     the namespace's expired hf-token-secret). FP8 native on H200. Dense 27B,
+#   - RedHatAI/gemma-3-27b-it-FP8-dynamic is UNGATED, anonymous CDN pull (no HF
+#     token needed). FP8 native on H200. Dense 27B,
 #     image+text only (no audio), mm_tokens_per_image=256.
 #
 # Ops (same as gemma4): handshake once in order; if any container restarts, DELETE
@@ -30,7 +30,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: trace-capture-gemma3
-  namespace: weaton-dev
+  namespace: your-namespace
   labels:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: gemma-3-27b
@@ -47,7 +47,7 @@ spec:
         llm-d.ai/guide: trace-capture-g3
         llm-d.ai/model: gemma-3-27b
     spec:
-      serviceAccountName: modelexpress-p2p-nvidia-gpu-vllm-sa
+      serviceAccountName: your-gpu-serviceaccount
       containers:
         # --- Real engine: headless gemma-3-27b at the protocol-pinned commit ------
         - name: engine

@@ -1,7 +1,7 @@
 //! End-to-end demo: a REAL gemma-4 multimodal capture replays byte-identically.
 //!
 //! Unlike `diffusion_replay_demo` (synthetic record), this drives the committed
-//! fixture `tests/fixtures/gemma4_mm_trace.jsonl`, captured live on coreweave from
+//! fixture `tests/fixtures/gemma4_mm_trace.jsonl`, captured live on an H200 cluster from
 //! `google/gemma-4-E4B-it` (vLLM 16e91176, H200) through the recording tap with
 //! `--record-tokens`. gemma-4 is a standard AUTOREGRESSIVE multimodal model (no
 //! diffusion blocks), so the records carry plain per-token ITL (`itl_tokens`

@@ -18,7 +18,7 @@
 //! that flag and produces coherent image->text, so it is the canonical gemma-4
 //! multimodal capture here. Either way replay fidelity is the same: the tap
 //! records the engine's REAL token ids and timing and the sim replays them
-//! exactly. See deploy/trace-capture/gemma4-mm-findings.md.
+//! exactly.
 
 use std::time::Duration;
 

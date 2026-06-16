@@ -37,7 +37,7 @@ fn diffusion_record() -> TraceRecord {
     // 2 text + 256 image placeholders + 1 text = 259 prompt tokens.
     let prompt: Vec<u32> = std::iter::once(2u32)
         .chain(std::iter::once(108))
-        .chain(std::iter::repeat(262144).take(256))
+        .chain(std::iter::repeat_n(262144, 256))
         .chain(std::iter::once(108))
         .collect();
     assert_eq!(prompt.len(), 259);

@@ -297,8 +297,8 @@ Two locally-verified facts close the loop on "image sent (DONE) but never arrive
 no error":
 
 **1. A plain libzmq ROUTER silently drops a send to a missing/stale route; only
-`ROUTER_MANDATORY` surfaces it.** Demonstrated with real libzmq
-(`router-mandatory-drop-demo.py`, `uv run --with pyzmq`):
+`ROUTER_MANDATORY` surfaces it.** Demonstrated with real libzmq (a pyzmq probe via
+`uv run --with pyzmq`):
 
 ```
 CASE1 plain-router send to missing route: RETURNED (no error) -> dropped silently
@@ -354,7 +354,7 @@ different, simpler code path).
 ## zmq.rs DEALER, localized live with ROUTER_MANDATORY + a TCP Recv-Q snapshot
 
 Brought the with-tap rig up (`trace-capture-diffusiongemma`, coreweave-waldorf)
-with a one-line addition to `mmdbg_sitecustomize.py`: monkeypatch
+with a one-line frontend `sitecustomize` monkeypatch: patch
 `core_client.make_zmq_socket` to set `ROUTER_MANDATORY=1` on the frontend's input
 ROUTER (handshake ROUTER untouched). Confirmed in the frontend log:
 `[MMDBG] set ROUTER_MANDATORY=1 on input ROUTER socket`.

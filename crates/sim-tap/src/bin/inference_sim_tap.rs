@@ -109,17 +109,14 @@ struct TapOpt {
     #[arg(long)]
     max_num_seqs: Option<u64>,
 
-    /// Set when the engine ran WITHOUT prefix caching (mirrors vLLM's
-    /// `--no-enable-prefix-caching`). Folded into the config hash so a cache-on and
-    /// a cache-off capture of the same workload get distinct fingerprints.
-    #[arg(long)]
-    no_prefix_caching: bool,
-
-    /// Speculative-decode descriptor the engine ran (e.g. `ngram-k3`), or unset for
-    /// standard decoding. A config-hash input, so a spec-decode capture doesn't
-    /// collide with the standard one. The caller sets it to match the engine config.
-    #[arg(long)]
-    speculative: Option<String>,
+    /// Canonical string of the deployed behavioral engine flags (model, tp,
+    /// gpu-mem-util, max-model-len, max-num-seqs, block-size, enforce-eager,
+    /// prefix-caching, speculative, ...), folded into the config hash so two
+    /// different deployments of the same model/hardware get distinct fingerprints.
+    /// The capture driver (gen-capture-jobs.py) builds it; the tap can't observe the
+    /// engine config on the wire. See docs/conformance.md.
+    #[arg(long, default_value = "")]
+    engine_config: String,
 
     /// Token-block size for prompt prefix fingerprints (block_hashes in the
     /// trace). Should match the engine's prefix-cache block size.
@@ -209,8 +206,7 @@ async fn run_main(opt: TapOpt) -> Result<()> {
         block_size: opt.block_size,
         config_hash: opt.config_hash,
         vllm_tag: opt.vllm_version,
-        enable_prefix_caching: !opt.no_prefix_caching,
-        speculative: opt.speculative,
+        engine_config: opt.engine_config,
     };
 
     let config = TapConfig {

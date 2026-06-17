@@ -70,10 +70,34 @@ def engine_args(c: dict) -> list[str]:
     return args
 
 
+def canonical_engine_config(c: dict) -> str:
+    """The deployed behavioral engine flags, canonical (sorted key=value, ';'-joined).
+
+    This is the config_hash's `engine_config` digest input (config_hash.rs v3). Only
+    behavioral knobs go in (no transport/addressing); the sort makes it order-stable.
+    """
+    fields = {
+        "model": c["model"],
+        "tensor_parallel": c["tp"],
+        "gpu_memory_utilization": c["gpu_memory_utilization"],
+        "max_model_len": c["max_model_len"],
+        "max_num_seqs": c["max_num_seqs"],
+        "block_size": c["block_size"],
+        "enforce_eager": bool(c.get("enforce_eager", True)),
+        "enable_prefix_caching": c["scenario"] != "nocache",
+        "speculative": c.get("speculative", "none") if c["scenario"] == "specdecode" else "none",
+    }
+
+    def fmt(v: object) -> str:
+        return "true" if v is True else "false" if v is False else str(v)
+
+    return ";".join(f"{k}={fmt(fields[k])}" for k in sorted(fields))
+
+
 def tap_args(c: dict) -> list[str]:
-    # These feed the config_hash; nocache/specdecode must match the engine flags above so
-    # the fingerprint distinguishes the scenario (see config_hash.rs v2).
-    args = [
+    # --model/--gpu/--tp/--block-size/--max-num-seqs are recorded in the trace meta for
+    # readability; the config_hash itself is gpu + vllm_tag + the engine_config digest.
+    return [
         "--frontend-handshake=tcp://127.0.0.1:5570",
         "--engine-handshake=tcp://127.0.0.1:5580",
         "--input-address=tcp://127.0.0.1:29560",
@@ -85,12 +109,8 @@ def tap_args(c: dict) -> list[str]:
         f"--block-size={c['block_size']}",
         f"--vllm-version={c['vllm_tag']}",
         f"--max-num-seqs={c['max_num_seqs']}",
+        f"--engine-config={canonical_engine_config(c)}",
     ]
-    if c["scenario"] == "nocache":
-        args.append("--no-prefix-caching")
-    elif c["scenario"] == "specdecode":
-        args += ["--speculative", c["speculative"]]
-    return args
 
 
 def env(pairs: dict) -> list[dict]:

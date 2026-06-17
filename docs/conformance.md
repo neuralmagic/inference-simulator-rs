@@ -148,31 +148,33 @@ a config it was not captured for. The tap stamps it into the trace metadata line
 `crates/sim-tap/src/bin/inference_sim_tap.rs` and `crates/sim-trace/src/trace.rs`).
 
 The recipe is `ConfigFingerprint` in `crates/sim-trace/src/config_hash.rs`: a lowercase-hex
-SHA-256 over a versioned, order-fixed canonical form (scheme tag `config-fingerprint-v2`)
-of these inputs, in this order:
+SHA-256 over a versioned, order-fixed canonical form (scheme tag `config-fingerprint-v3`)
+of three inputs:
 
-- `model`, `gpu`, `tp`, `block_size`, `max_num_seqs`
+- `gpu` (hardware, e.g. `H200`)
 - `vllm_tag` (the line tag, e.g. `v0.23.0`)
-- `enable_prefix_caching` (the tap's `--no-prefix-caching` flips it off)
-- `speculative` (the tap's `--speculative <descriptor>`, e.g. `ngram-k3`; `none` when off)
+- `engine_config` — a canonical, sorted digest of the *deployed behavioral* engine flags
+  (model, tensor-parallel, gpu-mem-util, max-model-len, max-num-seqs, block-size,
+  enforce-eager, prefix-caching, speculative config, ...), built by the capture driver.
 
-`vllm_tag` is the line tag, NOT the engine's raw reported version: the engine reports a
-dev build (`0.23.0.dev1+g...`) that is not reproducible across rebuilds, so capture and
-replay must agree on the tag. The engine's reported version is recorded separately in the
-trace meta (`vllm_version`). The prefix-cache and speculative inputs (added in v2) keep a
-cache-off or spec-decode capture from sharing a fingerprint with the plain run of the same
-model/hardware. If the input set ever changes, bump the scheme so old hashes deliberately
-stop matching. (v1 goldens keep their v1 hashes and stay valid: the sim compares the
-stamped hash, it never recomputes.)
+The design rule is **hardware + version + deployed behavioral flags**, deliberately *not*
+a hand-curated field list (the per-knob trap, you'd forever be adding the next one) and
+*not* the entire resolved config: engine defaults aren't enumerated because `vllm_tag`
+pins them, and transport/addressing flags are excluded. `vllm_tag` is the line tag, NOT
+the engine's raw reported version (a dev build `0.23.0.dev1+g...`, not reproducible across
+rebuilds); the reported version is recorded separately in the trace meta (`vllm_version`).
+`engine_config` is what keeps a cache-off, spec-decode, or eager-vs-graph capture from
+sharing a fingerprint with another deployment of the same model/hardware. If the input set
+ever changes, bump the scheme so old hashes deliberately stop matching. (Older goldens keep
+their own scheme's hashes and stay valid: the sim compares the stamped hash, never recomputes.)
 
 Two ways to get the hash:
 
-- Run the tap with `--vllm-version <tag>` (and `--model`/`--gpu`/`--tp`/`--block-size`/
-  `--max-num-seqs`, plus `--no-prefix-caching` and/or `--speculative <descriptor>` to
-  match the engine's scheduler/decode config) and let it compute the fingerprint, stamping
-  `config_hash` into the trace `meta` automatically. This is the default; the manifest
-  entry just copies it. The capture driver sets these tap flags to mirror the engine's
-  actual flags, the tap can't observe them on the wire.
+- Run the tap with `--vllm-version <tag>`, `--gpu <type>`, and `--engine-config <canonical>`
+  (plus `--model`/`--tp`/`--block-size`/`--max-num-seqs` for the readable trace meta) and
+  let it compute the fingerprint, stamping `config_hash` into the trace `meta`. This is the
+  default; `gen-capture-jobs.py` builds the `--engine-config` string (it owns the engine
+  flags, the tap can't observe them on the wire), and the manifest entry just copies the hash.
 - Or pass `--config-hash <hash>` explicitly to override the computed value.
 
 ## Upload + register the golden

@@ -847,12 +847,10 @@ pub struct TapMetaConfig {
     /// build (`0.23.0.dev1+g...`) and not reproducible across rebuilds, so the
     /// tag is what capture and replay must agree on.
     pub vllm_tag: Option<String>,
-    /// Whether the engine ran with prefix caching on (a `config_hash` input). The
-    /// caller passes the engine's actual setting; the tap can't observe it.
-    pub enable_prefix_caching: bool,
-    /// Speculative-decode descriptor the engine ran (e.g. `"ngram-k3"`), or `None`
-    /// for standard decoding (a `config_hash` input, set by the caller).
-    pub speculative: Option<String>,
+    /// Canonical string of the deployed behavioral engine flags (a `config_hash`
+    /// input). The capture driver builds it (it owns the engine args); the tap can't
+    /// observe the engine config on the wire, so an empty string means "unknown".
+    pub engine_config: String,
 }
 
 /// Build the trace meta from the caller's inputs plus what the handshake
@@ -870,14 +868,9 @@ fn build_meta(
             .unwrap_or_else(|| engine_vllm_version.to_string());
         Some(
             ConfigFingerprint {
-                model: meta.model.clone(),
                 gpu: meta.gpu.clone().unwrap_or_default(),
-                tp: meta.tp.unwrap_or(0),
-                block_size: meta.block_size as u32,
-                max_num_seqs: meta.max_num_seqs.unwrap_or(0),
                 vllm_tag,
-                enable_prefix_caching: meta.enable_prefix_caching,
-                speculative: meta.speculative.clone(),
+                engine_config: meta.engine_config.clone(),
             }
             .hash(),
         )
@@ -957,8 +950,7 @@ mod tests {
             block_size: 16,
             config_hash: None,
             vllm_tag: Some("v0.23.0".to_string()),
-            enable_prefix_caching: true,
-            speculative: None,
+            engine_config: "model=Qwen/Qwen3-8B;tensor_parallel=1".to_string(),
         };
         let a = build_meta(&cfg, "0.23.0.dev1+gAAAA", b"payload-a");
         let b = build_meta(&cfg, "0.23.0.dev9+gZZZZ", b"payload-b");

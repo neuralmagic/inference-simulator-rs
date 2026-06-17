@@ -10,6 +10,7 @@ KV-cache bytes over NIXL for prefill/decode testing.
 - [Purpose](#purpose)
 - [Architecture](#architecture)
 - [Status](#status)
+- [Install](#install)
 - [Quick start](#quick-start)
 - [Testing](#testing)
 - [LoRA simulation](#lora-simulation)
@@ -95,19 +96,49 @@ cargo check --features nixl-stub     # macOS gate: typecheck the NIXL path
 cargo test  --features nixl          # Linux: NIXL transfer
 ```
 
-## Quick start
+## Install
 
-Default build (protocol only, no NIXL):
+Requires Rust 1.85 or newer. From a checkout:
 
 ```bash
-cargo run -- --handshake-address tcp://127.0.0.1:29550 --log-requests
+cargo install --path . --locked
 ```
 
-Then point a vLLM frontend at the same handshake address (see vLLM's
-`rust/src/mock-engine/README.md` for the `vllm-rs serve` / `vllm serve` invocations;
-this binary uses the same handshake role as `vllm-mock-engine`).
+That installs `inference-sim` and `inference-sim-trace`. After the repository is
+public, the same default no-NIXL build can be installed from Git:
 
-Smoke request once a frontend is up:
+```bash
+cargo install --git https://github.com/neuralmagic/inference-simulator-rs \
+  --locked inference-simulator-rs
+```
+
+For a NIXL-enabled install, build on Linux with `libnixl` and UCX available:
+
+```bash
+cargo install --path . --locked --features nixl
+```
+
+For the Kubernetes deployment, build the container image instead:
+
+```bash
+podman build -t ghcr.io/neuralmagic/inference-simulator-rs:dev .
+```
+
+## Quick start
+
+### Protocol-only local run
+
+Start the simulator:
+
+```bash
+inference-sim --handshake-address tcp://127.0.0.1:29550 --log-requests
+```
+
+Start a vLLM frontend with the same handshake address. See vLLM's
+`rust/src/mock-engine/README.md` for the `vllm-rs serve` / `vllm serve`
+invocations; this binary uses the same handshake role as `vllm-mock-engine`.
+
+Send a streaming chat request once the frontend is up:
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -115,7 +146,16 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"hello"}],"max_tokens":16,"stream":true}'
 ```
 
-The binary is `inference-sim`; the k8s deployment lives in `deploy/llm-d-pd/`.
+### Prefill/decode control-plane smoke
+
+Run the routing-sidecar schema round trip without NIXL:
+
+```bash
+./scripts/pd_control.sh
+```
+
+For the Kubernetes P/D deployment, build the image from the install section and use
+[deploy/llm-d-pd/README.md](deploy/llm-d-pd/README.md).
 
 ## Testing
 

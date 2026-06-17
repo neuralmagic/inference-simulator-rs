@@ -1,0 +1,124 @@
+name: Release
+
+# Publish standalone `inference-sim` + `inference-sim-tap` binaries as GitHub Release
+# assets, one set per supported vLLM line x platform. These are the lightweight path
+# for users who just want to replay a trace, run the mock engine, or run the tap to
+# capture, without pulling the multi-GB container (which carries UCX + libnixl + vllm-rs
+# for the full P/D + capture topology). The binaries are pure Rust (no NIXL in the
+# default build, the `zeromq` crate is pure Rust), so they build static (musl) on Linux.
+#
+# Per-line because the wire protocol (vllm-engine-core-client rev) is compiled in; the
+# handshake guard aborts loudly if a binary meets a peer on a different line. Tag a
+# release (v*) to publish; workflow_dispatch builds everything as a smoke test without
+# uploading.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # never interrupt an in-progress release upload
+
+permissions:
+  contents: write # create the release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # Cross compat.toml lines with the target platforms into one matrix: a build per
+  # (line, platform). Mirrors ci.yml's compat-matrix but emits the platform fan-out too.
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.parse.outputs.include }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Build the line x platform matrix
+        id: parse
+        run: |
+          include=$(python3 - <<'PY'
+          import json, tomllib
+          # Native per-arch runners (no cross-compile): Linux targets build static musl,
+          # macOS builds its native arm64. Add platforms here to widen the fan-out.
+          platforms = [
+              {"runner": "ubuntu-latest",    "target": "x86_64-unknown-linux-musl",  "os": "linux"},
+              {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-musl", "os": "linux"},
+              {"runner": "macos-14",         "target": "aarch64-apple-darwin",       "os": "macos"},
+          ]
+          with open("compat.toml", "rb") as f:
+              lines = tomllib.load(f).get("vllm", [])
+          rows = []
+          for v in lines:
+              for p in platforms:
+                  rows.append({
+                      "line": v["line"],
+                      "tag": v["tag"],
+                      "protocol_rev": v["protocol_rev"],
+                      **p,
+                  })
+          print(json.dumps(rows, separators=(",", ":")))
+          PY
+          )
+          echo "include=${include}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      # Stamp the line so build.rs emits the right capability cfgs + advertised version
+      # (a non-vX.Y tag like "nightly" is treated as newest).
+      VLLM_TARGET_VERSION: ${{ matrix.tag }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          target: ${{ matrix.target }}
+
+      # musl-tools provides the musl linker for the static Linux builds. (No-op on macOS.)
+      - name: Install musl toolchain (Linux)
+        if: ${{ matrix.os == 'linux' }}
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Pin Cargo.toml to this line's rev + fork patch (see ci/pin-vllm-rev.py). The rev
+      # then no longer matches Cargo.lock, so the build omits --locked.
+      - name: Pin vLLM rev (line ${{ matrix.line }})
+        run: python3 ci/pin-vllm-rev.py "${{ matrix.line }}"
+
+      # Default features only: no NIXL, so these stay small pure-Rust binaries.
+      - name: Build inference-sim + inference-sim-tap (${{ matrix.target }})
+        run: cargo build --release --target "${{ matrix.target }}" -p inference-simulator-rs -p sim-tap
+
+      - name: Package
+        id: pkg
+        run: |
+          set -euo pipefail
+          name="inference-sim-vllm${{ matrix.line }}-${{ matrix.target }}"
+          mkdir -p dist staging
+          bindir="target/${{ matrix.target }}/release"
+          cp "$bindir/inference-sim" "$bindir/inference-sim-tap" staging/
+          tar -C staging -czf "dist/${name}.tar.gz" inference-sim inference-sim-tap
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          ls -la dist/
+
+      # On a tag: publish to the release. On workflow_dispatch: smoke only (the build
+      # above is the test). `gh release create || true` is idempotent across the matrix.
+      - name: Upload to release
+        if: ${{ github.ref_type == 'tag' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" --generate-notes --verify-tag 2>/dev/null || true
+          gh release upload "${{ github.ref_name }}" dist/* --clobber

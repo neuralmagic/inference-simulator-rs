@@ -14,13 +14,11 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::mock_engine::{MockCoordinatorSockets, MockEngineDataSockets, MockEngineSockets};
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::Serialize;
 use tokio::time::timeout;
 use vllm_engine_core_client::EngineId;
-use vllm_engine_core_client::mock_engine::{
-    MockCoordinatorSockets, MockEngineDataSockets, MockEngineSockets,
-};
 use vllm_engine_core_client::protocol::handshake::{HandshakeInitMessage, ReadyMessage};
 use vllm_engine_core_client::protocol::{ModelDtype, decode_msgpack, encode_msgpack};
 use zeromq::prelude::{Socket as _, SocketRecv as _, SocketSend as _};

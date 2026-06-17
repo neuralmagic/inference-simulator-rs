@@ -84,20 +84,28 @@ Image tags:
 
 ## CI matrix mechanics
 
-Cargo's git rev isn't env-overridable on stable, but `--config` patching is. A
-small step reads `compat.toml` and, per matrix entry, overrides the rev:
+The rev is swapped in `Cargo.toml`, NOT via `--config` patching. Cargo rejects a
+`[patch]` that points a git dependency at a different rev of the **same** source
+("patches must point to different sources"), so `--config 'patch...rev=...'`
+fails for every line (including the head). The per-line build instead rewrites
+the manifest in a throwaway checkout:
 
 ```sh
-cargo build --config \
-  'patch."https://github.com/vllm-project/vllm.git".vllm-engine-core-client.rev="<protocol_rev>"'
+python3 ci/pin-vllm-rev.py "<line>"   # reads compat.toml, edits Cargo.toml
+cargo build --workspace               # no --locked: the rev changed
 ```
 
-(Alternative: template the workspace `Cargo.toml` rev per entry in a throwaway
-build dir. Either works; the artifact is not committed.)
+`pin-vllm-rev.py` sets the rev in `[workspace.dependencies]` and rewrites or
+removes the fork `[patch]` from the line's `patch_repo`/`patch_rev` (the head
+line carries the #45848 fork; lines without a fork build against `protocol_rev`
+upstream). `compat.toml` stays the single source of truth.
 
-On `main` and tags the matrix builds + runs `e2e*.sh` + the replay gates against
-**all four lines**. That is the payoff: the day vLLM N+1 lands, the matrix tells
-us whether the wire still parses before we promote anything.
+On `main` and tags the matrix builds + runs the replay gates against every line.
+That is the payoff: the day vLLM N+1 lands, the matrix tells us whether the wire
+still parses before we promote anything. Lines that are not yet
+`fidelity_validated` run non-gating (job-level `continue-on-error`), so a line
+with real API drift (e.g. a removed `mock_engine` module) surfaces as a
+non-blocking annotation rather than blocking the merge.
 
 ## Handshake version guard (do regardless of path)
 
@@ -119,10 +127,13 @@ When vLLM cuts N+1:
 ## Build order
 
 1. `compat.toml` + handshake version guard. Small, immediately useful, makes
-   mismatches loud.
-2. Manifest-driven CI matrix. The real automation payoff.
-3. Per-version protocol modules behind a trait — only if we later want a single
-   multi-version binary, and only while the surface stays ~6 types.
+   mismatches loud. **Done.**
+2. Manifest-driven CI matrix + conformance runner. The real automation payoff.
+   **Done** (per-line build/unit/conformance; see `conformance.md`).
+3. Compatibility shim for the protocol crate's per-line API drift. **Done** for
+   the 0.22 line; see `multi-version-shim.md` (capability cfgs + owned/tolerant
+   decodes, `ci/pin-vllm-rev.py`). This is what lets one `main` build against
+   multiple lines without a single multi-version binary.
 
 ## Open coupling note: the `block_size` / registration drift
 
@@ -140,3 +151,40 @@ schema drift the matrix is meant to track; if upstream ever adds `block_size` to
 the Rust struct we can drop `SimReadyResponse` for that line, but until then the
 superset stays. Keep the `sim_ready_response_carries_all_python_required_fields`
 test as the canary.
+
+## Conformance testing
+
+The matrix above answers "does this line still build and parse the wire." Fidelity
+(does the sim still reproduce the engine's behavior for a line) is answered by
+conformance testing: a profile-once/replay-many loop that pairs a manifest of golden
+captures with a GPU-free replay in CI. The capture runbook is
+[conformance.md](conformance.md); this section ties the pieces together.
+
+Three artifacts cooperate:
+
+- **`compat.toml`** — the N-3 window (above). Each line carries `fidelity_validated`,
+  which gates whether its conformance failures block promotion.
+- **`conformance/manifest.toml`** — one `[[golden]]` entry per captured trace, with
+  `line`, `bucket_path`, `sha256`, `config_hash`, `workload`, and `role` (`schema` or
+  `fidelity`). The captures themselves are NOT in the repo; they live in a private
+  bucket and CI fetches them by sha.
+- **The capture runbook** ([conformance.md](conformance.md)) — how a golden gets
+  captured on the GPU cluster, uploaded, and registered.
+
+The CI flow (`.github/workflows/ci.yml`):
+
+1. `compat-matrix` parses `compat.toml` into a per-line build matrix.
+2. The `conformance` matrix job builds + tests each line against its own
+   `protocol_rev` (the `--config` patch from "CI matrix mechanics"), then fetches that
+   line's goldens by sha, verifies the sha256, and replays them GPU-free, asserting the
+   trace's `config_hash` (the profile-once/replay-many cache key, `--expect-config-hash`).
+3. Lines with `fidelity_validated = false` build and run conformance, but their
+   fidelity failures are continue-on-error (see "Rotation when N advances"): a freshly
+   added line gets signal without blocking the merge. Flip `fidelity_validated = true`
+   once the golden validates, and the leg becomes a hard gate.
+
+The replay-many half needs no GPU and is the same mechanism as the offline replay rig
+(`deploy/trace-capture/offline-replay.yaml`): the python frontend talks to
+`inference-sim` serving the captured trace, no engine, no card. CI runs it headlessly;
+the rig serves a live agent the same byte-identical streams.
+

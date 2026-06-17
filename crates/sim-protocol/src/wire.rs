@@ -6,7 +6,26 @@
 //! it owns from outside it. Free functions sidestep that entirely.
 
 use sim_trace::trace::TraceFinishReason;
-use vllm_engine_core_client::protocol::EngineCoreFinishReason;
+use vllm_engine_core_client::protocol::{EngineCoreFinishReason, EngineCoreRequestType};
+
+/// Decode the single-byte request-type frame on the engine input socket.
+///
+/// Reproduces `EngineCoreRequestType::from_frame`, which exists on the head
+/// crate but not on older lines (0.22 has only `to_frame`). The encoding is
+/// stable: one byte, 0=Add, 1=Abort, 2=StartDpWave, 3=Utility. Owning it here
+/// keeps the decode path building across revs.
+pub fn request_type_from_frame(frame: &[u8]) -> Option<EngineCoreRequestType> {
+    let [value] = frame else {
+        return None;
+    };
+    match value {
+        0 => Some(EngineCoreRequestType::Add),
+        1 => Some(EngineCoreRequestType::Abort),
+        2 => Some(EngineCoreRequestType::StartDpWave),
+        3 => Some(EngineCoreRequestType::Utility),
+        _ => None,
+    }
+}
 
 /// Map a wire finish reason to its trace-schema form.
 pub fn trace_finish_reason(reason: EngineCoreFinishReason) -> TraceFinishReason {

@@ -49,8 +49,6 @@ pub enum PdRole {
 pub struct NixlConfig {
     /// Bytes per KV block (one paged slot in the registered pool).
     pub kv_block_bytes: usize,
-    /// Prompt tokens that map to one KV block.
-    pub tokens_per_block: usize,
     /// Total KV-cache capacity in blocks. The prefill registers one contiguous pool of
     /// `kv_cache_blocks * kv_block_bytes`, so block `i` lives at `pool_base + i*kv_block_bytes`.
     pub kv_cache_blocks: usize,

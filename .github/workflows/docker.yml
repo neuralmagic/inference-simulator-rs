@@ -1,8 +1,14 @@
 name: Docker
 
 # Build the GPU-free model-server image (UCX + libnixl + vllm-rs + the mock engine) and
-# push it to GHCR. Kept off the fast CI lane: the from-source libnixl/UCX build is slow, so
-# this only runs on the main line, release tags, and manual dispatch (all trusted refs).
+# push it to GHCR, one image per supported vLLM line. Kept off the fast CI lane: the
+# from-source libnixl/UCX build is slow, so this only runs on the main line, release tags,
+# and manual dispatch (all trusted refs).
+#
+# Per-line tagging (docs/versioning.md "Versioning"):
+#   inference-sim:<simver>-vllm<line>   immutable, the real artifact (sim ver x vLLM line)
+#   inference-sim:vllm<line>            floating, -> latest sim for that line
+#   inference-sim:latest                sim-head x the default=true line only
 on:
   push:
     branches: [main]
@@ -19,8 +25,76 @@ permissions:
   packages: write
 
 jobs:
-  build-push:
+  # Parse compat.toml into the build matrix and read the sim semver from the workspace
+  # Cargo.toml. Both are needed by the per-line image build below. Mirrors the CI
+  # compat-matrix job; kept here so docker.yml is self-contained on its own triggers.
+  compat-matrix:
     runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.parse.outputs.include }}
+      simver: ${{ steps.simver.outputs.simver }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Parse compat.toml into a build matrix
+        id: parse
+        run: |
+          include=$(python3 - <<'PY'
+          import json, tomllib
+          with open("compat.toml", "rb") as f:
+              compat = tomllib.load(f)
+          rows = []
+          for v in compat.get("vllm", []):
+              rows.append({
+                  "line": v["line"],
+                  "tag": v["tag"],
+                  "protocol_rev": v["protocol_rev"],
+                  # Fork override (a DIFFERENT source than vllm.git) or "" when the
+                  # line builds upstream. Both the tap (via pin-vllm-rev.py) and the
+                  # vllm-rs frontend below build against the fork when set, so they
+                  # stay wire-identical.
+                  "patch_repo": v.get("patch_repo", ""),
+                  "patch_rev": v.get("patch_rev", ""),
+                  "fidelity_validated": bool(v.get("fidelity_validated", False)),
+                  "default": bool(v.get("default", False)),
+              })
+          print(json.dumps(rows, separators=(",", ":")))
+          PY
+          )
+          echo "include=${include}" >> "$GITHUB_OUTPUT"
+
+      # Sim semver is build metadata orthogonal to the vLLM line (docs/versioning.md
+      # "keep the two axes orthogonal"). Read it from [workspace.package].version.
+      - name: Read sim semver from Cargo.toml
+        id: simver
+        run: |
+          simver=$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as f:
+              cargo = tomllib.load(f)
+          print(cargo["workspace"]["package"]["version"])
+          PY
+          )
+          echo "simver=${simver}" >> "$GITHUB_OUTPUT"
+
+  build-push:
+    needs: compat-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      # One image per line; don't cancel siblings if one line fails to build.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.compat-matrix.outputs.include) }}
+    env:
+      SIMVER: ${{ needs.compat-matrix.outputs.simver }}
+      # The vllm-rs frontend baked into the image must speak the same wire as the
+      # tap, so it's built from this line's source: the fork when the line has one,
+      # else upstream vllm.git at protocol_rev. (The tap itself is pinned by
+      # pin-vllm-rev.py below.)
+      FRONTEND_REPO: ${{ matrix.patch_repo != '' && matrix.patch_repo || 'https://github.com/vllm-project/vllm.git' }}
+      FRONTEND_REF: ${{ matrix.patch_rev != '' && matrix.patch_rev || matrix.protocol_rev }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -35,26 +109,49 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Pin the workspace Cargo.toml to this line's rev + fork patch BEFORE the build
+      # context is sent. Cargo rejects patching a git dep to a different rev of the
+      # same source, so the rev is swapped in [workspace.dependencies] and the fork
+      # [patch] inserted/removed here (see ci/pin-vllm-rev.py). The Dockerfile then
+      # compiles the rewritten manifest without --locked. This replaces the old
+      # CARGO_PATCH build-arg, which used the rejected --config mechanism.
+      - name: Pin vLLM rev (line ${{ matrix.line }})
+        run: python3 ci/pin-vllm-rev.py "${{ matrix.line }}"
+
+      # Per-line tag set. The immutable <simver>-vllm<line> and the floating vllm<line>
+      # always ship; :latest only attaches to the default=true line on the default branch.
+      # TODO(registry path): images publish under ghcr.io/<repo>; if a different registry
+      # or repo name is required, set it here.
       - name: Image metadata (tags + labels)
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=sha,format=long
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ env.SIMVER }}-vllm${{ matrix.line }}
+            type=raw,value=vllm${{ matrix.line }}
+            type=raw,value=latest,enable=${{ matrix.default && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
       # linux/amd64 only for now: arm64 would cross-build libnixl/UCX under QEMU (very slow).
-      # The buildx GHA cache makes repeat builds reuse the heavy UCX/libnixl layers.
-      - name: Build and push
+      # The buildx GHA cache makes repeat builds reuse the heavy UCX/libnixl layers; the
+      # cache scope is per-line so lines don't clobber each other's protocol-crate layers.
+      #
+      # The tap's protocol rev is already pinned in the context (Cargo.toml rewritten by
+      # the pin step above). VLLM_TARGET_VERSION stamps build.rs so it emits the right
+      # capability cfgs + advertised version for this line (without it, build.rs falls
+      # back to the compat.toml default for every leg). VLLM_REPO/VLLM_REF point the
+      # vllm-rs frontend build at the same source as the tap.
+      - name: Build and push (vLLM ${{ matrix.line }} @ ${{ matrix.tag }})
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           platforms: linux/amd64
           push: true
+          build-args: |
+            VLLM_TARGET_VERSION=${{ matrix.tag }}
+            VLLM_REPO=${{ env.FRONTEND_REPO }}
+            VLLM_REF=${{ env.FRONTEND_REF }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=vllm${{ matrix.line }}
+          cache-to: type=gha,mode=max,scope=vllm${{ matrix.line }}

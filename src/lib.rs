@@ -11,18 +11,17 @@
 
 use anyhow::{Context as _, Result, bail};
 use clap::Parser;
+use sim_protocol::mock_engine::{DEFAULT_MOCK_MAX_MODEL_LEN, MockEngineSockets, default_dtype};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use vllm_engine_core_client::EngineId;
-use vllm_engine_core_client::mock_engine::{
-    DEFAULT_MOCK_MAX_MODEL_LEN, MockEngineSockets, default_ready_response,
-};
 use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
 pub mod blockpool;
 pub mod calibrate;
+pub mod conformance;
 pub mod dataplane;
 mod engine;
 mod engine_core;
@@ -38,7 +37,7 @@ mod tokens;
 // handshake, kv_transfer_params, finish-reason conversions) lives in
 // `sim-protocol`. Re-export both under the original paths so existing
 // `crate::trace` / `crate::frontend_connect` references keep working unchanged.
-pub use sim_protocol::{frontend_connect, kvparams, wire};
+pub use sim_protocol::{frontend_connect, kvparams, mock_engine, wire};
 pub use sim_trace::{latency, trace, trace_convert};
 
 use dataplane::PdRole;
@@ -87,6 +86,12 @@ pub enum SchedulingPolicy {
     /// Priority order: smaller `priority` value first, ties broken by earlier arrival.
     Priority,
 }
+
+/// The vLLM line this build targets, stamped by `build.rs` from the
+/// `compat.toml` default line (or the CI matrix's `VLLM_TARGET_VERSION`
+/// override). This is what the registration ready response advertises and what
+/// the handshake guard checks peers against.
+pub const VLLM_TARGET_VERSION: &str = env!("VLLM_TARGET_VERSION");
 
 /// Mock engine-core backend for frontend + prefill/decode data-plane testing.
 #[derive(Debug, Clone, Parser)]
@@ -151,6 +156,14 @@ pub struct Opt {
     /// (default) disables the check.
     #[arg(long, default_value = "")]
     pub expect_config_hash: String,
+
+    /// vLLM version this engine advertises in the registration ready response.
+    /// Defaults to the build's target line (stamped from `compat.toml` at build
+    /// time, or overridden by the CI matrix via the `VLLM_TARGET_VERSION` env);
+    /// set this only for capture runs that must mimic an exact tag. Empty means
+    /// "use the build stamp".
+    #[arg(long, default_value = "")]
+    pub vllm_version: String,
 
     /// Base seed for deterministic random token generation.
     #[arg(long, default_value_t = 0)]
@@ -505,6 +518,16 @@ impl Opt {
             || self.prefill_time_std_dev != 0
     }
 
+    /// The vLLM version this engine advertises: the `--vllm-version` override
+    /// when set, otherwise the line stamped in at build time from `compat.toml`.
+    pub fn target_vllm_version(&self) -> &str {
+        if self.vllm_version.is_empty() {
+            VLLM_TARGET_VERSION
+        } else {
+            self.vllm_version.as_str()
+        }
+    }
+
     /// Verify each provided trace was captured under the expected config hash.
     /// No-op when `--expect-config-hash` is empty. Bails if a trace is missing
     /// the hash or carries a different one, so a stale/wrong trace cannot be
@@ -585,7 +608,6 @@ async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) ->
     // response so the frontend validates against what this engine enforces.
     // This is sim-owned (not the crate's EngineCoreReadyResponse) because the
     // python frontend requires `block_size`, which the crate's struct lacks.
-    let defaults = default_ready_response();
     let ready_payload = frontend_connect::SimReadyResponse {
         max_model_len: if opt.max_model_len > 0 {
             opt.max_model_len
@@ -595,8 +617,8 @@ async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) ->
         num_gpu_blocks: opt.kv_cache_size,
         block_size: opt.tokens_per_block as u64,
         dp_stats_address: None,
-        dtype: defaults.dtype,
-        vllm_version: defaults.vllm_version,
+        dtype: default_dtype(),
+        vllm_version: opt.target_vllm_version().to_string(),
     }
     .encode()?;
 

@@ -1,4 +1,4 @@
-# The money shot: live agent capture -> zero-GPU byte-identical replay
+# Agent replay: live agent capture -> zero-GPU byte-identical replay
 
 One demo, two acts: Claude Code does a coding task against a real H200, every
 token is recorded on the wire by the tap, the GPU is scaled to zero on
@@ -21,15 +21,15 @@ simulator and produces the identical file.
 
 ```bash
 just agentic-capture-up            # wait for 4/4 (engine downloads ~61GB once)
-kubectl -n weaton-dev port-forward deploy/trace-capture-h200-agentic 8000:8000 &
+kubectl -n "${NAMESPACE:-inference-sim}" port-forward deploy/trace-capture-h200-agentic 8000:8000 &
 just replay-up                     # sim waits for a trace; frontend boots
 # after act 1 produces the trace:
-kubectl -n weaton-dev port-forward deploy/offline-replay 8001:8000 &
+kubectl -n "${NAMESPACE:-inference-sim}" port-forward deploy/offline-replay 8001:8000 &
 ```
 
 ## Recording
 
-- `vhs demo/money-shot.tape` renders `demo/money-shot.gif` deterministically
+- `vhs demo/agent-replay.tape` renders `demo/agent-replay.gif` deterministically
   from the tape. Re-render any time the sim improves; no human in the loop.
   Trim the act-1 `Sleep` to match real agent latency.
 - For an interactive-feel take instead, `asciinema rec demo.cast`, drive the

@@ -43,7 +43,7 @@ spec:
             allowPrivilegeEscalation: false
       containers:
         - name: modelserver
-          image: quay.io/wseaton/mock-engine-nixl:amd64
+          image: ghcr.io/neuralmagic/inference-simulator-rs:vllm0.23
           imagePullPolicy: Always
           env:
             - name: MODEL

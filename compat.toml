@@ -1,0 +1,73 @@
+# compat.toml -- the rolling vLLM support window.
+#
+# Source of truth for which vLLM lines this repo builds and conforms against.
+# The manifest diff *is* the release: adding/removing a [[vllm]] entry or
+# flipping `fidelity_validated` advances the window. Parsed by `sim-compat`
+# (build.rs stamps the default line's tag as VLLM_TARGET_VERSION + emits the
+# per-line capability cfgs; the handshake guard and conformance runner read it).
+#
+# Rules:
+#   - `protocol_rev` is the vllm.git rev whose in-tree `vllm-engine-core-client`
+#     this line builds against. vLLM cuts release branches off main, so these are
+#     v0.X-era main commits, not the tagged releases; the `tag` is the line label.
+#   - `patch_repo`/`patch_rev` (optional, both-or-neither): a fork that
+#     `[patch]`-overrides the crate for fixes not yet upstream (a DIFFERENT source
+#     than vllm.git). Omit when the line builds against upstream directly. NOTE:
+#     the older lines below pin the external `wseaton/vllm` serde-defaults fork;
+#     building those lines needs that fork to stay reachable (mirror it into the
+#     org if you want them to survive the fork going away). The default line
+#     builds against upstream and has no such dependency.
+#   - Exactly one line has `default = true`. That line is `:latest` / unsuffixed.
+#   - A line enters with `fidelity_validated = false` and is promoted to `true`
+#     only once the conformance replay gates pass against its captures.
+#   - The `nightly` line is special: it tracks vLLM main (post-merge commits), so
+#     its `tag` is the literal `"nightly"` rather than a release. Its `protocol_rev`
+#     is bumped to the latest main sha to catch wire drift before a release lands.
+#     build.rs treats a non-`vX.Y` tag as the newest line (all capability cfgs on).
+
+[[vllm]]
+# Bleeding edge: tracks vLLM main so the build/conformance matrix flags wire drift
+# the day a post-merge commit breaks it. No fork (main already carries #45848).
+# Bump protocol_rev to the latest main sha regularly (eventually via automation).
+line = "nightly"
+tag = "nightly"
+protocol_rev = "9c7c74bf1023774cf0e247bf77a038989ee272db"
+fidelity_validated = false
+
+[[vllm]]
+# N (head). 17bc1445 is the post-#45848 main commit (serde-default fix upstream
+# as of 2026-06-17), so no fork patch. Builds + conformance + unit tests green.
+line = "0.23"
+tag = "v0.23.0"
+protocol_rev = "17bc1445562435b608041d434e9738440954159c"
+fidelity_validated = false
+default = true
+
+[[vllm]]
+# N-1. Builds against the 0.22 crate (0decac0d), patched to the wseaton/vllm
+# serde-defaults fork. The compat shim absorbs the build-time API drift (absent
+# mock_engine, untyped lora, no ready vllm_version, client-only utility); the
+# fork backports vllm-project/vllm#45848 so the *capture* path can decode real
+# msgspec omit_defaults requests (the upstream 0.22 EngineCoreSamplingParams has
+# no field defaults). fidelity_validated stays false until captures exist.
+line = "0.22"
+tag = "v0.22.1"                                                # released 2026-06-04
+protocol_rev = "0decac0d96c42b49572498019f0a0e3600f50398"
+patch_repo = "https://github.com/wseaton/vllm.git"
+patch_rev = "b48f2434d7f523840a74e9f4b96b4499c1323a8f"
+fidelity_validated = false
+
+[[vllm]]
+# N-2. The Rust `vllm-engine-core-client` crate did not exist at the v0.21.0 tag
+# (the rust/ tree was added after 0.21), so there is no 0.21 rev to build against.
+# 0.21 is therefore capture-driven: it builds against the SAME 0.22 crate + fork
+# as the 0.22 line (identical wire as far as the client types go), and is
+# distinguished only by its tag label and its own goldens. The capture proves
+# whether the 0.21 engine's wire actually matches; if it diverges, this line gets
+# its own shim. fidelity_validated stays false until a 0.21 golden validates.
+line = "0.21"
+tag = "v0.21.0"
+protocol_rev = "0decac0d96c42b49572498019f0a0e3600f50398"
+patch_repo = "https://github.com/wseaton/vllm.git"
+patch_rev = "b48f2434d7f523840a74e9f4b96b4499c1323a8f"
+fidelity_validated = false

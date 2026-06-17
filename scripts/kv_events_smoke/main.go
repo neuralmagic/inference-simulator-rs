@@ -92,8 +92,8 @@ func main() {
 		for _, e := range batch.Events {
 			switch ev := e.(type) {
 			case *kvevents.BlockStoredEvent:
-				fmt.Printf("  BlockStored hashes=%v tokens=%d parent=%d size=%d tier=%q\n",
-					ev.BlockHashes, len(ev.Tokens), ev.ParentHash, ev.BlockSize, ev.DeviceTier)
+				fmt.Printf("  BlockStored hashes=%v tokens=%d parent=%d tier=%q\n",
+					ev.BlockHashes, len(ev.Tokens), ev.ParentHash, ev.DeviceTier)
 				sawStored = true
 			case *kvevents.BlockRemovedEvent:
 				fmt.Printf("  BlockRemoved hashes=%v tier=%q\n", ev.BlockHashes, ev.DeviceTier)

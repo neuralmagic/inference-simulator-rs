@@ -7,18 +7,36 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use serde_tuple::Deserialize_tuple;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use vllm_engine_core_client::protocol::utility::EngineCoreUtilityRequest;
+use vllm_engine_core_client::protocol::utility::UtilityCallId;
 use vllm_engine_core_client::protocol::{EngineCoreOutputs, EngineCoreRequest};
+
+/// The engine-core utility request (`add_lora` / `remove_lora` /
+/// `reset_prefix_cache`).
+///
+/// We decode the wire tuple `(client_index, call_id, method_name, args)`
+/// ourselves rather than via the crate's `EngineCoreUtilityRequest`: that type
+/// only derives `Deserialize` on 0.23+ (the crate was client-only on 0.22), and
+/// the mock engine is the decoding side. Field order and the tuple encoding
+/// match the crate exactly (`OpaqueValue` is `rmpv::Value`), so it reads the
+/// same bytes on every supported line.
+#[derive(Debug, Clone, Deserialize_tuple)]
+pub(crate) struct UtilityRequestSpec {
+    pub client_index: u32,
+    pub call_id: UtilityCallId,
+    pub method_name: String,
+    pub args: rmpv::Value,
+}
 
 /// Message sent from the IO loop to the engine task to drive the engine loop.
 pub(crate) enum EngineInput {
     Request(Box<EngineCoreRequest>),
     Abort(Vec<String>),
-    Utility(EngineCoreUtilityRequest),
+    Utility(UtilityRequestSpec),
     StartDpWave,
 }
 

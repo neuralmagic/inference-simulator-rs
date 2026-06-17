@@ -40,7 +40,7 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, info};
 
-use sim_tap::tap::{TapConfig, TokenRecording, run_tap, write_meta};
+use sim_tap::tap::{TapConfig, TapMetaConfig, TokenRecording, run_tap};
 use sim_trace::trace::TraceWriter;
 
 #[derive(Debug, Parser)]
@@ -91,9 +91,32 @@ struct TapOpt {
     /// Config hash recorded in the trace metadata line. This is the CI
     /// profile-once/replay-many cache key; the sim checks it at replay
     /// (`--expect-config-hash`) so a trace cannot be replayed against a config
-    /// it was not captured for.
+    /// it was not captured for. When omitted, the tap computes the canonical
+    /// fingerprint from --model/--gpu/--tp/--block-size/--max-num-seqs and the
+    /// --vllm-version tag, so capture and replay derive the same value.
     #[arg(long)]
     config_hash: Option<String>,
+
+    /// vLLM tag this capture targets (e.g. "v0.23.0"). Guards the real engine's
+    /// reported version (matched on the major.minor line) so a mislabelled
+    /// capture aborts, and is the reproducible vLLM input to the computed
+    /// config hash. The engine's own reported version is recorded separately.
+    #[arg(long)]
+    vllm_version: Option<String>,
+
+    /// Scheduler concurrency ceiling (max_num_seqs) recorded in the meta line
+    /// and folded into the computed config hash.
+    #[arg(long)]
+    max_num_seqs: Option<u64>,
+
+    /// Canonical string of the deployed behavioral engine flags (model, tp,
+    /// gpu-mem-util, max-model-len, max-num-seqs, block-size, enforce-eager,
+    /// prefix-caching, speculative, ...), folded into the config hash so two
+    /// different deployments of the same model/hardware get distinct fingerprints.
+    /// The capture driver (gen-capture-jobs.py) builds it; the tap can't observe the
+    /// engine config on the wire. See docs/conformance.md.
+    #[arg(long, default_value = "")]
+    engine_config: String,
 
     /// Token-block size for prompt prefix fingerprints (block_hashes in the
     /// trace). Should match the engine's prefix-cache block size.
@@ -173,14 +196,18 @@ fn main() -> ExitCode {
 async fn run_main(opt: TapOpt) -> Result<()> {
     let mut writer = TraceWriter::create(Path::new(&opt.trace_out))?;
 
-    write_meta(
-        &mut writer,
-        &opt.model,
-        opt.gpu.as_deref(),
-        opt.tp,
-        opt.block_size,
-        opt.config_hash.as_deref(),
-    )?;
+    // The meta line is written by run_tap after the handshake, so it can stamp
+    // the engine's reported version and raw ready-response bytes.
+    let meta = TapMetaConfig {
+        model: opt.model,
+        gpu: opt.gpu,
+        tp: opt.tp,
+        max_num_seqs: opt.max_num_seqs,
+        block_size: opt.block_size,
+        config_hash: opt.config_hash,
+        vllm_tag: opt.vllm_version,
+        engine_config: opt.engine_config,
+    };
 
     let config = TapConfig {
         frontend_handshake: opt.frontend_handshake,
@@ -200,7 +227,7 @@ async fn run_main(opt: TapOpt) -> Result<()> {
     let shutdown = shutdown_signal();
     // Finalize the writers even when the proxy dies on a transport error: a
     // gzip stream without its trailer reads as truncated.
-    let result = run_tap(config, &mut writer, step_writer.as_mut(), shutdown).await;
+    let result = run_tap(config, meta, &mut writer, step_writer.as_mut(), shutdown).await;
     writer.finish()?;
     if let Some(step_writer) = step_writer {
         step_writer.finish()?;

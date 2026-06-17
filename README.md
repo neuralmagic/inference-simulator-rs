@@ -25,6 +25,7 @@ model**.
   - [Replay pacing](#replay-pacing)
   - [Speculative decoding and diffusion](#speculative-decoding-and-diffusion)
 - [Dependencies of note](#dependencies-of-note)
+- [License](#license)
 
 ## Why
 
@@ -171,7 +172,7 @@ engine that reuses the loop.
 | Trait | File | Default | What it controls |
 |---|---|---|---|
 | `TokenSource` | `src/tokens.rs` | `RandomTokens` | Which token ids each request emits. `EchoTokens` replays the prompt. |
-| `LatencyModel` | `src/latency.rs` | `KnobLatency` | TTFT and inter-token pacing. `FixedLatency` gives constant delays with no rng draws. |
+| `LatencyModel` | `crates/sim-trace/src/latency.rs` | `KnobLatency` | TTFT and inter-token pacing. `FixedLatency` gives constant delays with no rng draws. |
 | `Scheduler` | `src/sched.rs` | `Fcfs` | Waiting-queue admission order. `Priority` uses `(priority, arrival_time)`. `ShortestPromptFirst` picks the smallest prompt. |
 
 Defaults are wired in `SimEngine::new` (from CLI flags) and in `run()`.
@@ -579,3 +580,8 @@ a GPU by `tests/spec_replay_fidelity.rs` and `replay_steps`/engine unit tests.
 - `nixl-sys` — pinned git dep on `ai-dynamo/nixl` (`rev` in `Cargo.toml`), the same
   source the image builds `libnixl` from, so the crate resolves identically on macOS
   (stub) and in the container (real lib).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT), at your option.

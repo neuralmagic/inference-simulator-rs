@@ -8,21 +8,26 @@
 ARG FEDORA_VERSION=42
 # Keep NIXL_REF in lockstep with Cargo.toml's git dep so the data-plane ABI matches.
 ARG NIXL_REF=41685d39
-# The vllm-rs frontend source. Defaults to upstream vLLM at c9340e6f3, the exact commit
-# our engine-core-client Cargo dep is pinned to, so the frontend, the tap, and a real
-# engine built from the same commit are all wire-identical (the msgspec data-path structs
-# are positional; do not mix revs).
-#
-# The `vllm:lora_requests_info` gauge is upstream as of #45030 (frontend-derived; the
-# engine no longer reports per-adapter maps in SchedulerStats), so no fork is needed.
+# The vllm-rs frontend source. The msgspec data-path structs are positional, so the
+# frontend, the tap, and the real engine must all come from the same wire (do not mix
+# revs). docker.yml passes this line's source: the wseaton/vllm fork for the 0.21/0.22
+# lines (the serde-defaults backport), else upstream vllm.git at the line's protocol_rev.
+# The default below matches compat.toml's default line (0.23 head); CI always overrides
+# it per line.
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
-ARG VLLM_REF=c9340e6f350a009cf835878abad2a0e379b9e6a4
+ARG VLLM_REF=17bc1445562435b608041d434e9738440954159c
+
+# Which compat.toml line this image speaks. Stamped into build.rs so it emits the right
+# capability cfgs (e.g. vllm_lora_typed) and advertised vllm_version; without it build.rs
+# falls back to the compat.toml default for every line. docker.yml sets it to the line tag.
+ARG VLLM_TARGET_VERSION=v0.23.0
 
 # ---------------------------------------------------------------------------------------
 FROM fedora:${FEDORA_VERSION} AS builder
 ARG NIXL_REF
 ARG VLLM_REPO
 ARG VLLM_REF
+ARG VLLM_TARGET_VERSION
 
 # Toolchain: C/C++ + meson/ninja for libnixl, clang/libclang for bindgen (nixl-sys),
 # ucx-devel for the UCX backend, perl for the vendored OpenSSL build (vllm-rs), protoc
@@ -80,12 +85,16 @@ RUN git clone ${VLLM_REPO} /src/vllm \
     && cp target/release/vllm-rs /usr/local/bin/vllm-rs
 
 # 3. Build our mock engine against the real libnixl, plus the engine-core recording tap.
+#    The context's Cargo.toml is already pinned to this line's rev/fork by
+#    ci/pin-vllm-rev.py (so no --locked: the rev no longer matches Cargo.lock).
 COPY . /src/inference-simulator-rs
 # The nixl feature lives on the root package; the tap is its own workspace
 # member, so build them in one invocation (-p selects packages, --features
-# applies to the root package that defines it).
+# applies to the root package that defines it). VLLM_TARGET_VERSION drives the
+# per-line capability cfgs in build.rs (else it falls back to the compat default).
 RUN cd /src/inference-simulator-rs \
-    && cargo build --release -p inference-simulator-rs -p sim-tap --features nixl \
+    && VLLM_TARGET_VERSION="${VLLM_TARGET_VERSION}" \
+       cargo build --release -p inference-simulator-rs -p sim-tap --features nixl \
     && cp target/release/inference-sim /usr/local/bin/inference-sim \
     && cp target/release/inference-sim-tap /usr/local/bin/inference-sim-tap
 

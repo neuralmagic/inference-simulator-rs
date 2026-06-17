@@ -2,7 +2,9 @@
 name = "sim-trace"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "JSONL trace schema, latency models, and guidellm conversion for the inference simulator. Free of the vLLM engine-core protocol dependency."
 
 [dependencies]
@@ -11,4 +13,5 @@ flate2 = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }

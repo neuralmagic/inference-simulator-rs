@@ -16,7 +16,6 @@ use inference_simulator_rs::dataplane::{
 fn cfg(engine_id: &str, port: u32) -> NixlConfig {
     NixlConfig {
         kv_block_bytes: 4096,
-        tokens_per_block: 16,
         kv_cache_blocks: 16,
         engine_id: engine_id.to_string(),
         side_channel_host: "127.0.0.1".to_string(),

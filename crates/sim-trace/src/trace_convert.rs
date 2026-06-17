@@ -147,6 +147,8 @@ pub fn convert_guidellm(
         source: Some("guidellm".to_string()),
         block_size: None,
         config_hash: None,
+        vllm_version: None,
+        ready_response_hex: None,
         extra: HashMap::new(),
     };
 

@@ -21,12 +21,13 @@ What's vendored (from the llm-d guide, adapted to CPU + our image):
 
 - Build & push the image (from the repo root):
   ```bash
-  podman build -t quay.io/wseaton/mock-engine-nixl:dev .
-  podman push quay.io/wseaton/mock-engine-nixl:dev
+  podman build -t ghcr.io/neuralmagic/inference-simulator-rs:dev .
+  podman push ghcr.io/neuralmagic/inference-simulator-rs:dev
   ```
-- A cluster with the llm-d control-plane deps (e.g. the `coreweave-waldorf` context):
+  If you use a custom tag, update `modelserver/kustomization.yaml` before applying.
+- A cluster with the llm-d control-plane deps:
   ```bash
-  kubectl config use-context coreweave-waldorf
+  kubectl config use-context <your-cluster>
   ```
 - Install the Gateway API Inference Extension CRDs and create the namespace:
   ```bash

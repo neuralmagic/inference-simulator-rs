@@ -4,16 +4,16 @@
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::{Stream, StreamExt as _, stream};
+use sim_protocol::mock_engine::MockEngineDataSockets;
+use sim_protocol::wire::request_type_from_frame;
 use tokio::sync::mpsc;
 use tracing::warn;
-use vllm_engine_core_client::mock_engine::MockEngineDataSockets;
-use vllm_engine_core_client::protocol::utility::EngineCoreUtilityRequest;
 use vllm_engine_core_client::protocol::{
     EngineCoreRequest, EngineCoreRequestType, decode_msgpack, encode_msgpack,
 };
 use zeromq::{DealerSocket, PushSocket, SocketRecv as _, SocketSend as _, ZmqMessage};
 
-use crate::engine_core::{EngineInput, EngineOutput};
+use crate::engine_core::{EngineInput, EngineOutput, UtilityRequestSpec};
 
 /// Send one engine output batch to the client over the appropriate push socket.
 async fn send_engine_outputs_to_client(
@@ -67,7 +67,7 @@ fn decode_request(message: ZmqMessage) -> Result<EngineInput> {
     }
 
     let request_type_frame = frames[0].as_ref();
-    let Some(request_type) = EngineCoreRequestType::from_frame(request_type_frame) else {
+    let Some(request_type) = request_type_from_frame(request_type_frame) else {
         bail!("unknown engine request type: {:?}", request_type_frame);
     };
 
@@ -81,7 +81,7 @@ fn decode_request(message: ZmqMessage) -> Result<EngineInput> {
             EngineInput::Abort(request_ids)
         }
         EngineCoreRequestType::Utility => {
-            let request: EngineCoreUtilityRequest = decode_msgpack(frames[1].as_ref())?;
+            let request: UtilityRequestSpec = decode_msgpack(frames[1].as_ref())?;
             EngineInput::Utility(request)
         }
         EngineCoreRequestType::StartDpWave => EngineInput::StartDpWave,

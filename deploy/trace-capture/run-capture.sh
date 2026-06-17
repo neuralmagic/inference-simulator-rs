@@ -13,9 +13,9 @@
 # guidellm-concurrent-stall-workaround), so it is not used here.
 set -euo pipefail
 
-NS=weaton-dev
-DEPLOY=trace-capture-h200
-MODEL=Qwen/Qwen3-8B
+NS="${NS:-${NAMESPACE:-inference-sim}}"
+DEPLOY="${DEPLOY:-trace-capture-h200}"
+MODEL="${MODEL:-Qwen/Qwen3-8B}"
 OUT_DIR="${OUT_DIR:-/tmp/trace-capture-h200}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

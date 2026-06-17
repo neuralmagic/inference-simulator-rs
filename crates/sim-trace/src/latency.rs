@@ -270,23 +270,6 @@ fn random_norm_truncated(rng: &mut StdRng, mean: u64, stddev: u64) -> u64 {
     clamped as u64
 }
 
-/// Constant first-token and inter-token delays. No rng draws, no load scaling.
-/// Useful for deterministic timing tests where you want exact control.
-pub struct FixedLatency {
-    pub first_token: Duration,
-    pub inter_token: Duration,
-}
-
-impl LatencyModel for FixedLatency {
-    fn first_token_delay(&self, _rng: &mut StdRng, _ctx: &FirstTokenCtx) -> Duration {
-        self.first_token
-    }
-
-    fn inter_token_delay(&self, _rng: &mut StdRng, _num_running: u64) -> Duration {
-        self.inter_token
-    }
-}
-
 use crate::trace::{TraceMeta, TraceRecord};
 
 /// Prompt-token bucket edges (powers of two). A value `v` falls into bucket `i` where
@@ -1406,35 +1389,6 @@ mod tests {
         for _ in 0..10_000 {
             let v = random_norm_truncated(&mut rng, 100, 50);
             assert!((30..=170).contains(&v), "out of truncation bounds: {v}");
-        }
-    }
-
-    #[test]
-    fn fixed_latency_ignores_context_and_rng() {
-        use crate::latency::FixedLatency;
-
-        let fixed = FixedLatency {
-            first_token: std::time::Duration::from_millis(42),
-            inter_token: std::time::Duration::from_millis(7),
-        };
-        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
-
-        // TTFT is constant regardless of prompt size, cache, remote, or concurrency.
-        for &(prompt, cached, remote, running) in
-            &[(100, 0, false, 1), (1, 1, true, 999), (0, 0, false, 0)]
-        {
-            assert_eq!(
-                fixed.first_token_delay(&mut rng, &ctx(prompt, cached, remote, running)),
-                std::time::Duration::from_millis(42),
-            );
-        }
-
-        // Inter-token is constant regardless of concurrency.
-        for &num_running in &[1, 10, 1000] {
-            assert_eq!(
-                fixed.inter_token_delay(&mut rng, num_running),
-                std::time::Duration::from_millis(7),
-            );
         }
     }
 

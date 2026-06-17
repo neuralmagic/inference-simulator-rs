@@ -16,7 +16,70 @@
 
 use std::collections::BTreeMap;
 
-use vllm_engine_core_client::protocol::lora::LoraRequest;
+use anyhow::{Result, anyhow};
+use serde_tuple::Serialize_tuple;
+use vllm_engine_core_client::protocol::EngineCoreRequest;
+
+/// The lora identity (name + int id) the engine needs, off an `add_lora` utility
+/// call. Our own subset of the wire's `LoraRequest`, read the same way at every
+/// supported line: the crate's typed `protocol::lora::LoraRequest` only exists on
+/// 0.23+ (lora is opaque rmpv on 0.22).
+///
+/// The wire form is a **positional** msgpack array, not a map: both the crate's
+/// `LoraRequest` (`serde_tuple`) and Python's msgspec `LoRARequest` encode as
+/// `[lora_name, lora_int_id, lora_path, ...]`. The trailing field set differs
+/// across vLLM lines, so we read positions 0 and 1 by hand (`from_wire`) rather
+/// than deriving a fixed-length tuple decode, which would reject the extra
+/// elements. `Serialize_tuple` is for tests that round-trip an `add_lora` call.
+#[derive(Debug, Clone, Serialize_tuple)]
+pub(crate) struct LoraSpec {
+    pub lora_name: String,
+    pub lora_int_id: u64,
+}
+
+impl LoraSpec {
+    /// Read the lora identity from a wire `LoraRequest` value: a positional array
+    /// `[lora_name, lora_int_id, ...]`. Tolerant of however many trailing fields a
+    /// given vLLM line carries.
+    pub(crate) fn from_wire(value: &rmpv::Value) -> Result<Self> {
+        let fields = value
+            .as_array()
+            .ok_or_else(|| anyhow!("lora_request is not a positional array"))?;
+        let lora_name = fields
+            .first()
+            .and_then(rmpv::Value::as_str)
+            .ok_or_else(|| anyhow!("lora_request[0] (lora_name) missing or not a string"))?
+            .to_string();
+        let lora_int_id = fields
+            .get(1)
+            .and_then(rmpv::Value::as_u64)
+            .ok_or_else(|| anyhow!("lora_request[1] (lora_int_id) missing or not an integer"))?;
+        Ok(Self {
+            lora_name,
+            lora_int_id,
+        })
+    }
+}
+
+/// The adapter name a request runs against, read from
+/// `EngineCoreRequest.lora_request`. That field is a typed `LoraRequest` on
+/// 0.23+ and opaque `rmpv::Value` on 0.22, so this is the one access that gates
+/// on the `vllm_lora_typed` capability (emitted by build.rs).
+pub(crate) fn request_lora_name(request: &EngineCoreRequest) -> Option<&str> {
+    #[cfg(vllm_lora_typed)]
+    {
+        request.lora_request.as_ref().map(|l| l.lora_name.as_str())
+    }
+    #[cfg(not(vllm_lora_typed))]
+    {
+        let value = request.lora_request.as_ref()?;
+        value
+            .as_map()?
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("lora_name"))
+            .and_then(|(_, v)| v.as_str())
+    }
+}
 
 /// The set of adapters the frontend has loaded into this engine, plus the running-batch slot
 /// cap. A real vLLM engine would hold adapter weights here; we only need their identities.
@@ -40,7 +103,7 @@ impl LoraRegistry {
     /// Register (or refresh) a loaded adapter. Always succeeds: a real engine could OOM on
     /// weights, but we hold nothing, so we accept every adapter the frontend hands us. Returns
     /// `true` to match what the frontend's `add_lora` utility expects.
-    pub(crate) fn add(&mut self, lora: LoraRequest) -> bool {
+    pub(crate) fn add(&mut self, lora: LoraSpec) -> bool {
         self.loaded.insert(lora.lora_int_id, lora.lora_name);
         true
     }
@@ -83,8 +146,11 @@ impl LoraRegistry {
 mod tests {
     use super::*;
 
-    fn lora(name: &str, id: u64) -> LoraRequest {
-        LoraRequest::new(name.to_string(), id, format!("/loras/{name}"), false, false)
+    fn lora(name: &str, id: u64) -> LoraSpec {
+        LoraSpec {
+            lora_int_id: id,
+            lora_name: name.to_string(),
+        }
     }
 
     #[test]

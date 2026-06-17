@@ -5,4 +5,5 @@
 
 pub mod frontend_connect;
 pub mod kvparams;
+pub mod mock_engine;
 pub mod wire;

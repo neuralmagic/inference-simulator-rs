@@ -64,3 +64,168 @@ jobs:
       # The nixl features live on the root package, so this stays root-scoped.
       - name: Check (nixl-stub)
         run: cargo check --all-targets --locked --features nixl-stub
+
+  # Read compat.toml and emit the N-3 support window as a JSON matrix. Keeping the
+  # parse in its own tiny job means the heavy per-line build job can `needs:` a
+  # ready-made list instead of re-parsing the manifest per matrix leg.
+  #
+  # compat.toml is the source of truth (see docs/versioning.md). Each [[vllm]] entry
+  # carries: line, tag, protocol_rev, fidelity_validated, default. We surface every
+  # entry; the build job decides per-leg whether conformance gates (fidelity_validated).
+  compat-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.parse.outputs.include }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # tomllib is stdlib on the ubuntu-latest python3 (3.12), so no pip install.
+      # Emit one matrix entry per [[vllm]] line as compact JSON on $GITHUB_OUTPUT.
+      - name: Parse compat.toml into a build matrix
+        id: parse
+        run: |
+          include=$(python3 - <<'PY'
+          import json, tomllib, os
+          with open("compat.toml", "rb") as f:
+              compat = tomllib.load(f)
+          # Lines that have at least one golden registered drive the AWS fetch; the
+          # rest skip credentials entirely.
+          golden_lines = set()
+          if os.path.exists("conformance/manifest.toml"):
+              with open("conformance/manifest.toml", "rb") as f:
+                  manifest = tomllib.load(f)
+              golden_lines = {g["line"] for g in manifest.get("golden", [])}
+          rows = []
+          for v in compat.get("vllm", []):
+              rows.append({
+                  "line": v["line"],
+                  "tag": v["tag"],
+                  "protocol_rev": v["protocol_rev"],
+                  "fidelity_validated": bool(v.get("fidelity_validated", False)),
+                  "default": bool(v.get("default", False)),
+                  "has_goldens": v["line"] in golden_lines,
+              })
+          print(json.dumps(rows, separators=(",", ":")))
+          PY
+          )
+          echo "include=${include}" >> "$GITHUB_OUTPUT"
+
+  # Per-line build + conformance. One leg per compat.toml line, each compiling the
+  # protocol crate against that line's rev (pinned into Cargo.toml by ci/pin-vllm-rev.py;
+  # see that script for why --config can't do it). fmt/clippy stay in build-and-test
+  # above: they don't depend on the vLLM rev, so running them once is enough.
+  #
+  # CPU-only throughout. The conformance step fetches that line's golden captures from
+  # a private bucket by sha and replays them; see docs/conformance.md for the capture
+  # side. fail-fast off so one drifting line doesn't cancel the others' signal.
+  #
+  # Gating: the whole leg is a hard gate ONLY for fidelity_validated lines
+  # (continue-on-error below). A line enters the window as fidelity_validated = false,
+  # so a newly added or older line that doesn't yet build against its protocol_rev
+  # surfaces the failure as a non-blocking annotation instead of blocking the merge.
+  # The default line's build safety does not depend on this: the build-and-test job
+  # above already hard-gates the default pin (fmt/clippy/build/test). A line becomes a
+  # hard per-line gate the moment it flips to fidelity_validated = true.
+  conformance:
+    needs: compat-matrix
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ !matrix.fidelity_validated }}
+    permissions:
+      # Mint a GitHub OIDC token so the runner can assume the AWS golden-fetch
+      # role; contents:read for the checkout.
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.compat-matrix.outputs.include) }}
+    env:
+      # Stamp this leg's line into the binary so build.rs doesn't fall back to the
+      # compat.toml default for every leg. Drives the advertised vllm_version and the
+      # conformance line check; build.rs reads this env first (see build.rs / src/lib.rs).
+      VLLM_TARGET_VERSION: ${{ matrix.tag }}
+      # Object-store bucket holding the golden captures (NOT in the repo; fetched by
+      # sha). Each manifest entry's bucket_path is the key within it (the conformance/
+      # prefix the fetch role is scoped to).
+      CONFORMANCE_BUCKET: "s3://llm-d-artifacts-783952637884"
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      # Pin Cargo.toml to this line's rev + fork patch. Cargo rejects patching a git
+      # dep to a different rev of the same source, so the rev is swapped in
+      # [workspace.dependencies] (not via --config); the per-line fork [patch] is
+      # rewritten or removed. After this the rev no longer matches Cargo.lock, so the
+      # build/test below deliberately omit --locked. compat.toml is the source of truth.
+      - name: Pin vLLM rev (line ${{ matrix.line }})
+        run: python3 ci/pin-vllm-rev.py "${{ matrix.line }}"
+
+      - name: Build (vLLM ${{ matrix.line }} @ ${{ matrix.tag }})
+        run: cargo build --workspace
+
+      # Unit tests (--lib) only. The full-stack e2e integration tests (tests/) drive
+      # the real EngineCoreClient, whose API is incomplete on older lines, so they're
+      # HEAD-client-targeted and run on the default line via build-and-test. Per-line
+      # behavioral coverage is the conformance replay below, not the e2e suite.
+      - name: Unit tests (vLLM ${{ matrix.line }} @ ${{ matrix.tag }})
+        run: cargo test --workspace --lib
+
+      # Assume the least-privilege golden-fetch role via GitHub OIDC. The role
+      # (llm-d-conformance-ci) trusts repo:neuralmagic/inference-simulator-rs:* and
+      # grants only s3:GetObject on the conformance/ prefix. Skipped when the line
+      # has no goldens, so the no-capture state needs no AWS.
+      - name: Configure AWS credentials (golden fetch, vLLM ${{ matrix.line }})
+        if: ${{ matrix.has_goldens }}
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        with:
+          role-to-assume: arn:aws:iam::783952637884:role/llm-d-conformance-ci
+          aws-region: us-east-1
+
+      # Fetch this line's goldens from the private bucket and verify their sha256
+      # against conformance/manifest.toml before replaying.
+      - name: Fetch + verify goldens (vLLM ${{ matrix.line }})
+        if: ${{ matrix.has_goldens }}
+        run: |
+          set -euo pipefail
+          mkdir -p goldens
+          python3 - "${{ matrix.line }}" <<'PY' > goldens/fetch-plan.tsv
+          import sys, tomllib
+          line = sys.argv[1]
+          with open("conformance/manifest.toml", "rb") as f:
+              manifest = tomllib.load(f)
+          for g in manifest.get("golden", []):
+              if g["line"] != line:
+                  continue
+              # bucket_path<TAB>sha256
+              print("\t".join([g["bucket_path"], g["sha256"]]))
+          PY
+          # Mirror the bucket key under goldens/ (not just the basename) so the path's
+          # model/workload structure is preserved and the conformance runner resolves
+          # each golden at $CONFORMANCE_GOLDENS/<bucket_path>.
+          while IFS=$'\t' read -r bucket_path sha256; do
+            local_file="goldens/${bucket_path}"
+            mkdir -p "$(dirname "$local_file")"
+            echo "==> fetch ${CONFORMANCE_BUCKET}/${bucket_path}"
+            aws s3 cp "${CONFORMANCE_BUCKET}/${bucket_path}" "${local_file}"
+            echo "${sha256}  ${local_file}" | sha256sum --check --strict
+          done < goldens/fetch-plan.tsv
+
+      # The runner is tests/conformance.rs: manifest-driven, CPU-only. It reads
+      # conformance/manifest.toml, resolves each golden for this build's line under
+      # $CONFORMANCE_GOLDENS/<basename(bucket_path)>, and asserts line + provenance
+      # (config_hash) + schema + fidelity (see docs/conformance.md). It skips cleanly
+      # when no golden was fetched, so the step is safe before captures exist. The
+      # hard-gate-vs-informational distinction is the job-level continue-on-error
+      # (fidelity_validated lines block; others annotate only).
+      - name: Conformance replay (vLLM ${{ matrix.line }})
+        env:
+          CONFORMANCE_GOLDENS: goldens
+        run: |
+          set -euo pipefail
+          cargo test --test conformance -- --nocapture

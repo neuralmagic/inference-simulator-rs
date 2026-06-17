@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# The money shot, self-driving: live agent capture -> GPU scaled to zero ->
+# Agent replay, self-driving: live agent capture -> GPU scaled to zero ->
 # byte-identical offline replay. Record with:
-#   asciinema rec -c "bash demo/money-shot.sh" demo/money-shot.cast
+#   asciinema rec -c "bash demo/agent-replay.sh" demo/agent-replay.cast
 #
 # Pre-flight (off camera): capture rig 4/4 (just agentic-capture-up), replay
 # rig deployed (just replay-up; sim waiting for a trace), port-forward :8000
 # to the capture rig.
 set -euo pipefail
-NS=weaton-dev
+NS="${NS:-${NAMESPACE:-inference-sim}}"
 CYAN=$'\033[1;36m'; GREEN=$'\033[1;32m'; YELLOW=$'\033[1;33m'; RESET=$'\033[0m'
 
 say()  { echo; echo "${CYAN}# $*${RESET}"; sleep 1.5; }

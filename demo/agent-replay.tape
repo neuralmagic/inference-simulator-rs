@@ -1,5 +1,5 @@
 # VHS tape: live agentic capture -> byte-identical offline replay, zero GPU.
-# Render: vhs demo/money-shot.tape   (brew install vhs)
+# Render: vhs demo/agent-replay.tape   (brew install vhs)
 #
 # PRE-FLIGHT (everything slow happens before recording):
 #   1. Capture rig up + ready:        just agentic-capture-up   (wait for 4/4)
@@ -9,7 +9,7 @@
 #   5. Port-forward replay rig on :8001 AFTER act 1's trace is loaded
 #      (the tape pauses at the interstitial; see demo/README.md for the beat sheet)
 
-Output demo/money-shot.gif
+Output demo/agent-replay.gif
 Set FontSize 16
 Set Width 1400
 Set Height 800

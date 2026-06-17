@@ -16,7 +16,7 @@ use vllm_engine_core_client::protocol::{EngineCoreRequest, decode_msgpack};
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     let hex = hex.trim();
-    assert!(hex.len().is_multiple_of(2), "odd-length hex");
+    assert!(hex.len() % 2 == 0, "odd-length hex");
     (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex byte"))

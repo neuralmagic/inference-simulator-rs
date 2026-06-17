@@ -7,6 +7,7 @@
 //! protocol (finish-reason conversions, step-stats snapshots) lives in the
 //! engine crates instead.
 
+pub mod config_hash;
 pub mod latency;
 pub mod trace;
 pub mod trace_convert;

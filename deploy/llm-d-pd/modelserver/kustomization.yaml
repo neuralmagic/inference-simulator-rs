@@ -8,5 +8,5 @@ resources:
 
 # Repoint the image here (e.g. to a freshly built tag) without editing the Deployments.
 images:
-  - name: quay.io/wseaton/mock-engine-nixl
-    newTag: amd64
+  - name: ghcr.io/neuralmagic/inference-simulator-rs
+    newTag: vllm0.23

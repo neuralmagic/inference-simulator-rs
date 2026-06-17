@@ -45,6 +45,19 @@ pub struct TraceMeta {
     /// field existed, or outside the cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_hash: Option<String>,
+    /// vLLM version the captured engine reported in its registration ready
+    /// response (the engine's actual `__version__`, e.g. `"0.23.0.dev1+g16e9"`).
+    /// Distinct from the *line tag* a build targets; recorded so a replay can
+    /// confirm it is mimicking the right engine and so the version guard has
+    /// ground truth. `None` on traces captured before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_version: Option<String>,
+    /// Lowercase-hex of the engine's raw registration ready-response payload
+    /// (python `EngineCoreReadyResponse`, msgpack). Recorded so conformance can
+    /// assert the sim's `SimReadyResponse` reproduces the same wire schema
+    /// (field set, key encoding) the real engine emitted for this line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_response_hex: Option<String>,
     /// Freeform key-value pairs for any fields not covered above.
     #[serde(default, skip_serializing_if = "HashMap::is_empty", flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -507,6 +520,8 @@ mod tests {
             source: Some("guidellm".to_string()),
             block_size: None,
             config_hash: None,
+            vllm_version: None,
+            ready_response_hex: None,
             extra: HashMap::new(),
         }
     }

@@ -1,4 +1,4 @@
-{"version":3,"term":{"cols":140,"rows":40,"type":"xterm-ghostty"},"timestamp":1781300735,"command":"bash demo/money-shot.sh","env":{"SHELL":"/bin/zsh"}}
+{"version":3,"term":{"cols":140,"rows":40,"type":"xterm-ghostty"},"timestamp":1781300735,"command":"bash demo/agent-replay.sh","env":{"SHELL":"/bin/zsh"}}
 [0.020068, "o", "\r\n\u001b[1;36m# ACT 1: Claude Code -> vLLM /v1/messages -> recording tap -> H200 GPU\u001b[0m\r\n"]
 [1.512272, "o", "\u001b[1;33m$ kubectl -n weaton-dev get pods -l llm-d.ai/guide=trace-capture-agentic\u001b[0m\r\n"]
 [0.324643, "o", "NAME                                          READY   STATUS    RESTARTS   AGE\r\ntrace-capture-h200-agentic-5694995ccc-dc5k6   4/4     Running   0          3m48s\r\n"]

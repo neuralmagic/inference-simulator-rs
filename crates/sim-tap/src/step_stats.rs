@@ -7,11 +7,9 @@
 //! dependency.
 
 use std::io::{BufRead, Write};
-use std::path::Path;
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
-use sim_trace::trace::open_trace_reader;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
 
 /// One scheduler-stats snapshot observed during capture, written to the
@@ -36,12 +34,6 @@ pub fn append_step_stats(writer: &mut impl Write, record: &StepStatsRecord) -> R
     serde_json::to_writer(&mut *writer, record)?;
     writeln!(writer)?;
     Ok(())
-}
-
-/// Read a step-stats sidecar stream (plain or gzipped JSONL), skipping blank
-/// lines.
-pub fn read_step_stats_file(path: &Path) -> Result<Vec<StepStatsRecord>> {
-    read_step_stats(open_trace_reader(path)?)
 }
 
 /// Read step-stats records from any JSONL reader, skipping blank lines.

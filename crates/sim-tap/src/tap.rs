@@ -34,14 +34,14 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
+use sim_protocol::mock_engine::MockEngineSockets;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use vllm_engine_core_client::EngineId;
-use vllm_engine_core_client::mock_engine::MockEngineSockets;
 use vllm_engine_core_client::protocol::handshake::{
-    EngineCoreReadyResponse, HandshakeAddresses, HandshakeInitMessage, ReadyMessage,
+    HandshakeAddresses, HandshakeInitMessage, ReadyMessage,
 };
 use vllm_engine_core_client::protocol::{
     EngineCoreFinishReason, EngineCoreRequest, EngineCoreRequestType, decode_engine_core_outputs,
@@ -51,7 +51,8 @@ use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::{PullSocket, RouterSocket, ZmqMessage};
 
 use sim_protocol::kvparams::{extract_kv_params, kv_flag};
-use sim_protocol::wire::trace_finish_reason;
+use sim_protocol::wire::{request_type_from_frame, trace_finish_reason};
+use sim_trace::config_hash::ConfigFingerprint;
 use sim_trace::trace::{ItlContext, TraceMeta, TraceRecord, append_record};
 
 use crate::step_stats::{StepStatsRecord, append_step_stats};
@@ -254,6 +255,10 @@ struct UpstreamEngine {
     /// fields the python frontend requires (`block_size`), and raw relay is
     /// immune to schema drift entirely.
     ready_response_payload: Vec<u8>,
+    /// The engine's reported vLLM version, decoded from the registration ready
+    /// response. Ground truth for the version guard and stamped into the trace
+    /// meta so a capture is self-describing.
+    vllm_version: String,
 }
 
 /// Split a message into its expected `[identity, payload]` frame pair.
@@ -348,16 +353,58 @@ async fn upstream_handshake(config: &TapConfig) -> Result<UpstreamEngine> {
         .await
         .context("receiving engine registration on input socket")?;
     let [_, reg_payload] = into_two_frames(reg_msg.into_vec(), "engine registration")?;
-    let ready_response: EngineCoreReadyResponse = decode_msgpack(&reg_payload)
+    // Decode our own tolerant view rather than the crate's EngineCoreReadyResponse:
+    // the only field we read is vllm_version, and that field is absent from the
+    // struct before 0.23, so decoding the crate type would fail to build on older
+    // lines. Owning the subset (serde ignores the rest) keeps the tap version-portable.
+    let info: CapturedReadyInfo = decode_msgpack(&reg_payload)
         .map_err(|e| anyhow!("decoding engine registration ready response: {e}"))?;
-    debug!(?ready_response, "engine registered on tap input socket");
+    debug!(vllm_version = ?info.vllm_version, "engine registered on tap input socket");
 
     Ok(UpstreamEngine {
         input: input_socket,
         output: output_socket,
         ready_message,
         ready_response_payload: reg_payload.to_vec(),
+        vllm_version: info.vllm_version.unwrap_or_default(),
     })
+}
+
+/// The single field the tap reads off the engine's registration ready response.
+/// Decoded tolerantly so it works on lines whose `EngineCoreReadyResponse` lacks
+/// `vllm_version` (absent before 0.23); there it stays `None`.
+#[derive(serde::Deserialize)]
+struct CapturedReadyInfo {
+    #[serde(default)]
+    vllm_version: Option<String>,
+}
+
+/// Refuse to record when the engine speaks a different vLLM line than the
+/// capture is labelled for. Matching is on the `major.minor` line (the engine
+/// reports a full version like `0.23.0.dev1+g...`, the label is a tag like
+/// `v0.23.0`), so patch/dev/build suffixes don't trip a false mismatch. This
+/// turns "silently recorded a mislabelled capture" into a loud abort.
+fn guard_vllm_version(expected_tag: &str, engine_reported: &str) -> Result<()> {
+    match (
+        sim_compat::minor_line(expected_tag),
+        sim_compat::minor_line(engine_reported),
+    ) {
+        (Some(want), Some(got)) if want == got => Ok(()),
+        (Some(want), Some(got)) => bail!(
+            "vLLM line mismatch: tap labelled for {expected_tag} (line {want}), but the engine \
+             reported {engine_reported} (line {got}); refusing to record a mislabelled capture"
+        ),
+        _ => {
+            // Can't parse one side; don't hard-fail on an unexpected version
+            // string, just warn so the capture still happens.
+            warn!(
+                expected_tag,
+                engine_reported,
+                "could not parse a major.minor line from a vLLM version; skipping the guard"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Connect downstream to the real frontend as an engine, presenting the real
@@ -385,9 +432,11 @@ async fn downstream_connect(
 /// stats also appends a [`StepStatsRecord`] line to it (requires the engine
 /// to run with stats logging enabled; without it the stream stays empty).
 ///
-/// The caller is responsible for writing the meta line before calling this.
+/// Writes the trace meta line itself, after the handshake, so the meta can
+/// carry the engine's reported vLLM version and raw ready-response bytes.
 pub async fn run_tap<W: Write, S: Write>(
     config: TapConfig,
+    meta: TapMetaConfig,
     writer: &mut W,
     mut step_writer: Option<S>,
     shutdown: CancellationToken,
@@ -398,9 +447,25 @@ pub async fn run_tap<W: Write, S: Write>(
         output: mut upstream_output,
         ready_message,
         ready_response_payload,
+        vllm_version: engine_vllm_version,
     } = upstream_handshake(&config).await?;
 
-    info!("upstream engine connected, connecting downstream to frontend");
+    // Guard before recording anything: a capture labelled for one vLLM line but
+    // served by another mislabels the golden, which is worse than no capture.
+    if let Some(tag) = meta.vllm_tag.as_deref() {
+        guard_vllm_version(tag, &engine_vllm_version)?;
+    }
+
+    // The meta line carries handshake-derived fields (engine version, raw
+    // ready-response bytes), so it is written here, after the handshake and
+    // before any records.
+    let trace_meta = build_meta(&meta, &engine_vllm_version, &ready_response_payload);
+    write_meta_line(writer, &trace_meta)?;
+
+    info!(
+        engine_vllm_version = %engine_vllm_version,
+        "upstream engine connected, connecting downstream to frontend"
+    );
 
     // Step 2: Connect downstream to the real frontend.
     let MockEngineSockets { data_sockets, .. } = downstream_connect(
@@ -511,7 +576,7 @@ pub async fn run_tap<W: Write, S: Write>(
                 );
                 // DIAG: decode the request to see if it carries mm_features (and how
                 // many prompt tokens).
-                if frames.len() >= 2 && EngineCoreRequestType::from_frame(frames[0].as_ref()) == Some(EngineCoreRequestType::Add) {
+                if frames.len() >= 2 && request_type_from_frame(frames[0].as_ref()) == Some(EngineCoreRequestType::Add) {
                     match decode_msgpack::<EngineCoreRequest>(frames[1].as_ref()) {
                         Ok(req) => info!(
                             request_id = %req.request_id,
@@ -606,7 +671,7 @@ fn observe_request<F: AsRef<[u8]>>(
         return;
     }
 
-    let Some(request_type) = EngineCoreRequestType::from_frame(frames[0].as_ref()) else {
+    let Some(request_type) = request_type_from_frame(frames[0].as_ref()) else {
         warn!("unknown request type frame, skipping observation");
         return;
     };
@@ -759,32 +824,92 @@ fn observe_output<W: Write, S: Write, F: AsRef<[u8]>>(
     }
 }
 
-/// Write the trace metadata line.
-pub fn write_meta<W: Write>(
-    writer: &mut W,
-    model: &str,
-    gpu: Option<&str>,
-    tp: Option<u32>,
-    block_size: usize,
-    config_hash: Option<&str>,
-) -> Result<()> {
-    let meta = TraceMeta {
+/// Inputs for the trace meta line, supplied by the caller. The handshake-derived
+/// fields (engine version, raw ready-response bytes) are filled in by the tap.
+#[derive(Debug, Clone, Default)]
+pub struct TapMetaConfig {
+    /// Model identifier recorded in the meta line.
+    pub model: String,
+    /// GPU type (e.g. `"H200"`).
+    pub gpu: Option<String>,
+    /// Tensor-parallel degree.
+    pub tp: Option<u32>,
+    /// Scheduler concurrency ceiling, a `config_hash` input.
+    pub max_num_seqs: Option<u64>,
+    /// Token-block size for prefix fingerprints.
+    pub block_size: usize,
+    /// Explicit `config_hash` override. When `None` it is computed from a
+    /// [`ConfigFingerprint`] over the inputs here plus `vllm_tag`.
+    pub config_hash: Option<String>,
+    /// vLLM tag this capture targets (e.g. `"v0.23.0"`). Two roles: it guards
+    /// the engine's reported version (by `major.minor` line), and it is the
+    /// stable `config_hash` input. The engine's own version string is a dev
+    /// build (`0.23.0.dev1+g...`) and not reproducible across rebuilds, so the
+    /// tag is what capture and replay must agree on.
+    pub vllm_tag: Option<String>,
+    /// Canonical string of the deployed behavioral engine flags (a `config_hash`
+    /// input). The capture driver builds it (it owns the engine args); the tap can't
+    /// observe the engine config on the wire, so an empty string means "unknown".
+    pub engine_config: String,
+}
+
+/// Build the trace meta from the caller's inputs plus what the handshake
+/// observed. `config_hash` is the explicit override when set, otherwise the
+/// canonical fingerprint over the deployment inputs.
+fn build_meta(
+    meta: &TapMetaConfig,
+    engine_vllm_version: &str,
+    ready_response_payload: &[u8],
+) -> TraceMeta {
+    let config_hash = meta.config_hash.clone().or_else(|| {
+        let vllm_tag = meta
+            .vllm_tag
+            .clone()
+            .unwrap_or_else(|| engine_vllm_version.to_string());
+        Some(
+            ConfigFingerprint {
+                gpu: meta.gpu.clone().unwrap_or_default(),
+                vllm_tag,
+                engine_config: meta.engine_config.clone(),
+            }
+            .hash(),
+        )
+    });
+
+    TraceMeta {
         source: Some("tap".to_string()),
-        model: if model.is_empty() {
+        model: if meta.model.is_empty() {
             None
         } else {
-            Some(model.to_string())
+            Some(meta.model.clone())
         },
-        gpu: gpu.map(str::to_string),
-        tp,
-        block_size: Some(block_size),
-        config_hash: config_hash.map(str::to_string),
+        gpu: meta.gpu.clone(),
+        tp: meta.tp,
+        max_num_seqs: meta.max_num_seqs,
+        block_size: Some(meta.block_size),
+        config_hash,
+        vllm_version: Some(engine_vllm_version.to_string()),
+        ready_response_hex: Some(hex_encode(ready_response_payload)),
         ..TraceMeta::default()
-    };
-    let wrapper = serde_json::json!({"meta": meta});
+    }
+}
+
+/// Serialize the `{"meta": ...}` line to the writer.
+fn write_meta_line<W: Write>(writer: &mut W, meta: &TraceMeta) -> Result<()> {
+    let wrapper = serde_json::json!({ "meta": meta });
     serde_json::to_writer(&mut *writer, &wrapper)?;
     writeln!(writer)?;
     Ok(())
+}
+
+/// Lowercase-hex encode bytes (no extra dependency for a one-shot payload).
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 #[cfg(test)]
@@ -792,6 +917,62 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn guard_passes_on_same_line_across_suffix_differences() {
+        // Tag is a release label, engine reports a dev build of the same line.
+        assert!(guard_vllm_version("v0.23.0", "0.23.0.dev1+g16e9117").is_ok());
+        assert!(guard_vllm_version("v0.23.1", "0.23.0").is_ok());
+    }
+
+    #[test]
+    fn guard_rejects_a_different_line() {
+        let err = guard_vllm_version("v0.23.0", "0.22.1")
+            .expect_err("0.22 engine under a 0.23 label must abort");
+        assert!(err.to_string().contains("line mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn guard_is_lenient_when_a_version_is_unparseable() {
+        // Don't fail a capture just because a version string is exotic.
+        assert!(guard_vllm_version("v0.23.0", "nightly-weirdness").is_ok());
+    }
+
+    #[test]
+    fn build_meta_computes_config_hash_from_the_tag_not_the_engine_dev_string() {
+        // The computed hash must be stable across engine dev-build suffixes:
+        // capture (dev string A) and replay (tag) have to agree.
+        let cfg = TapMetaConfig {
+            model: "Qwen/Qwen3-8B".to_string(),
+            gpu: Some("H200".to_string()),
+            tp: Some(1),
+            max_num_seqs: Some(256),
+            block_size: 16,
+            config_hash: None,
+            vllm_tag: Some("v0.23.0".to_string()),
+            engine_config: "model=Qwen/Qwen3-8B;tensor_parallel=1".to_string(),
+        };
+        let a = build_meta(&cfg, "0.23.0.dev1+gAAAA", b"payload-a");
+        let b = build_meta(&cfg, "0.23.0.dev9+gZZZZ", b"payload-b");
+        assert_eq!(
+            a.config_hash, b.config_hash,
+            "config hash must come from the tag, not the engine dev string"
+        );
+        // But the recorded engine version + raw bytes do reflect what was seen.
+        assert_eq!(a.vllm_version.as_deref(), Some("0.23.0.dev1+gAAAA"));
+        assert_eq!(a.ready_response_hex.as_deref(), Some("7061796c6f61642d61"));
+    }
+
+    #[test]
+    fn build_meta_honours_an_explicit_config_hash_override() {
+        let cfg = TapMetaConfig {
+            config_hash: Some("manual-override".to_string()),
+            vllm_tag: Some("v0.23.0".to_string()),
+            ..TapMetaConfig::default()
+        };
+        let meta = build_meta(&cfg, "0.23.0", b"");
+        assert_eq!(meta.config_hash.as_deref(), Some("manual-override"));
+    }
 
     fn state_at(arrival: Instant) -> RequestState {
         RequestState {

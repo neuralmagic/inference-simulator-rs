@@ -11,7 +11,7 @@
 #
 # Usage: demo/itl-sweep.sh [trace] [act1-transcript]
 set -uo pipefail
-NS=weaton-dev
+NS="${NS:-${NAMESPACE:-inference-sim}}"
 TRACE=${1:-/tmp/demo-trace.jsonl}
 ACT1=${2:-/tmp/act1-transcript.txt}
 RESULTS=/tmp/itl-sweep-results.txt

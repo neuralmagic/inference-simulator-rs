@@ -1,0 +1,103 @@
+# Conformance capture matrix. Read by gen-capture-jobs.py, which emits one Kueue Job
+# per [[capture]] target (kubectl apply -f -). Replaces the old hand-maintained
+# validation-jobs.yaml: one declarative source for every model x scenario we capture.
+#
+# Each [[capture]] inherits [defaults] (scalar overrides allowed per target) and picks a
+# [lines.<vllm_tag>] for its engine + tap/frontend images. The scenario drives the engine
+# and tap flags (so the config_hash and the engine agree on prefix-cache / spec-decode).
+#
+# Captures run one at a time via conformance-queue (see conformance-queue.yaml). After a
+# capture, upload to conformance/<vllm_tag>/<gpu>/<model>/<workload>.jsonl.gz and register
+# in manifest.toml (see docs/conformance.md).
+
+[defaults]
+namespace = "inference-sim"
+queue = "conformance-queue"
+service_account = "modelexpress-p2p-nvidia-gpu-vllm-sa"
+gpu = "H200"
+gpu_memory_utilization = 0.90
+tp = 1
+block_size = 16
+max_num_seqs = 256
+max_model_len = 16384
+enforce_eager = true
+# Engine container resources; override per capture for big models.
+engine_cpu_request = "8"
+engine_cpu_limit = "16"
+engine_memory_request = "64Gi"
+engine_memory_limit = "96Gi"
+model_cache_size = "100Gi"
+
+# Per-line build artifacts: the engine image (the vLLM under test, pinned by digest for
+# releases) and the tap/frontend image (built against the line's protocol_rev). Keyed by
+# vllm_tag. Add a line here, then point captures at it.
+[lines."v0.23.0"]
+engine_image = "docker.io/vllm/vllm-openai:v0.23.0@sha256:6d8429e38e3747723ca07ee1b17972e09bb9c51c4032b266f24fb1cc3b22ed8f"
+tap_image = "ghcr.io/neuralmagic/inference-simulator-rs:vllm0.23"
+
+[lines."nightly"]
+# Postmerge image at the nightly protocol_rev; bump alongside compat.toml's nightly rev.
+engine_image = "public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:9c7c74bf1023774cf0e247bf77a038989ee272db"
+tap_image = "ghcr.io/neuralmagic/inference-simulator-rs:vllmnightly"
+
+# --- capture targets ----------------------------------------------------------------
+# `name` is the Job suffix + label (must be RFC1123: lowercase, digits, '-'); the dotted
+# model id lives in `model`. `scenario`: baseline | nocache | specdecode | multimodal.
+
+[[capture]]
+name = "qwen3-8b"
+model = "Qwen/Qwen3-8B"
+vllm_tag = "v0.23.0"
+scenario = "baseline"
+phases = "sweep multiturn"
+
+[[capture]]
+name = "qwen3-8b-nocache"
+model = "Qwen/Qwen3-8B"
+vllm_tag = "v0.23.0"
+scenario = "nocache"
+phases = "multiturn"
+
+[[capture]]
+name = "qwen3-8b-specdecode"
+model = "Qwen/Qwen3-8B"
+vllm_tag = "v0.23.0"
+scenario = "specdecode"
+speculative = "ngram-k3"
+phases = "multiturn"
+
+[[capture]]
+name = "qwen3-0-6b"
+model = "Qwen/Qwen3-0.6B"
+vllm_tag = "v0.23.0"
+scenario = "baseline"
+phases = "sweep multiturn"
+engine_memory_request = "32Gi"
+
+[[capture]]
+name = "qwen3-30b-a3b"
+model = "Qwen/Qwen3-30B-A3B"
+vllm_tag = "v0.23.0"
+scenario = "baseline"
+phases = "sweep multiturn"
+engine_memory_request = "96Gi"
+engine_memory_limit = "160Gi"
+
+[[capture]]
+name = "gpt-oss-20b"
+model = "openai/gpt-oss-20b"
+vllm_tag = "v0.23.0"
+scenario = "baseline"
+phases = "sweep multiturn"
+engine_memory_request = "64Gi"
+engine_memory_limit = "128Gi"
+
+# Multimodal: needs the loadgen image mode (a /v1/chat/completions image path) before it
+# captures successfully; the runner rejects an unknown "multimodal" phase until then.
+[[capture]]
+name = "qwen2-5-vl-7b"
+model = "Qwen/Qwen2.5-VL-7B-Instruct"
+vllm_tag = "v0.23.0"
+scenario = "multimodal"
+phases = "multimodal"
+max_model_len = 32768

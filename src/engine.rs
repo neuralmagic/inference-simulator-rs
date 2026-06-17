@@ -622,8 +622,13 @@ impl SimEngine {
     ) -> Result<Option<EngineCoreOutputs>> {
         let ok = match request.method_name.as_str() {
             "add_lora" => {
-                let (lora,): (LoraSpec,) = rmpv::ext::from_value(request.args.clone())
-                    .map_err(|error| anyhow!("decoding add_lora args: {error}"))?;
+                // args is the one-element tuple `(LoraRequest,)`; the LoraRequest itself
+                // is a positional array whose trailing fields vary by line, so pull it out
+                // as an opaque value and read the identity by position (LoraSpec::from_wire).
+                let (lora_value,): (rmpv::Value,) = rmpv::ext::from_value(request.args.clone())
+                    .map_err(|error| anyhow!("decoding add_lora args tuple: {error}"))?;
+                let lora = LoraSpec::from_wire(&lora_value)
+                    .map_err(|error| anyhow!("decoding add_lora lora_request: {error}"))?;
                 let name = lora.lora_name.clone();
                 let id = lora.lora_int_id;
                 let ok = self.loras.add(lora);

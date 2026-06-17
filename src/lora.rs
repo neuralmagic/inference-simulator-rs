@@ -16,19 +16,49 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use anyhow::{Result, anyhow};
+use serde_tuple::Serialize_tuple;
 use vllm_engine_core_client::protocol::EngineCoreRequest;
 
-/// The lora identity (int id + name) the engine needs, off an `add_lora`
-/// utility call or a request's `lora_request`. Our own subset that deserializes
-/// the same msgpack at every supported line: the crate's typed
-/// `protocol::lora::LoraRequest` only exists on 0.23+ (lora is opaque rmpv on
-/// 0.22), and serde ignores the fields we don't name. `Serialize` is for tests
-/// that round-trip an `add_lora` call through the wire.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// The lora identity (name + int id) the engine needs, off an `add_lora` utility
+/// call. Our own subset of the wire's `LoraRequest`, read the same way at every
+/// supported line: the crate's typed `protocol::lora::LoraRequest` only exists on
+/// 0.23+ (lora is opaque rmpv on 0.22).
+///
+/// The wire form is a **positional** msgpack array, not a map: both the crate's
+/// `LoraRequest` (`serde_tuple`) and Python's msgspec `LoRARequest` encode as
+/// `[lora_name, lora_int_id, lora_path, ...]`. The trailing field set differs
+/// across vLLM lines, so we read positions 0 and 1 by hand (`from_wire`) rather
+/// than deriving a fixed-length tuple decode, which would reject the extra
+/// elements. `Serialize_tuple` is for tests that round-trip an `add_lora` call.
+#[derive(Debug, Clone, Serialize_tuple)]
 pub(crate) struct LoraSpec {
-    pub lora_int_id: u64,
     pub lora_name: String,
+    pub lora_int_id: u64,
+}
+
+impl LoraSpec {
+    /// Read the lora identity from a wire `LoraRequest` value: a positional array
+    /// `[lora_name, lora_int_id, ...]`. Tolerant of however many trailing fields a
+    /// given vLLM line carries.
+    pub(crate) fn from_wire(value: &rmpv::Value) -> Result<Self> {
+        let fields = value
+            .as_array()
+            .ok_or_else(|| anyhow!("lora_request is not a positional array"))?;
+        let lora_name = fields
+            .first()
+            .and_then(rmpv::Value::as_str)
+            .ok_or_else(|| anyhow!("lora_request[0] (lora_name) missing or not a string"))?
+            .to_string();
+        let lora_int_id = fields
+            .get(1)
+            .and_then(rmpv::Value::as_u64)
+            .ok_or_else(|| anyhow!("lora_request[1] (lora_int_id) missing or not an integer"))?;
+        Ok(Self {
+            lora_name,
+            lora_int_id,
+        })
+    }
 }
 
 /// The adapter name a request runs against, read from

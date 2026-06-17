@@ -205,8 +205,12 @@ jobs:
               # bucket_path<TAB>sha256
               print("\t".join([g["bucket_path"], g["sha256"]]))
           PY
+          # Mirror the bucket key under goldens/ (not just the basename) so the path's
+          # model/workload structure is preserved and the conformance runner resolves
+          # each golden at $CONFORMANCE_GOLDENS/<bucket_path>.
           while IFS=$'\t' read -r bucket_path sha256; do
-            local_file="goldens/$(basename "$bucket_path")"
+            local_file="goldens/${bucket_path}"
+            mkdir -p "$(dirname "$local_file")"
             echo "==> fetch ${CONFORMANCE_BUCKET}/${bucket_path}"
             aws s3 cp "${CONFORMANCE_BUCKET}/${bucket_path}" "${local_file}"
             echo "${sha256}  ${local_file}" | sha256sum --check --strict

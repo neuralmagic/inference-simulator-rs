@@ -199,11 +199,11 @@ async fn run_conformance(manifest_path: &Path, goldens_dir: Option<&Path>) -> us
 
     let mut checked = 0;
     for golden in goldens {
-        // The CI fetch step names the local file after the object's basename.
-        let basename = Path::new(&golden.bucket_path)
-            .file_name()
-            .expect("golden bucket_path has a file name");
-        let trace_path = dir.join(basename);
+        // The CI fetch step mirrors the bucket key under $CONFORMANCE_GOLDENS, so the
+        // local path is the bucket_path joined onto the fetch dir. Keeping the full key
+        // (not just the basename) lets the path carry the model/workload structure
+        // (conformance/<line>/<model>/<workload>...) without filename collisions.
+        let trace_path = dir.join(&golden.bucket_path);
         if !trace_path.exists() {
             eprintln!(
                 "  {} ({:?}) not present at {}; skipping",
@@ -215,9 +215,7 @@ async fn run_conformance(manifest_path: &Path, goldens_dir: Option<&Path>) -> us
         }
         eprintln!(
             "conformance: {} [{:?}] {}",
-            golden.workload,
-            golden.role,
-            basename.to_string_lossy()
+            golden.workload, golden.role, golden.bucket_path
         );
 
         let (meta, _) = read_trace_file(&trace_path).expect("read golden meta");
@@ -267,8 +265,11 @@ async fn synthetic_schema_golden_passes_the_static_checks() {
 
     // Unique temp dir for this test run.
     let dir = std::env::temp_dir().join(format!("conformance-synthetic-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    let golden_path = dir.join("golden.jsonl");
+    // The golden lives at the bucket key under the fetch dir (mirrors the CI fetch).
+    let bucket_path = format!("conformance/{line}/test-gpu/test-org/test-model/golden.jsonl");
+    let golden_path = dir.join(&bucket_path);
+    std::fs::create_dir_all(golden_path.parent().expect("golden has a parent"))
+        .expect("create temp dir");
 
     let meta = TraceMeta {
         source: Some("tap".to_string()),
@@ -290,7 +291,7 @@ async fn synthetic_schema_golden_passes_the_static_checks() {
         format!(
             "[[golden]]\n\
              line = \"{line}\"\n\
-             bucket_path = \"s3://test/golden.jsonl\"\n\
+             bucket_path = \"{bucket_path}\"\n\
              sha256 = \"deadbeef\"\n\
              config_hash = \"{config_hash}\"\n\
              workload = \"synthetic\"\n\

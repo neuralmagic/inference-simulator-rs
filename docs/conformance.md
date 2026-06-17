@@ -191,8 +191,11 @@ the least-privilege `llm-d-conformance-ci` role (GitHub OIDC, GetObject on
 ```bash
 # 1. Upload to the conformance/ prefix (use credentials with write access; the CI
 #    role is read-only).
+# Path convention: conformance/<line>/<gpu>/<model>/<workload>[-<seed>].jsonl.gz
+# (gpu + model id, '/' kept, are path segments; they mirror config_hash inputs so
+# captures across hardware/models don't collide. CI mirrors the full key locally.)
 aws s3 cp trace.jsonl.gz \
-  "s3://llm-d-artifacts-783952637884/conformance/<line>/<workload>-<seed>.jsonl.gz"
+  "s3://llm-d-artifacts-783952637884/conformance/<line>/<gpu>/<model>/<workload>-<seed>.jsonl.gz"
 
 # 2. Record the sha256 (the manifest key CI verifies after fetch).
 sha256sum trace.jsonl.gz
@@ -203,7 +206,7 @@ Add a `[[golden]]` entry to `conformance/manifest.toml`:
 ```toml
 [[golden]]
 line        = "0.23"                                  # matches a compat.toml line
-bucket_path = "conformance/0.23/multiturn-seed7.jsonl.gz" # key within the bucket
+bucket_path = "conformance/0.23/H200/Qwen/Qwen3-8B/multiturn-seed7.jsonl.gz" # key within the bucket
 sha256      = "<sha256 of the uploaded .gz>"          # CI verifies this post-fetch
 config_hash = "<the trace's config_hash>"             # replay asserts --expect-config-hash
 workload    = "multiturn"                              # human-readable workload label

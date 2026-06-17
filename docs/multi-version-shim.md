@@ -101,6 +101,11 @@ lines that have the typed client.
 
 ## Current window
 
+- **nightly** (`nightly`): tracks vLLM main, `protocol_rev` is the latest post-merge
+  commit (bumped regularly). No fork (main carries everything). build.rs treats the
+  non-`vX.Y` tag as the newest line, so all capability cfgs are on. It exists to catch
+  wire drift before a release lands: the day a main commit breaks the protocol, the
+  nightly build/conformance leg goes red. `fidelity_validated = false`.
 - **0.23** (`v0.23.0`, default): builds against upstream `17bc1445`, unit tests +
   conformance green. No fork (`#45848` is upstream here).
 - **0.22** (`v0.22.1`): library + bins + unit tests + conformance all build; the

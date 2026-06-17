@@ -16,6 +16,19 @@
 #   - Exactly one line has `default = true`. That line is `:latest` / unsuffixed.
 #   - A line enters with `fidelity_validated = false` and is promoted to `true`
 #     only once the conformance replay gates pass against its captures.
+#   - The `nightly` line is special: it tracks vLLM main (post-merge commits), so
+#     its `tag` is the literal `"nightly"` rather than a release. Its `protocol_rev`
+#     is bumped to the latest main sha to catch wire drift before a release lands.
+#     build.rs treats a non-`vX.Y` tag as the newest line (all capability cfgs on).
+
+[[vllm]]
+# Bleeding edge: tracks vLLM main so the build/conformance matrix flags wire drift
+# the day a post-merge commit breaks it. No fork (main already carries #45848).
+# Bump protocol_rev to the latest main sha regularly (eventually via automation).
+line = "nightly"
+tag = "nightly"
+protocol_rev = "9c7c74bf1023774cf0e247bf77a038989ee272db"
+fidelity_validated = false
 
 [[vllm]]
 # N (head). 17bc1445 is the post-#45848 main commit (serde-default fix upstream

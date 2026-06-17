@@ -49,9 +49,13 @@ fn main() {
 }
 
 /// Whether the target tag's `major.minor` line is >= `(major, minor)`.
+///
+/// A tag with no parseable `major.minor` (e.g. `"nightly"`, which tracks vLLM
+/// main) is treated as the **newest** line, so every capability cfg turns on:
+/// main always carries the latest protocol surface.
 fn line_at_least(tag: &str, major: u32, minor: u32) -> bool {
     let Some(line) = sim_compat::minor_line(tag) else {
-        return false;
+        return true;
     };
     let mut parts = line.split('.');
     let parsed = (|| {
@@ -61,6 +65,6 @@ fn line_at_least(tag: &str, major: u32, minor: u32) -> bool {
     })();
     match parsed {
         Some((maj, min)) => (maj, min) >= (major, minor),
-        None => false,
+        None => true,
     }
 }

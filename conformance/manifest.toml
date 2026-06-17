@@ -8,12 +8,14 @@
 #   line         vLLM line it validates (matches a compat.toml [[vllm]].line)
 #   bucket_path  key within the bucket (CI fetches ${CONFORMANCE_BUCKET}/${bucket_path});
 #                live under the conformance/ prefix the fetch role is scoped to.
-#                Convention: conformance/<line>/<gpu>/<model>/<workload>[-seed<N>].jsonl.gz
-#                -- gpu and model id (its '/' kept) are path segments so one line's
-#                captures across hardware/models don't collide. These mirror config_hash
-#                inputs; the hash stays the authoritative replay key, the path is just
-#                organization. CI mirrors the full key under $CONFORMANCE_GOLDENS, so the
-#                path (not just the basename) is resolved.
+#                Convention: conformance/<vllm_tag>/<gpu>/<model>/<workload>[-seed<N>].jsonl.gz
+#                where <vllm_tag> is the release tag (e.g. v0.23.0) or "nightly" (tracks
+#                main). gpu and model id (its '/' kept) are path segments. These mirror
+#                config_hash inputs (vllm_tag/gpu/model), so captures across builds,
+#                hardware, and models don't collide; the hash stays the authoritative
+#                replay key, the path is just organization. `line` stays a field below
+#                (CI groups by it). CI mirrors the full key under $CONFORMANCE_GOLDENS, so
+#                the path (not just the basename) is resolved.
 #   sha256       content hash; CI fetches + verifies against this
 #   config_hash  deployment-config fingerprint; replay gate uses it as
 #                --expect-config-hash so a trace can't replay against the wrong config
@@ -28,7 +30,7 @@
 #
 # [[golden]]
 # line = "0.23"
-# bucket_path = "conformance/0.23/H200/Qwen/Qwen3-8B/sweep.jsonl.gz"
+# bucket_path = "conformance/v0.23.0/H200/Qwen/Qwen3-8B/sweep.jsonl.gz"
 # sha256 = "TODO"
 # config_hash = "TODO"
 # workload = "sweep"

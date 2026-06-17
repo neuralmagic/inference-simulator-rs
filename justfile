@@ -86,6 +86,27 @@ capture-fetch out="/tmp/tap-trace.jsonl":
     kubectl -n {{namespace}} exec deploy/{{deploy}} -c tap -- cat /trace/trace.jsonl > {{out}}
     @wc -l {{out}}
 
+# --- conformance captures (deploy/trace-capture/models.toml) -----------------------
+# Kueue-serialized golden captures, one model x scenario per Job. See docs/conformance.md.
+
+# Apply the one-GPU conformance queue (serializes captures; run once).
+conformance-queue:
+    kubectl apply -f deploy/trace-capture/conformance-queue.yaml
+
+# List the capture targets defined in models.toml.
+conformance-list:
+    python3 deploy/trace-capture/gen-capture-jobs.py --list
+
+# Submit a conformance capture Job, e.g. `just conformance-capture qwen3-8b`. Ships the
+# loadgen scripts as a configmap, then applies the generated Job (Kueue holds it until a
+# GPU is free, so it's safe to submit several; they run one at a time).
+conformance-capture name:
+    kubectl create configmap validation-scripts -n {{namespace}} \
+        --from-file=loadgen.py=deploy/trace-capture/loadgen.py \
+        --from-file=runner.sh=deploy/trace-capture/validation-runner.sh \
+        --dry-run=client -o yaml | kubectl apply -f -
+    python3 deploy/trace-capture/gen-capture-jobs.py {{name}} | kubectl apply -f -
+
 # --- agentic capture + offline replay (docs/agentic-offline-replay.md) -------------
 
 # Agentic capture rig: python frontend (/v1/messages) + tap + GPU engine.
@@ -164,30 +185,21 @@ capture-up-nocache:
         -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--no-enable-prefix-caching"}]'
     kubectl -n {{namespace}} scale deploy {{deploy}} --replicas=1
 
-# --- kueue validation jobs ----------------------------------------------------------
-
-# Queue the counterfactual-validation capture jobs (cached + nocache) on Kueue.
-validation-up:
-    kubectl create configmap validation-scripts -n {{namespace}} \
-        --from-file=loadgen.py=deploy/trace-capture/loadgen.py \
-        --from-file=runner.sh=deploy/trace-capture/validation-runner.sh \
-        --dry-run=client -o yaml | kubectl apply -f -
-    kubectl apply -f deploy/trace-capture/validation-jobs.yaml
-
-# Admission + pod + loadgen status for the validation jobs.
-validation-status:
+# Admission + pod + loadgen status for the conformance capture jobs.
+conformance-status:
     kubectl -n {{namespace}} get workloads
     kubectl -n {{namespace}} get jobs -l llm-d.ai/guide=trace-capture
     kubectl -n {{namespace}} get pods -l llm-d.ai/guide=trace-capture
     -kubectl -n {{namespace}} logs -l llm-d.ai/guide=trace-capture -c loadgen --tail=2 --prefix
 
 # Fetch a job's tap trace and release it (job completes, GPU freed).
-validation-fetch job out:
+# e.g. `just conformance-fetch trace-qwen3-8b /tmp/qwen3-8b.jsonl`.
+conformance-fetch job out:
     kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- cat /trace/trace.jsonl > {{out}}
     -kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- sh -c 'for f in /trace/marker-*; do echo "$f=$(cat $f)"; done'
     kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- touch /trace/fetched
     @wc -l {{out}}
 
-# Delete the validation jobs (frees quota immediately).
-validation-down:
-    -kubectl -n {{namespace}} delete -f deploy/trace-capture/validation-jobs.yaml
+# Delete all conformance capture jobs (frees quota immediately).
+conformance-down:
+    -kubectl -n {{namespace}} delete jobs -l llm-d.ai/guide=trace-capture

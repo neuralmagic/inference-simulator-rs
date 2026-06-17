@@ -1,5 +1,6 @@
 #!/bin/bash
-# In-pod load driver for the Kueue validation Jobs (see validation-jobs.yaml).
+# In-pod load driver for the Kueue conformance capture Jobs (generated from
+# models.toml by gen-capture-jobs.py).
 # Runs the phases in $PHASES against the sidecar stack on localhost, marks the
 # tap-trace line count at each phase boundary (for slicing the JSONL locally),
 # then idles until the trace is fetched so the Job can complete and release

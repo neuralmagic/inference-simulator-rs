@@ -51,23 +51,22 @@ real engine, because the point is to measure the engine vLLM actually ships for 
 ## What pins the vLLM version
 
 The vLLM version under capture is pinned by the engine container image digest, not by
-a tag. In `deploy/trace-capture/validation-jobs.yaml` the engine container is:
+a tag. The per-line engine + tap/frontend images live in `models.toml` under
+`[lines.<vllm_tag>]`, e.g.:
 
-```yaml
-- name: engine
-  image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:ba94a3b9989666f950e1f784d18f2033c63c6cad
+```toml
+[lines."v0.23.0"]
+engine_image = "docker.io/vllm/vllm-openai:v0.23.0@sha256:6d8429e3..."  # release, by digest
+tap_image    = "ghcr.io/neuralmagic/inference-simulator-rs:vllm0.23"     # built for this line
 ```
 
 For a conformance capture, pin the engine to the **release tag's** published image for
-the line you are validating (the `tag` field in `compat.toml`, e.g. `v0.9.2`), by its
-digest. The image digest is the ground truth for "which vLLM this golden measures";
-record it in the manifest entry's provenance. The tap and frontend stay on the
-protocol-pin capture image (the `inference-sim-tap` + `vllm-rs` image), which must be
-built against that line's `protocol_rev` so the wire parses.
-
-TODO(per-line engine images): list the release-tag engine image + digest per line.
-Today only the postmerge build above is referenced; each `compat.toml` line needs its
-release image digest recorded here and in the manifest.
+the line you are validating (the `tag` field in `compat.toml`, e.g. `v0.23.0`), by its
+digest, that digest is the ground truth for "which vLLM this golden measures" (record it
+in the manifest entry's provenance). The `nightly` line instead points at the post-merge
+image at its `protocol_rev`. The tap and frontend stay on the per-line capture image
+(`inference-sim-tap` + `vllm-rs`), built against that line's `protocol_rev` so the wire
+parses, which is exactly what CI's `docker.yml` publishes as `:vllm<line>`.
 
 ## Capture hygiene
 
@@ -89,48 +88,37 @@ golden you can gate on and noise:
 
 ## Stand up a capture per line
 
-The capture runs as a Kueue-admitted Job on the GPU cluster (waldorf), so Kueue holds
-the Job until GPU quota admits it and releases the GPU the moment the capture
-completes. Two self-contained Jobs live in `deploy/trace-capture/validation-jobs.yaml`:
+Each capture is a Kueue-admitted Job on the GPU cluster (waldorf), so Kueue holds the Job
+until GPU quota admits it and releases the GPU the moment the capture completes. The
+capture matrix lives in `deploy/trace-capture/models.toml`: one `[[capture]]` per
+model × scenario (`baseline` / `nocache` / `specdecode` / `multimodal`), each pinned to a
+line's engine + tap/frontend images. `gen-capture-jobs.py` turns a target into a Job; the
+scenario drives the engine *and* tap flags so the `config_hash` matches the engine config
+(prefix-cache, spec-decode). To add a model or scenario, edit `models.toml`, no YAML by hand.
 
-- `trace-validation-cached` — prefix cache ON: the prompt-length sweep (fits the
-  latency model's long-prefill buckets) plus the agentic multiturn scenario.
-- `trace-validation-nocache` — engine started with `--no-enable-prefix-caching`, same
-  multiturn workload: the real counterfactual.
+All capture Jobs target `conformance-queue` (`conformance-queue.yaml`), a dedicated Kueue
+queue with a one-GPU quota, so they run **one at a time**: submit as many as you like and
+they serialize, the rest wait pending (capture hygiene: one workload per pod lifetime, no
+cross-capture interference). Each pod runs engine/tap/frontend as sidecars and
+`validation-runner.sh` as the loadgen container, which runs `$PHASES`, marks the trace
+line count at each phase boundary, then idles until the trace is fetched.
 
-Both Jobs target `conformance-queue` (`deploy/trace-capture/conformance-queue.yaml`), a
-dedicated Kueue queue with a one-GPU quota, so they run **one at a time**: whichever
-admits first holds the single GPU of quota, the other waits pending until it completes.
-This is deliberate (capture hygiene: one workload per pod lifetime, no cross-capture
-interference). Apply the queue once before the first capture:
-
-```bash
-kubectl apply -f deploy/trace-capture/conformance-queue.yaml
-```
-
-Each pod runs the engine/tap/frontend as sidecars and `validation-runner.sh` as the main
-loadgen container, which runs the phases in `$PHASES`, marks the trace line count at each
-phase boundary (for slicing the JSONL locally), then idles until the trace is fetched.
-
-Per line, the steps (wrapped by the justfile in the canonical flow):
+The flow (wrapped by the justfile):
 
 ```bash
-# 1. Point the engine sidecar at the line's release image digest (edit
-#    validation-jobs.yaml, the `engine` container image) and the tap/frontend at the
-#    capture image built for that line's protocol_rev.
+just conformance-queue                  # apply the one-GPU queue (once)
+just conformance-list                   # see the targets in models.toml
+just conformance-capture qwen3-8b       # ship loadgen scripts + submit the Job
 
-# 2. Ship the loadgen scripts as a configmap.
-kubectl create configmap validation-scripts -n weaton-dev \
-    --from-file=loadgen.py \
-    --from-file=runner.sh=validation-runner.sh \
-    --dry-run=client -o yaml | kubectl apply -f -
+# raw equivalent:
+python3 deploy/trace-capture/gen-capture-jobs.py qwen3-8b | kubectl apply -f -
 
-# 3. Submit the Jobs; Kueue unsuspends on admission.
-kubectl apply -f deploy/trace-capture/validation-jobs.yaml
-
-# 4. Wait for the loadgen to finish (it logs "waiting for fetch").
-kubectl logs -f job/trace-validation-cached -c loadgen
+# wait for the loadgen to finish (it logs "waiting for fetch"):
+kubectl logs -f job/trace-qwen3-8b -c loadgen
 ```
+
+To capture a new line (e.g. a new release or `nightly`), add a `[lines.<vllm_tag>]` entry
+(engine image digest + the tap/frontend image built for that line) and point captures at it.
 
 ## Fetch the trace + step stats
 

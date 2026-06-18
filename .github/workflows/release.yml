@@ -7,8 +7,11 @@ name: Release
 # for the full P/D + capture topology). The binaries are pure Rust (no NIXL in the
 # default build, the `zeromq` crate is pure Rust), so they build static (musl) on Linux.
 #
-# Per-line because the wire protocol (vllm-engine-core-client rev) is compiled in; the
-# handshake guard aborts loudly if a binary meets a peer on a different line. Tag a
+# `inference-sim` + `inference-sim-tap` are per-line because the wire protocol
+# (vllm-engine-core-client rev) is compiled in; the handshake guard aborts loudly if a
+# binary meets a peer on a different line. `inference-sim-trace` (offline trace tooling:
+# convert/calibrate/summarize/perfetto) never handshakes an external peer, so it is
+# line-agnostic and published once per platform (built on the default line). Tag a
 # release (v*) to publish; workflow_dispatch builds everything as a smoke test without
 # uploading.
 on:
@@ -59,6 +62,8 @@ jobs:
                       "line": v["line"],
                       "tag": v["tag"],
                       "protocol_rev": v["protocol_rev"],
+                      # The default line also publishes the line-agnostic trace tooling.
+                      "default": v.get("default", False),
                       **p,
                   })
           print(json.dumps(rows, separators=(",", ":")))
@@ -109,6 +114,22 @@ jobs:
           bindir="target/${{ matrix.target }}/release"
           cp "$bindir/inference-sim" "$bindir/inference-sim-tap" staging/
           tar -C staging -czf "dist/${name}.tar.gz" inference-sim inference-sim-tap
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          ls -la dist/
+
+      # inference-sim-trace is line-agnostic (no external handshake), so it ships
+      # once per platform. It is already built by the package build above; only the
+      # default-line jobs package + upload it, so the per-platform asset isn't
+      # rebuilt and clobbered N times across the lines.
+      - name: Package trace tooling (default line only)
+        if: ${{ matrix.default }}
+        run: |
+          set -euo pipefail
+          name="inference-sim-trace-${{ matrix.target }}"
+          mkdir -p dist staging-trace
+          bindir="target/${{ matrix.target }}/release"
+          cp "$bindir/inference-sim-trace" staging-trace/
+          tar -C staging-trace -czf "dist/${name}.tar.gz" inference-sim-trace
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
           ls -la dist/
 

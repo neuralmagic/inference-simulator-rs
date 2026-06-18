@@ -55,7 +55,7 @@ use sim_protocol::wire::{request_type_from_frame, trace_finish_reason};
 use sim_trace::config_hash::ConfigFingerprint;
 use sim_trace::trace::{ItlContext, TraceMeta, TraceRecord, append_record};
 
-use crate::step_stats::{StepStatsRecord, append_step_stats};
+use sim_protocol::step_stats::{StepStatsRecord, append_step_stats};
 
 /// Batch context attached to a single ITL gap (one gap per output chunk).
 struct GapSample {

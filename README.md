@@ -25,6 +25,7 @@ KV-cache bytes over NIXL for prefill/decode testing.
   - [Content-identical replay](#content-identical-replay)
   - [Replay pacing](#replay-pacing)
   - [Speculative decoding and diffusion](#speculative-decoding-and-diffusion)
+  - [Visualizing traces (Perfetto)](#visualizing-traces-perfetto)
 - [Dependencies of note](#dependencies-of-note)
 - [License](#license)
 
@@ -610,6 +611,18 @@ Right: per-position draft acceptance read back from the `SchedulerStats` sidecar
 a second `--spec-steps replay=...` to overlay the simulator's own emitted stats).
 Covered without a GPU by `tests/spec_replay_fidelity.rs` and `replay_steps`/engine unit
 tests.
+
+### Visualizing traces (Perfetto)
+
+`inference-sim-trace perfetto` converts a trace to the Chrome Trace Event Format for
+<https://ui.perfetto.dev>: per-request prefill/decode spans packed into peak-concurrency
+lanes, batch-level counters, and (with the tap's `--step-stats` sidecar) a step-centric
+track of what the scheduler actually ran each step. `--open` serves it and launches the
+UI. See [docs/perfetto.md](docs/perfetto.md).
+
+```bash
+cargo run --bin inference-sim-trace -- perfetto trace.jsonl --step-stats trace-step-stats.jsonl --open
+```
 
 ## Dependencies of note
 

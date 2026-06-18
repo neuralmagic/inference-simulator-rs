@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "inference-simulator-rs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1777,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "sim-compat"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "sim-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "rmpv",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "sim-tap"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "sim-trace"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "flate2",

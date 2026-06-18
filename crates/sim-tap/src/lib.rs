@@ -2,5 +2,4 @@
 //! frontend and a real engine-core that records per-request timing into a JSONL
 //! trace (plus an optional step-stats sidecar stream).
 
-pub mod step_stats;
 pub mod tap;

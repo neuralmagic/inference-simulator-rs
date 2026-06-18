@@ -37,8 +37,8 @@ mod tokens;
 // handshake, kv_transfer_params, finish-reason conversions) lives in
 // `sim-protocol`. Re-export both under the original paths so existing
 // `crate::trace` / `crate::frontend_connect` references keep working unchanged.
-pub use sim_protocol::{frontend_connect, kvparams, mock_engine, wire};
-pub use sim_trace::{latency, trace, trace_convert};
+pub use sim_protocol::{frontend_connect, kvparams, mock_engine, step_stats, wire};
+pub use sim_trace::{latency, perfetto, trace, trace_convert};
 
 use dataplane::PdRole;
 use latency::KnobLatency;

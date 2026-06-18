@@ -9,5 +9,6 @@
 
 pub mod config_hash;
 pub mod latency;
+pub mod perfetto;
 pub mod trace;
 pub mod trace_convert;

@@ -9,6 +9,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use inference_simulator_rs::calibrate::{self, PromptReplay, SessionPacing, SimDriver};
+use inference_simulator_rs::perfetto::{Overlays, PerfettoOptions, write_perfetto};
+use inference_simulator_rs::step_stats::{read_step_stats, step_spans, step_stats_counters};
 use inference_simulator_rs::trace::{TraceWriter, open_trace_reader, read_trace_file};
 use inference_simulator_rs::trace_convert::{
     ConvertOptions, convert_guidellm, summarize_trace, write_conversion, write_summary,
@@ -78,6 +80,36 @@ enum Command {
     Summarize {
         /// Path to the JSONL trace file.
         input: PathBuf,
+    },
+    /// Convert a trace into the Chrome Trace Event Format (drop the output on
+    /// <https://ui.perfetto.dev> to view request spans over a concurrency
+    /// counter). Reads `.gz` traces transparently.
+    Perfetto {
+        /// Path to the JSONL trace file (`.gz` ok).
+        input: PathBuf,
+        /// Output JSON path. Defaults to stdout when omitted (or no stdout dump
+        /// when `--open` is set).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Step-stats sidecar (`--step-stats-out` from the tap, `.gz` ok) to
+        /// overlay as batch-level counter tracks: scheduler queue depths,
+        /// KV-cache usage, and spec-decode acceptance rate.
+        #[arg(long)]
+        step_stats: Option<PathBuf>,
+        /// Override the process-row label (defaults to the trace's model).
+        #[arg(long)]
+        name: Option<String>,
+        /// Give every request its own track instead of packing them into
+        /// reusable lanes (peak-concurrency rows). Handy for small traces.
+        #[arg(long)]
+        track_per_request: bool,
+        /// Serve the trace over localhost and open it in the Perfetto UI. Blocks
+        /// (the UI fetches from this process) until Ctrl-C.
+        #[arg(long)]
+        open: bool,
+        /// Port for `--open`'s local server.
+        #[arg(long, default_value_t = 9001)]
+        port: u16,
     },
     /// Synthesize a heavy-tailed demo trace for calibration testing.
     GenDemo {
@@ -256,6 +288,59 @@ fn run() -> Result<ExitCode> {
             let mut writer = BufWriter::new(stdout.lock());
             write_summary(&mut writer, &meta, &stats)?;
         }
+        Command::Perfetto {
+            input,
+            output,
+            step_stats,
+            name,
+            track_per_request,
+            open,
+            port,
+        } => {
+            let (meta, records) = read_trace_file(&input)?;
+            let opts = PerfettoOptions {
+                process_name: name,
+                track_per_request,
+            };
+
+            // Optional sidecar overlays: batch-level counter tracks plus the
+            // step-centric step-span track (true per-step prefill/decode view).
+            let overlays = match step_stats {
+                Some(path) => {
+                    let reader = open_trace_reader(&path)?;
+                    let snapshots = read_step_stats(reader)?;
+                    Overlays {
+                        counters: step_stats_counters(&snapshots),
+                        steps: step_spans(&snapshots),
+                    }
+                }
+                None => Overlays::default(),
+            };
+
+            // Render once into memory, then route: save, serve, and/or dump.
+            let mut bytes = Vec::new();
+            let summary = write_perfetto(&mut bytes, &meta, &records, &overlays, &opts)?;
+
+            if let Some(path) = &output {
+                fs::write(path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+                eprintln!("wrote {} events to {}", summary.events, path.display());
+            }
+            if summary.dropped_requests > 0 {
+                eprintln!(
+                    "note: {} of {} records had no arrival_ms and were dropped (cannot place on a timeline)",
+                    summary.dropped_requests,
+                    summary.placed_requests + summary.dropped_requests,
+                );
+            }
+
+            if open {
+                serve_perfetto(&bytes, port)?;
+            } else if output.is_none() {
+                io::stdout()
+                    .write_all(&bytes)
+                    .context("writing perfetto trace to stdout")?;
+            }
+        }
         Command::GenDemo {
             output,
             records,
@@ -374,6 +459,69 @@ fn run() -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Serve the rendered trace bytes over localhost (CORS-open so the hosted
+/// Perfetto UI can fetch them) and open the UI deep-linked to it. The UI pulls
+/// the file from this process, so we stay up serving every request until the
+/// user interrupts. Single in-memory body, served verbatim on any path.
+fn serve_perfetto(trace_json: &[u8], port: u16) -> Result<()> {
+    use std::io::Read as _;
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .with_context(|| format!("binding 127.0.0.1:{port} (is the port already in use?)"))?;
+    let trace_url = format!("http://127.0.0.1:{port}/trace.json");
+    let ui_url = format!("https://ui.perfetto.dev/#!/?url={trace_url}");
+
+    open_browser(&ui_url);
+    eprintln!("serving {} bytes at {trace_url}", trace_json.len());
+    eprintln!("opening {ui_url}");
+    eprintln!("Ctrl-C when you're done viewing.");
+
+    // CORS headers on every response: Perfetto fetches cross-origin from
+    // ui.perfetto.dev, so the body must be allowed for any origin.
+    let header = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        trace_json.len()
+    );
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::warn!("perfetto serve: accept failed: {e}");
+                continue;
+            }
+        };
+        // Drain the request line/headers so the client's write completes before
+        // we reply; we serve the same body regardless of what was asked for.
+        let mut scratch = [0u8; 2048];
+        let _ = stream.read(&mut scratch);
+        if let Err(e) = stream
+            .write_all(header.as_bytes())
+            .and_then(|()| stream.write_all(trace_json))
+        {
+            tracing::warn!("perfetto serve: write failed: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Open a URL in the platform browser, best-effort. A failure here is not fatal:
+/// the server is already up, so we just print the URL for the user to paste.
+fn open_browser(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    if let Err(e) = std::process::Command::new(opener).arg(url).spawn() {
+        eprintln!("could not launch browser via `{opener}` ({e}); open this URL yourself:\n{url}");
+    }
 }
 
 /// Print a calibration report to stdout in the requested format.

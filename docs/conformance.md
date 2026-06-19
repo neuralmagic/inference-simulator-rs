@@ -199,11 +199,11 @@ GitHub OIDC, scoped to `s3:GetObject` on `conformance/*` only.
 # Path convention: conformance/<vllm_tag>/<gpu>/<model>/<workload>[-<seed>].jsonl.gz
 # where <vllm_tag> is the release tag (v0.23.0) or "nightly" (tracks main). These
 # mirror config_hash inputs (vllm_tag/gpu/model), so captures across builds, hardware,
-# and models don't collide. CI mirrors the full key locally.
+# and models don't collide.
 aws s3 cp trace.jsonl.gz \
   "$CONFORMANCE_BUCKET/conformance/<vllm_tag>/<gpu>/<model>/<workload>-<seed>.jsonl.gz"
 
-# 2. Record the sha256 (the manifest key CI verifies after fetch).
+# 2. Record the sha256 (the conformance runner verifies it after fetch).
 sha256sum trace.jsonl.gz
 ```
 
@@ -212,8 +212,8 @@ Add a `[[golden]]` entry to `conformance/manifest.toml`:
 ```toml
 [[golden]]
 line        = "0.23"                                  # matches a compat.toml line
-bucket_path = "conformance/v0.23.0/H200/Qwen/Qwen3-8B/multiturn-seed7.jsonl.gz" # key within the bucket
-sha256      = "<sha256 of the uploaded .gz>"          # CI verifies this post-fetch
+bucket_path = "conformance/v0.23.0/H200/Qwen/Qwen3-8B/multiturn-seed7.jsonl.gz" # key under $CONFORMANCE_BUCKET (or a full s3:// URI)
+sha256      = "<sha256 of the uploaded .gz>"          # runner verifies this after fetch
 config_hash = "<the trace's config_hash>"             # replay asserts --expect-config-hash
 workload    = "multiturn"                              # human-readable workload label
 role        = "fidelity"                              # "schema" or "fidelity"
@@ -248,13 +248,15 @@ runs entirely on CPU, so the CI matrix invokes it per line after building agains
 line's `protocol_rev`:
 
 ```bash
-CONFORMANCE_GOLDENS=/path/to/fetched cargo test --test conformance -- --nocapture
+CONFORMANCE_BUCKET=s3://your-bucket cargo test --test conformance -- --nocapture
 ```
 
 For the line this build targets (`VLLM_TARGET_VERSION`, stamped from `compat.toml`), it
-reads `conformance/manifest.toml`, and for each `[[golden]]` on that line resolves the
-fetched file at `$CONFORMANCE_GOLDENS/<basename(bucket_path)>`. It then asserts:
+reads `conformance/manifest.toml`, and for each `[[golden]]` on that line fetches the
+golden straight from S3 via `sim-s3` (a full `s3://` `bucket_path` as-is, else the key
+joined under `$CONFORMANCE_BUCKET`). It then asserts:
 
+- integrity: the fetched bytes hash to the manifest `sha256`.
 - line: the golden's recorded `vllm_version` is on the same `major.minor` line as the
   build (`assert_same_line`).
 - provenance: the trace's `config_hash` equals the manifest entry's `config_hash`.
@@ -265,10 +267,10 @@ fetched file at `$CONFORMANCE_GOLDENS/<basename(bucket_path)>`. It then asserts:
 - fidelity (`role = "fidelity"`): boots the sim on the golden under the `config_hash`
   gate and asserts every recorded token stream replays byte-identically.
 
-It skips cleanly (passes without asserting) when there are no goldens for the line or
-`$CONFORMANCE_GOLDENS` is unset, which is the normal state until captures exist. Set
-`$CONFORMANCE_MANIFEST` to point at an alternate manifest. The pure assertions live in
-`src/conformance.rs` and are unit-tested independently of any real capture.
+It skips cleanly (passes without asserting) when there are no goldens for the line,
+which is the normal state until captures exist. Set `$CONFORMANCE_MANIFEST` to point at
+an alternate manifest. The pure assertions live in `src/conformance.rs` and are
+unit-tested independently of any real capture.
 
 ## The GPU-free replay half
 

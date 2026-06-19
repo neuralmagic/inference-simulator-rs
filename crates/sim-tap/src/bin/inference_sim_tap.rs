@@ -32,11 +32,11 @@
 //!   per chunk, with token counts in the record's `itl_tokens`.
 //! - Aborted requests are silently discarded (no trace record emitted).
 
-use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::Parser;
+use sim_s3::TraceUri;
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, info};
 
@@ -69,12 +69,14 @@ struct TapOpt {
     #[arg(long, default_value = "tcp://127.0.0.1:29561")]
     output_address: String,
 
-    /// Path to write the JSONL trace output. Gzip-compressed when the path
-    /// ends in `.gz` (recommended with --record-tokens, which grows traces by
-    /// one integer per generated token); the stream is finalized on Ctrl-C,
-    /// so don't SIGKILL the tap if you want a well-terminated gzip file.
+    /// Path or `s3://bucket/key` URI to write the JSONL trace output.
+    /// Gzip-compressed when the path ends in `.gz` (recommended with
+    /// --record-tokens, which grows traces by one integer per generated token);
+    /// the stream is finalized on SIGINT/SIGTERM, so don't SIGKILL the tap if
+    /// you want a well-terminated gzip file. An `s3://` target is written to a
+    /// local scratch file and uploaded as one object after finalize.
     #[arg(long)]
-    trace_out: String,
+    trace_out: TraceUri,
 
     /// Model name recorded in the trace metadata line.
     #[arg(long, default_value = "")]
@@ -136,13 +138,14 @@ struct TapOpt {
     )]
     record_tokens: TokenRecording,
 
-    /// Path to also write per-step scheduler-stats snapshots (JSONL, one line
-    /// per engine output message that carried stats; gzip when the path ends
-    /// in `.gz`). Includes spec-decoding draft/acceptance counts when the
-    /// engine runs with speculative decoding. Requires the engine's stats
-    /// logging to be enabled, otherwise the file stays empty.
+    /// Path or `s3://bucket/key` URI to also write per-step scheduler-stats
+    /// snapshots (JSONL, one line per engine output message that carried stats;
+    /// gzip when the path ends in `.gz`). Includes spec-decoding
+    /// draft/acceptance counts when the engine runs with speculative decoding.
+    /// Requires the engine's stats logging to be enabled, otherwise the file
+    /// stays empty. `s3://` targets upload after finalize, like --trace-out.
     #[arg(long)]
-    step_stats_out: Option<String>,
+    step_stats_out: Option<TraceUri>,
 }
 
 fn init_tracing() {
@@ -154,16 +157,43 @@ fn init_tracing() {
         .init();
 }
 
+/// A cancellation token triggered by SIGINT (Ctrl-C) or SIGTERM. SIGTERM is the
+/// signal Kubernetes sends on `scale 0`/pod delete, so without it the tap's
+/// finalize (gzip trailer + S3 upload) never runs on cluster teardown. Mirrors
+/// the main sim's `wait_for_signal`.
 fn shutdown_signal() -> CancellationToken {
     let token = CancellationToken::new();
     let shutdown = token.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            info!("received Ctrl-C, shutting down tap");
-            shutdown.cancel();
-        }
+        let signal = wait_for_signal().await;
+        info!(signal, "received shutdown signal, shutting down tap");
+        shutdown.cancel();
     });
     token
+}
+
+#[cfg(unix)]
+async fn wait_for_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = sigterm.recv() => "SIGTERM",
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to install SIGTERM handler; handling SIGINT only");
+            let _ = tokio::signal::ctrl_c().await;
+            "SIGINT"
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "ctrl-c"
 }
 
 fn main() -> ExitCode {
@@ -194,7 +224,14 @@ fn main() -> ExitCode {
 }
 
 async fn run_main(opt: TapOpt) -> Result<()> {
-    let mut writer = TraceWriter::create(Path::new(&opt.trace_out))?;
+    let scratch_dir = std::env::temp_dir();
+    let trace_local = opt.trace_out.write_path(&scratch_dir);
+    let step_local = opt
+        .step_stats_out
+        .as_ref()
+        .map(|uri| uri.write_path(&scratch_dir));
+
+    let mut writer = TraceWriter::create(&trace_local)?;
 
     // The meta line is written by run_tap after the handshake, so it can stamp
     // the engine's reported version and raw ready-response bytes.
@@ -218,19 +255,19 @@ async fn run_main(opt: TapOpt) -> Result<()> {
         record_tokens: opt.record_tokens,
     };
 
-    let mut step_writer = opt
-        .step_stats_out
-        .as_deref()
-        .map(|path| TraceWriter::create(Path::new(path)))
-        .transpose()?;
+    let mut step_writer = step_local.as_deref().map(TraceWriter::create).transpose()?;
 
     let shutdown = shutdown_signal();
-    // Finalize the writers even when the proxy dies on a transport error: a
-    // gzip stream without its trailer reads as truncated.
+    // Finalize and upload even on transport error: an untrailered gzip stream
+    // reads as truncated, so a clean shutdown must always land a complete object.
     let result = run_tap(config, meta, &mut writer, step_writer.as_mut(), shutdown).await;
     writer.finish()?;
+    opt.trace_out.upload(&trace_local).await?;
     if let Some(step_writer) = step_writer {
         step_writer.finish()?;
+        if let (Some(uri), Some(local)) = (&opt.step_stats_out, &step_local) {
+            uri.upload(local).await?;
+        }
     }
     result
 }

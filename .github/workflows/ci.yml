@@ -146,9 +146,10 @@ jobs:
       # compat.toml default for every leg. Drives the advertised vllm_version and the
       # conformance line check; build.rs reads this env first (see build.rs / src/lib.rs).
       VLLM_TARGET_VERSION: ${{ matrix.tag }}
-      # Object-store bucket holding the golden captures (NOT in the repo; fetched by
-      # sha). Each manifest entry's bucket_path is the key within it (the conformance/
-      # prefix the fetch role is scoped to).
+      # Object-store bucket holding the golden captures (NOT in the repo). The
+      # conformance runner reads each manifest bucket_path straight from here via
+      # sim-s3 (it joins this bucket onto the key); the fetch role is scoped to
+      # the conformance/ prefix.
       CONFORMANCE_BUCKET: "s3://llm-d-artifacts-783952637884"
       AWS_REGION: us-east-1
     steps:
@@ -187,45 +188,16 @@ jobs:
           role-to-assume: arn:aws:iam::783952637884:role/llm-d-conformance-ci
           aws-region: us-east-1
 
-      # Fetch this line's goldens from the private bucket and verify their sha256
-      # against conformance/manifest.toml before replaying.
-      - name: Fetch + verify goldens (vLLM ${{ matrix.line }})
-        if: ${{ matrix.has_goldens }}
-        run: |
-          set -euo pipefail
-          mkdir -p goldens
-          python3 - "${{ matrix.line }}" <<'PY' > goldens/fetch-plan.tsv
-          import sys, tomllib
-          line = sys.argv[1]
-          with open("conformance/manifest.toml", "rb") as f:
-              manifest = tomllib.load(f)
-          for g in manifest.get("golden", []):
-              if g["line"] != line:
-                  continue
-              # bucket_path<TAB>sha256
-              print("\t".join([g["bucket_path"], g["sha256"]]))
-          PY
-          # Mirror the bucket key under goldens/ (not just the basename) so the path's
-          # model/workload structure is preserved and the conformance runner resolves
-          # each golden at $CONFORMANCE_GOLDENS/<bucket_path>.
-          while IFS=$'\t' read -r bucket_path sha256; do
-            local_file="goldens/${bucket_path}"
-            mkdir -p "$(dirname "$local_file")"
-            echo "==> fetch ${CONFORMANCE_BUCKET}/${bucket_path}"
-            aws s3 cp "${CONFORMANCE_BUCKET}/${bucket_path}" "${local_file}"
-            echo "${sha256}  ${local_file}" | sha256sum --check --strict
-          done < goldens/fetch-plan.tsv
-
       # The runner is tests/conformance.rs: manifest-driven, CPU-only. It reads
-      # conformance/manifest.toml, resolves each golden for this build's line under
-      # $CONFORMANCE_GOLDENS/<basename(bucket_path)>, and asserts line + provenance
-      # (config_hash) + schema + fidelity (see docs/conformance.md). It skips cleanly
-      # when no golden was fetched, so the step is safe before captures exist. The
-      # hard-gate-vs-informational distinction is the job-level continue-on-error
-      # (fidelity_validated lines block; others annotate only).
+      # conformance/manifest.toml, fetches each golden for this build's line
+      # straight from $CONFORMANCE_BUCKET via sim-s3 (using the AWS creds the OIDC
+      # step exported), verifies the integrity sha256, and asserts line +
+      # provenance (config_hash) + schema + fidelity (see docs/conformance.md). It
+      # skips cleanly when no golden is listed for the line, so the step is safe
+      # before captures exist. The hard-gate-vs-informational distinction is the
+      # job-level continue-on-error (fidelity_validated lines block; others
+      # annotate only).
       - name: Conformance replay (vLLM ${{ matrix.line }})
-        env:
-          CONFORMANCE_GOLDENS: goldens
         run: |
           set -euo pipefail
           cargo test --test conformance -- --nocapture

@@ -12,10 +12,11 @@
 use anyhow::{Context as _, Result, bail};
 use clap::Parser;
 use sim_protocol::mock_engine::{DEFAULT_MOCK_MAX_MODEL_LEN, MockEngineSockets, default_dtype};
+use sim_s3::TraceUri;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use vllm_engine_core_client::EngineId;
 use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
@@ -120,17 +121,18 @@ pub struct Opt {
     #[arg(long, default_value_t = 32_000)]
     pub vocab_size: u32,
 
-    /// Path to a JSONL trace whose recorded output token ids (tap
-    /// `--record-tokens`) are served verbatim instead of random tokens, making
+    /// Path or `s3://bucket/key` URI to a JSONL trace whose recorded output
+    /// token ids (tap `--record-tokens`) are served verbatim instead of random tokens, making
     /// replayed streams content-identical to the capture. A request resolves
     /// to its record through the trailing `-<index>` of its request id, where
     /// the index is the record's position in the arrival-ordered subset (the
     /// arrival-replay harness names them `replay-{i}`). Unmatched requests
     /// fall back to random tokens.
-    #[arg(long, default_value = "")]
-    pub replay_tokens: String,
+    #[arg(long)]
+    pub replay_tokens: Option<TraceUri>,
 
-    /// JSONL trace whose recorded per-chunk decode timing (`itl_ms` gaps and
+    /// JSONL trace (path or `s3://bucket/key` URI) whose recorded per-chunk
+    /// decode timing (`itl_ms` gaps and
     /// `itl_tokens` burst sizes) is replayed VERBATIM, the timing/framing
     /// analogue of `--replay-tokens`. This is the *replay* timing axis;
     /// `--latency-trace` is the *modeled* one (gaps and bursts sampled from a
@@ -138,8 +140,8 @@ pub struct Opt {
     /// (speculative-decoding bursts, diffusion blocks) at its recorded gaps and
     /// stops at the recorded length; unmatched requests stay on the configured
     /// latency model. Requests resolve to records via `--replay-match`.
-    #[arg(long, default_value = "")]
-    pub replay_steps: String,
+    #[arg(long)]
+    pub replay_steps: Option<TraceUri>,
 
     /// How `--replay-tokens` and `--replay-steps` map incoming requests to
     /// trace records: `index` trusts the request id's trailing `-<i>` (our own
@@ -198,7 +200,7 @@ pub struct Opt {
     // === Latency model (all milliseconds; 0 = instant, the default) ===
     // Ported from llm-d-inference-sim. The real frontend measures TTFT/ITL from when we
     // emit tokens, so these knobs drive both response timing and the vllm:* latency metrics.
-    /// Path to a JSONL trace file for MODELED latency. Mutually exclusive with the
+    /// Path or `s3://bucket/key` URI to a JSONL trace file for MODELED latency. Mutually exclusive with the
     /// timing knobs below (time_to_first_token, inter_token_latency, prefill_*). When set,
     /// first-token and inter-token delays are SAMPLED from a model fitted to the recorded
     /// observations (conditioned on concurrency, context depth, prompt size) rather than
@@ -207,8 +209,8 @@ pub struct Opt {
     /// instead, use `--replay-steps`. KV-transfer timing for do_remote_prefill requests
     /// still uses the kv_cache_transfer_* knobs (the trace does not cover P/D transfer
     /// latencies).
-    #[arg(long, default_value = "")]
-    pub latency_trace: String,
+    #[arg(long)]
+    pub latency_trace: Option<TraceUri>,
 
     /// Fixed time-to-first-token. When this and its std-dev are 0, the token-count prefill
     /// model (`--prefill-overhead` + `--prefill-time-per-token`) is used instead.
@@ -412,25 +414,23 @@ impl Opt {
     /// Build the token source: replay recorded output ids (from `--replay-tokens`) or
     /// random draws. Returns an error if the trace is unreadable or carries no tokens.
     pub(crate) fn build_token_source(&self) -> Result<Box<dyn tokens::TokenSource>> {
-        if self.replay_tokens.is_empty() {
+        let Some(uri) = &self.replay_tokens else {
             return Ok(Box::new(tokens::RandomTokens {
                 vocab_size: self.vocab_size,
             }));
-        }
-        let (meta, records) = trace::read_trace_file(std::path::Path::new(&self.replay_tokens))?;
+        };
+        let (meta, records) = trace::read_trace_file(local_input(uri, "--replay-tokens")?)?;
         let subset = trace::replay_subset(records);
         if subset.is_empty() {
             bail!(
-                "--replay-tokens trace {} has no records with arrival_ms (nothing to \
-                 establish the replay order)",
-                self.replay_tokens
+                "--replay-tokens trace {uri} has no records with arrival_ms (nothing to \
+                 establish the replay order)"
             );
         }
         if !subset.iter().any(|r| r.output_token_ids.is_some()) {
             bail!(
-                "--replay-tokens trace {} has no output_token_ids; capture it with the \
-                 tap's --record-tokens",
-                self.replay_tokens
+                "--replay-tokens trace {uri} has no output_token_ids; capture it with the \
+                 tap's --record-tokens"
             );
         }
         match self.replay_match {
@@ -444,9 +444,8 @@ impl Opt {
                     .any(|r| r.block_hashes.as_ref().is_some_and(|h| !h.is_empty()))
                 {
                     bail!(
-                        "--replay-match prefix needs block_hashes in trace {}; the tap \
-                         records them by default for prompts of at least one block",
-                        self.replay_tokens
+                        "--replay-match prefix needs block_hashes in trace {uri}; the tap \
+                         records them by default for prompts of at least one block"
                     );
                 }
                 let block_size = meta.block_size.unwrap_or(self.tokens_per_block);
@@ -464,23 +463,20 @@ impl Opt {
     /// model). Returns an error if the trace is unreadable or carries no
     /// per-chunk timing to replay.
     pub(crate) fn build_step_source(&self) -> Result<Option<Box<dyn replay_steps::StepSource>>> {
-        if self.replay_steps.is_empty() {
+        let Some(uri) = &self.replay_steps else {
             return Ok(None);
-        }
-        let (meta, records) = trace::read_trace_file(std::path::Path::new(&self.replay_steps))?;
+        };
+        let (meta, records) = trace::read_trace_file(local_input(uri, "--replay-steps")?)?;
         let subset = trace::replay_subset(records);
         if subset.is_empty() {
             bail!(
-                "--replay-steps trace {} has no records with arrival_ms (nothing to \
-                 establish the replay order)",
-                self.replay_steps
+                "--replay-steps trace {uri} has no records with arrival_ms (nothing to \
+                 establish the replay order)"
             );
         }
         if !subset.iter().any(|r| r.itl_ms.is_some()) {
             bail!(
-                "--replay-steps trace {} has no itl_ms; there is no per-chunk timing to \
-                 replay",
-                self.replay_steps
+                "--replay-steps trace {uri} has no itl_ms; there is no per-chunk timing to replay"
             );
         }
         match self.replay_match {
@@ -493,9 +489,8 @@ impl Opt {
                     .any(|r| r.block_hashes.as_ref().is_some_and(|h| !h.is_empty()))
                 {
                     bail!(
-                        "--replay-match prefix needs block_hashes in trace {}; the tap \
-                         records them by default for prompts of at least one block",
-                        self.replay_steps
+                        "--replay-match prefix needs block_hashes in trace {uri}; the tap \
+                         records them by default for prompts of at least one block"
                     );
                 }
                 let block_size = meta.block_size.unwrap_or(self.tokens_per_block);
@@ -538,27 +533,29 @@ impl Opt {
         }
         // The three replay inputs are usually the same file; dedupe so we read
         // each trace's header once.
-        let mut paths: Vec<&str> = [
-            self.replay_tokens.as_str(),
-            self.replay_steps.as_str(),
-            self.latency_trace.as_str(),
+        let mut paths: Vec<&std::path::Path> = [
+            self.replay_tokens.as_ref(),
+            self.replay_steps.as_ref(),
+            self.latency_trace.as_ref(),
         ]
         .into_iter()
-        .filter(|p| !p.is_empty())
-        .collect();
+        .flatten()
+        .map(|uri| local_input(uri, "--expect-config-hash trace"))
+        .collect::<Result<_>>()?;
         paths.sort_unstable();
         paths.dedup();
 
         for path in paths {
-            let meta = trace::read_trace_meta(std::path::Path::new(path))?;
+            let meta = trace::read_trace_meta(path)?;
+            let display = path.display();
             match meta.config_hash.as_deref() {
                 Some(found) if found == self.expect_config_hash => {}
                 Some(found) => bail!(
-                    "config-hash mismatch for trace {path}: expected {}, trace was captured under {found}",
+                    "config-hash mismatch for trace {display}: expected {}, trace was captured under {found}",
                     self.expect_config_hash
                 ),
                 None => bail!(
-                    "trace {path} has no config_hash but --expect-config-hash {} was set \
+                    "trace {display} has no config_hash but --expect-config-hash {} was set \
                      (recapture with the tap's --config-hash, or drop the check)",
                     self.expect_config_hash
                 ),
@@ -571,9 +568,9 @@ impl Opt {
     /// knob-based. Returns an error if both are configured or if the trace file is
     /// unreadable.
     pub fn build_latency(&self) -> Result<Box<dyn latency::LatencyModel>> {
-        if self.latency_trace.is_empty() {
+        let Some(uri) = &self.latency_trace else {
             return Ok(Box::new(self.latency_model()));
-        }
+        };
 
         if self.has_timing_knobs() {
             bail!(
@@ -583,7 +580,7 @@ impl Opt {
             );
         }
 
-        let (meta, records) = trace::read_trace_file(std::path::Path::new(&self.latency_trace))?;
+        let (meta, records) = trace::read_trace_file(local_input(uri, "--latency-trace")?)?;
 
         // The KV-transfer knobs are NOT mutually exclusive: the trace does not cover
         // P/D transfer timing, so the knob model handles do_remote_prefill requests.
@@ -594,10 +591,16 @@ impl Opt {
             kv_fallback,
             self.max_num_batched_tokens as usize,
         )
-        .with_context(|| format!("building trace latency model from: {}", self.latency_trace))?;
+        .with_context(|| format!("building trace latency model from: {uri}"))?;
 
         Ok(Box::new(trace_model))
     }
+}
+
+/// Local path of a replay input (materialized by `run()` before any `build_*`).
+fn local_input<'a>(uri: &'a TraceUri, flag: &str) -> Result<&'a std::path::Path> {
+    uri.local_path()
+        .with_context(|| format!("{flag} {uri} was not materialized to a local path"))
 }
 
 /// Run one mock engine until shutdown completes or the transport fails. Shutdown is
@@ -707,8 +710,45 @@ async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) ->
     Ok(())
 }
 
+/// Materialize any `s3://` replay inputs (`--replay-tokens`, `--replay-steps`,
+/// `--latency-trace`) to local scratch files, rewriting the option fields to the
+/// local paths. Identical URIs are fetched once (the three inputs are usually
+/// the same trace), matching how `verify_config_hash` dedupes them.
+async fn materialize_remote_inputs(opt: &mut Opt) -> Result<()> {
+    let scratch_dir = std::env::temp_dir();
+    let mut fetched: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
+
+    for field in [
+        &mut opt.replay_tokens,
+        &mut opt.replay_steps,
+        &mut opt.latency_trace,
+    ] {
+        let Some(uri) = field.as_ref().filter(|u| u.is_remote()) else {
+            continue;
+        };
+        let key = uri.to_string();
+        let local = match fetched.get(&key) {
+            Some(local) => {
+                debug!(uri = %key, local = %local.display(), "reusing already-fetched replay input");
+                local.clone()
+            }
+            None => {
+                info!(uri = %key, "materializing remote replay input");
+                let local = uri.materialize(&scratch_dir).await?;
+                fetched.insert(key, local.clone());
+                local
+            }
+        };
+        *field = Some(TraceUri::Local(local));
+    }
+    Ok(())
+}
+
 /// Run all requested mock engines until cancellation or one engine task fails.
-pub async fn run(opt: Opt, shutdown: CancellationToken) -> Result<()> {
+pub async fn run(mut opt: Opt, shutdown: CancellationToken) -> Result<()> {
+    materialize_remote_inputs(&mut opt).await?;
+
     // Validate the latency configuration (knob/trace conflict, trace parse) before any
     // transport setup, so a bad config fails immediately instead of after the 30s
     // frontend handshake timeout. Engines rebuild their own copy in SimEngine::new.

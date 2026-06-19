@@ -1,9 +1,11 @@
 //! Manifest-driven conformance runner (capture-once-GPU / replay-many-CPU).
 //!
 //! For the vLLM line this build targets (`VLLM_TARGET_VERSION`), this reads
-//! `conformance/manifest.toml`, locates each golden the CI fetch step placed
-//! under `$CONFORMANCE_GOLDENS`, and asserts the build conforms:
+//! `conformance/manifest.toml`, fetches each golden straight from S3 via
+//! `sim-s3`, verifies its integrity against the manifest sha256, and asserts the
+//! build conforms:
 //!
+//!   - integrity: the fetched bytes hash to the manifest's `sha256`.
 //!   - line: the golden was captured from an engine on this build's line.
 //!   - provenance: the trace's `config_hash` matches what the manifest claims.
 //!   - schema: the sim's `SimReadyResponse` covers every field the captured
@@ -11,13 +13,15 @@
 //!   - fidelity: replayed token streams are byte-identical to the capture
 //!     (fidelity-role goldens that recorded tokens).
 //!
-//! It skips cleanly (returns, doesn't fail) when there are no goldens for this
-//! line or `$CONFORMANCE_GOLDENS` is unset, which is the normal state until
-//! captures exist. The CI matrix sets `$CONFORMANCE_GOLDENS` after fetching by
-//! sha; locally:
+//! Each manifest `bucket_path` is resolved to an S3 URI: a full `s3://…` URI is
+//! used as-is; a bare key is joined under `$CONFORMANCE_BUCKET`. With no bucket
+//! set, `bucket_path` is treated as a local filesystem path (dev / the synthetic
+//! test below). It skips cleanly (returns, doesn't fail) when there are no
+//! goldens for this line, the normal state until captures exist. The CI matrix
+//! sets `$CONFORMANCE_BUCKET` and assumes the golden-fetch role; locally:
 //!
 //! ```bash
-//! CONFORMANCE_GOLDENS=/path/to/fetched cargo test --test conformance -- --nocapture
+//! CONFORMANCE_BUCKET=s3://your-bucket cargo test --test conformance -- --nocapture
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -36,6 +40,7 @@ use inference_simulator_rs::frontend_connect::SimReadyResponse;
 use inference_simulator_rs::trace::{TraceMeta, read_trace_file, replay_subset};
 use inference_simulator_rs::{Opt, VLLM_TARGET_VERSION, run};
 use sim_compat::{GoldenManifest, GoldenRole};
+use sim_s3::TraceUri;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -176,9 +181,38 @@ async fn check_fidelity(trace_path: &Path) {
     eprintln!("  fidelity: {with_tokens} token streams byte-identical, finish reasons match");
 }
 
+/// Resolve a manifest `bucket_path` to a [`TraceUri`]: a full `s3://…` URI as-is,
+/// a bare key joined under `bucket`, or (no bucket) a local filesystem path.
+fn resolve_location(bucket: Option<&str>, bucket_path: &str) -> TraceUri {
+    let raw = match bucket {
+        Some(bucket) if !sim_s3::is_remote(bucket_path) => {
+            format!("{}/{}", bucket.trim_end_matches('/'), bucket_path)
+        }
+        _ => bucket_path.to_string(),
+    };
+    raw.parse()
+        .unwrap_or_else(|e| panic!("invalid golden location {raw}: {e}"))
+}
+
+/// Assert the golden's bytes hash to the manifest sha256.
+fn verify_sha256(path: &Path, expected_hex: &str) {
+    use sha2::{Digest as _, Sha256};
+    let bytes = std::fs::read(path).expect("read golden for sha256");
+    let actual: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        actual,
+        expected_hex,
+        "golden integrity: sha256 of {} must match the manifest",
+        path.display()
+    );
+}
+
 /// Run conformance against a manifest. Returns the number of goldens actually
-/// checked (0 means cleanly skipped: none for this line, or none fetched).
-async fn run_conformance(manifest_path: &Path, goldens_dir: Option<&Path>) -> usize {
+/// checked (0 means cleanly skipped: none listed for this line).
+async fn run_conformance(manifest_path: &Path, bucket: Option<&str>) -> usize {
     let manifest = GoldenManifest::load(manifest_path).expect("load conformance manifest");
     // The build's compat line: the major.minor for a release tag (v0.23.0 -> 0.23), or
     // the tag verbatim when it has no major.minor (e.g. "nightly", which tracks main).
@@ -192,34 +226,32 @@ async fn run_conformance(manifest_path: &Path, goldens_dir: Option<&Path>) -> us
         return 0;
     }
 
-    let Some(dir) = goldens_dir else {
-        eprintln!(
-            "no goldens dir; {} golden(s) listed for line {line} but not fetched, skipping",
-            goldens.len()
-        );
-        return 0;
-    };
-
+    let scratch = std::env::temp_dir();
     let mut checked = 0;
     for golden in goldens {
-        // The CI fetch step mirrors the bucket key under $CONFORMANCE_GOLDENS, so the
-        // local path is the bucket_path joined onto the fetch dir. Keeping the full key
-        // (not just the basename) lets the path carry the model/workload structure
-        // (conformance/<line>/<model>/<workload>...) without filename collisions.
-        let trace_path = dir.join(&golden.bucket_path);
-        if !trace_path.exists() {
-            eprintln!(
-                "  {} ({:?}) not present at {}; skipping",
-                golden.workload,
-                golden.role,
-                trace_path.display()
-            );
-            continue;
-        }
+        let location = resolve_location(bucket, &golden.bucket_path);
+        // A listed remote golden must fetch; a missing local path (dev) is a skip.
+        let trace_path = match location.local_path() {
+            Some(path) if !path.exists() => {
+                eprintln!(
+                    "  {} ({:?}) not present at {}; skipping",
+                    golden.workload,
+                    golden.role,
+                    path.display()
+                );
+                continue;
+            }
+            _ => location
+                .materialize(&scratch)
+                .await
+                .unwrap_or_else(|e| panic!("fetch golden {location}: {e:#}")),
+        };
+
         eprintln!(
             "conformance: {} [{:?}] {}",
             golden.workload, golden.role, golden.bucket_path
         );
+        verify_sha256(&trace_path, &golden.sha256);
 
         let (meta, _) = read_trace_file(&trace_path).expect("read golden meta");
         check_meta(&meta, &golden.config_hash, golden.role);
@@ -233,8 +265,8 @@ async fn run_conformance(manifest_path: &Path, goldens_dir: Option<&Path>) -> us
 
 #[tokio::test]
 async fn build_conforms_to_its_vllm_line_goldens() {
-    let dir = std::env::var("CONFORMANCE_GOLDENS").ok().map(PathBuf::from);
-    run_conformance(&default_manifest_path(), dir.as_deref()).await;
+    let bucket = std::env::var("CONFORMANCE_BUCKET").ok();
+    run_conformance(&default_manifest_path(), bucket.as_deref()).await;
 }
 
 /// Drive the schema/line/provenance path end to end against a synthetic golden,
@@ -273,13 +305,9 @@ async fn synthetic_schema_golden_passes_the_static_checks() {
     rmpv::encode::write_value(&mut ready_bytes, &map).expect("encode ready response");
     let ready_hex: String = ready_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
-    // Unique temp dir for this test run.
     let dir = std::env::temp_dir().join(format!("conformance-synthetic-{}", std::process::id()));
-    // The golden lives at the bucket key under the fetch dir (mirrors the CI fetch).
-    let bucket_path = format!("conformance/{line}/test-gpu/test-org/test-model/golden.jsonl");
-    let golden_path = dir.join(&bucket_path);
-    std::fs::create_dir_all(golden_path.parent().expect("golden has a parent"))
-        .expect("create temp dir");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let golden_path = dir.join("golden.jsonl");
 
     let meta = TraceMeta {
         source: Some("tap".to_string()),
@@ -295,22 +323,32 @@ async fn synthetic_schema_golden_passes_the_static_checks() {
         writeln!(f).expect("newline");
     }
 
+    let sha256: String = {
+        use sha2::{Digest as _, Sha256};
+        let bytes = std::fs::read(&golden_path).expect("read golden");
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+
     let manifest_path = dir.join("manifest.toml");
     std::fs::write(
         &manifest_path,
         format!(
             "[[golden]]\n\
              line = \"{line}\"\n\
-             bucket_path = \"{bucket_path}\"\n\
-             sha256 = \"deadbeef\"\n\
+             bucket_path = \"{}\"\n\
+             sha256 = \"{sha256}\"\n\
              config_hash = \"{config_hash}\"\n\
              workload = \"synthetic\"\n\
-             role = \"schema\"\n"
+             role = \"schema\"\n",
+            golden_path.display()
         ),
     )
     .expect("write manifest");
 
-    let checked = run_conformance(&manifest_path, Some(&dir)).await;
+    let checked = run_conformance(&manifest_path, None).await;
     assert_eq!(checked, 1, "the synthetic schema golden must be checked");
 
     let _ = std::fs::remove_dir_all(&dir);

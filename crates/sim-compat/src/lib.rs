@@ -153,8 +153,9 @@ pub enum GoldenRole {
 pub struct GoldenEntry {
     /// vLLM line this golden validates; matches a [`VllmLine::line`].
     pub line: String,
-    /// Key within the private bucket (CI fetches `$CONFORMANCE_BUCKET/<bucket_path>`),
-    /// under the `conformance/` prefix, e.g. `conformance/0.23/sweep.jsonl.gz`.
+    /// Where the golden lives, fetched directly via sim-s3 by the conformance
+    /// runner. Either a full `s3://bucket/key` URI, or a bare key resolved under
+    /// `$CONFORMANCE_BUCKET` (e.g. `conformance/0.23/sweep.jsonl.gz`).
     pub bucket_path: String,
     /// Content hash. CI fetches and verifies the capture against this.
     pub sha256: String,

@@ -369,7 +369,7 @@ impl ActiveRequest {
         // return None and the requested max_tokens stands. Verbatim replay
         // (--replay-steps / --replay-tokens) pins each request to its own recorded
         // length downstream, so the marginal sampler must not pre-empt it.
-        let verbatim = !opt.replay_steps.is_empty() || !opt.replay_tokens.is_empty();
+        let verbatim = opt.replay_steps.is_some() || opt.replay_tokens.is_some();
         let max_tokens = if verbatim || !model_eos {
             max_tokens
         } else {

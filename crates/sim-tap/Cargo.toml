@@ -15,6 +15,7 @@ path = "src/bin/inference_sim_tap.rs"
 sim-trace = { workspace = true }
 sim-protocol = { workspace = true }
 sim-compat = { workspace = true }
+sim-s3 = { workspace = true }
 vllm-engine-core-client = { workspace = true }
 
 anyhow = { workspace = true }

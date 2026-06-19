@@ -15,6 +15,7 @@ use inference_simulator_rs::trace::{TraceWriter, open_trace_reader, read_trace_f
 use inference_simulator_rs::trace_convert::{
     ConvertOptions, convert_guidellm, summarize_trace, write_conversion, write_summary,
 };
+use sim_s3::TraceUri;
 
 #[derive(Parser)]
 #[command(
@@ -78,24 +79,24 @@ enum Command {
     },
     /// Print summary statistics from an existing trace file.
     Summarize {
-        /// Path to the JSONL trace file.
-        input: PathBuf,
+        /// Path or `s3://bucket/key` URI to the JSONL trace file.
+        input: TraceUri,
     },
     /// Convert a trace into the Chrome Trace Event Format (drop the output on
     /// <https://ui.perfetto.dev> to view request spans over a concurrency
     /// counter). Reads `.gz` traces transparently.
     Perfetto {
-        /// Path to the JSONL trace file (`.gz` ok).
-        input: PathBuf,
-        /// Output JSON path. Defaults to stdout when omitted (or no stdout dump
-        /// when `--open` is set).
+        /// Path or `s3://bucket/key` URI to the JSONL trace file (`.gz` ok).
+        input: TraceUri,
+        /// Output JSON path or `s3://bucket/key` URI. Defaults to stdout when
+        /// omitted (or no stdout dump when `--open` is set).
         #[arg(short, long)]
-        output: Option<PathBuf>,
-        /// Step-stats sidecar (`--step-stats-out` from the tap, `.gz` ok) to
-        /// overlay as batch-level counter tracks: scheduler queue depths,
-        /// KV-cache usage, and spec-decode acceptance rate.
+        output: Option<TraceUri>,
+        /// Step-stats sidecar (`--step-stats-out` from the tap, `.gz` ok, path
+        /// or `s3://` URI) to overlay as batch-level counter tracks: scheduler
+        /// queue depths, KV-cache usage, and spec-decode acceptance rate.
         #[arg(long)]
-        step_stats: Option<PathBuf>,
+        step_stats: Option<TraceUri>,
         /// Override the process-row label (defaults to the trace's model).
         #[arg(long)]
         name: Option<String>,
@@ -107,8 +108,11 @@ enum Command {
         /// (the UI fetches from this process) until Ctrl-C.
         #[arg(long)]
         open: bool,
-        /// Port for `--open`'s local server.
-        #[arg(long, default_value_t = 9001)]
+        /// Port for `--open`'s local server. Defaults to 0, letting the OS
+        /// pick a free ephemeral port (the actual URL is printed and opened),
+        /// so concurrent or just-restarted servers never collide. Pin it only
+        /// when you want a stable URL.
+        #[arg(long, default_value_t = 0)]
         port: u16,
     },
     /// Synthesize a heavy-tailed demo trace for calibration testing.
@@ -257,6 +261,34 @@ enum Command {
     },
 }
 
+/// Local path for an input URI; fetches s3:// to scratch on a short-lived runtime.
+fn materialize_input(uri: &TraceUri) -> Result<PathBuf> {
+    if let Some(path) = uri.local_path() {
+        return Ok(path.to_path_buf());
+    }
+    block_on(uri.materialize(&std::env::temp_dir()))
+}
+
+/// Write rendered bytes to an output URI: local files directly; s3:// staged to
+/// scratch and uploaded.
+fn write_output(bytes: &[u8], uri: &TraceUri) -> Result<()> {
+    let local = uri.write_path(&std::env::temp_dir());
+    fs::write(&local, bytes).with_context(|| format!("writing {}", local.display()))?;
+    if uri.is_remote() {
+        block_on(uri.upload(&local))?;
+    }
+    Ok(())
+}
+
+/// Run one async S3 op to completion on a fresh single-thread runtime.
+fn block_on<T>(fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime for S3 I/O")?
+        .block_on(fut)
+}
+
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
 
@@ -281,6 +313,7 @@ fn run() -> Result<ExitCode> {
             eprintln!("wrote {} records to {}", records.len(), output.display());
         }
         Command::Summarize { input } => {
+            let input = materialize_input(&input)?;
             let reader = open_trace_reader(&input)?;
             let (meta, stats) = summarize_trace(reader)?;
 
@@ -297,6 +330,7 @@ fn run() -> Result<ExitCode> {
             open,
             port,
         } => {
+            let input = materialize_input(&input)?;
             let (meta, records) = read_trace_file(&input)?;
             let opts = PerfettoOptions {
                 process_name: name,
@@ -306,7 +340,8 @@ fn run() -> Result<ExitCode> {
             // Optional sidecar overlays: batch-level counter tracks plus the
             // step-centric step-span track (true per-step prefill/decode view).
             let overlays = match step_stats {
-                Some(path) => {
+                Some(uri) => {
+                    let path = materialize_input(&uri)?;
                     let reader = open_trace_reader(&path)?;
                     let snapshots = read_step_stats(reader)?;
                     Overlays {
@@ -321,9 +356,9 @@ fn run() -> Result<ExitCode> {
             let mut bytes = Vec::new();
             let summary = write_perfetto(&mut bytes, &meta, &records, &overlays, &opts)?;
 
-            if let Some(path) = &output {
-                fs::write(path, &bytes).with_context(|| format!("writing {}", path.display()))?;
-                eprintln!("wrote {} events to {}", summary.events, path.display());
+            if let Some(uri) = &output {
+                write_output(&bytes, uri)?;
+                eprintln!("wrote {} events to {uri}", summary.events);
             }
             if summary.dropped_requests > 0 {
                 eprintln!(
@@ -467,11 +502,33 @@ fn run() -> Result<ExitCode> {
 /// user interrupts. Single in-memory body, served verbatim on any path.
 fn serve_perfetto(trace_json: &[u8], port: u16) -> Result<()> {
     use std::io::Read as _;
-    use std::net::TcpListener;
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 
-    let listener = TcpListener::bind(("127.0.0.1", port))
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    // SO_REUSEADDR before bind: each served connection lingers in TIME_WAIT on
+    // this port for ~2*MSL after Ctrl-C, and a plain bind would then fail with
+    // EADDRINUSE on the next run. The flag lets us rebind over those.
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+        .context("creating perfetto serve socket")?;
+    socket
+        .set_reuse_address(true)
+        .context("setting SO_REUSEADDR on perfetto serve socket")?;
+    socket
+        .bind(&addr.into())
         .with_context(|| format!("binding 127.0.0.1:{port} (is the port already in use?)"))?;
-    let trace_url = format!("http://127.0.0.1:{port}/trace.json");
+    socket
+        .listen(128)
+        .with_context(|| format!("listening on 127.0.0.1:{port}"))?;
+    let listener = TcpListener::from(socket);
+    // Resolve the actual port: with the default (0) the OS assigned an ephemeral
+    // one, so read it back rather than echoing the 0.
+    let bound_port = listener
+        .local_addr()
+        .context("reading perfetto serve address")?
+        .port();
+    let trace_url = format!("http://127.0.0.1:{bound_port}/trace.json");
     let ui_url = format!("https://ui.perfetto.dev/#!/?url={trace_url}");
 
     open_browser(&ui_url);

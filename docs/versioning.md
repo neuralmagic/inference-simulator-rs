@@ -134,6 +134,12 @@ When vLLM cuts N+1:
    the 0.22 line; see `multi-version-shim.md` (capability cfgs + owned/tolerant
    decodes, `cargo xtask pin-vllm`). This is what lets one `main` build against
    multiple lines without a single multi-version binary.
+4. Nightly canary (`.github/workflows/nightly-canary.yml`). The `nightly` line is
+   pinned and only moves when bumped; the canary instead pins to the LIVE upstream
+   main HEAD each night (`cargo xtask pin-vllm nightly --rev <sha>`), builds +
+   unit-tests, and publishes a rolling `nightly` prerelease with the sha in its
+   notes. A red scheduled run is the early warning that upstream moved the
+   engine-core protocol. **Done.**
 
 ## Open coupling note: the `block_size` / registration drift
 

@@ -1,0 +1,87 @@
+name: Nightly Canary
+
+# Early warning on vLLM protocol drift. The `nightly` compat.toml line is pinned
+# and only moves when someone bumps it; this job tracks the LIVE upstream main
+# HEAD instead. It pins the protocol crate to that sha, builds + unit-tests, and
+# publishes a rolling `nightly` prerelease with the sha in its notes. A red run
+# = upstream moved the engine-core protocol out from under us (notify-only: this
+# isn't a PR gate, it can't be, it tracks a moving target we don't control).
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-canary
+  cancel-in-progress: false
+
+permissions:
+  contents: write # refresh the rolling `nightly` prerelease
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # build.rs treats a non-vX.Y tag as the newest line (all capability cfgs on).
+  VLLM_TARGET_VERSION: nightly
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          target: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Resolve vLLM main HEAD
+        id: head
+        run: |
+          sha=$(git ls-remote https://github.com/vllm-project/vllm.git HEAD | cut -f1)
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "vLLM main HEAD: ${sha}"
+
+      - name: Pin protocol crate to upstream HEAD
+        run: cargo xtask pin-vllm nightly --rev "${{ steps.head.outputs.sha }}"
+
+      # The early-warning signal: build + behavioral unit tests against HEAD. A
+      # failure here is the protocol-drift alert. Omit --locked: the pin moved the
+      # rev off Cargo.lock.
+      - name: Build + unit test against HEAD
+        run: |
+          cargo build --workspace
+          cargo test --workspace --lib
+
+      - name: Package standalone binaries
+        run: |
+          set -euo pipefail
+          target=x86_64-unknown-linux-musl
+          cargo build --release --target "$target" -p inference-simulator-rs -p sim-tap
+          name="inference-sim-nightly-${target}"
+          mkdir -p dist staging
+          bindir="target/${target}/release"
+          cp "$bindir/inference-sim" "$bindir/inference-sim-tap" "$bindir/inference-sim-trace" staging/
+          tar -C staging -czf "dist/${name}.tar.gz" inference-sim inference-sim-tap inference-sim-trace
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+      # Rolling prerelease: one `nightly` tag/release, force-moved to today's main
+      # and rebuilt against the resolved vLLM sha (recorded in the notes).
+      - name: Refresh rolling `nightly` prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.head.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+          gh release create nightly \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "nightly (vLLM main @ ${SHA:0:12})" \
+            --notes "Rolling build against vLLM main commit \`${SHA}\`, overwritten each night. Not a stable release; tracks upstream HEAD to surface protocol drift early."
+          gh release upload nightly dist/* --clobber

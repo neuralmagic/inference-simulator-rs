@@ -14,6 +14,11 @@ name: Release
 # default-line binary doubles as the line-agnostic inspect tool and is also published
 # unsuffixed once per platform. Tag a release (v*) to publish; workflow_dispatch builds
 # everything as a smoke test without uploading.
+#
+# Supply-chain: each tarball ships with a `.sha256` (no-tooling integrity), a CycloneDX
+# `.cdx.json` SBOM, a cosign keyless `.sig` + `.pem` (offline verify), and a SLSA build
+# provenance attestation in GitHub's attestation API (`gh attestation verify`). See the
+# README "Verifying release artifacts" section.
 on:
   push:
     tags: ['v*']
@@ -25,10 +30,15 @@ concurrency:
 
 permissions:
   contents: write # create the release + upload assets
+  id-token: write # OIDC for cosign keyless signing + provenance attestation
+  attestations: write # actions/attest-build-provenance records SLSA provenance
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Match ci.yml: dodge the HTTP/2 framing flake and retry transient fetches.
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
 
 jobs:
   # Cross compat.toml lines with the target platforms into one matrix: a build per
@@ -111,6 +121,56 @@ jobs:
           tar -C staging-inspect -czf "dist/${name}.tar.gz" vllm-vcr
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
           ls -la dist/
+
+      # --- Supply-chain hardening: SBOM + provenance + signing --------------------
+      # SBOM: a CycloneDX dependency manifest per line x target (cfg-gated deps differ
+      # across targets, so it's per-artifact). cargo-cyclonedx writes one
+      # <package>.cdx.json per workspace member; we ship the root package's, whose
+      # graph transitively covers the sim-* members. The default-line inspect tarball
+      # is the same binary as that line's main tarball, so it shares this SBOM.
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@8b3c737da4b541bf0fb5a3e0488ff20535badac9 # v2.82.1
+        with:
+          tool: cargo-cyclonedx@0.5.9
+
+      - name: Generate SBOM (${{ matrix.target }})
+        run: |
+          set -euo pipefail
+          cargo cyclonedx -f json --target "${{ matrix.target }}"
+          name="vllm-vcr-vllm${{ matrix.line }}-${{ matrix.target }}"
+          cp vllm-vcr.cdx.json "dist/${name}.cdx.json"
+          ( cd dist && shasum -a 256 "${name}.cdx.json" > "${name}.cdx.json.sha256" )
+          ls -la dist/
+
+      # Signing + attestation act on real published artifacts, so they run on tags
+      # only; a workflow_dispatch stays a build+SBOM smoke test that publishes nothing.
+      - name: Install cosign
+        if: ${{ github.ref_type == 'tag' }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign release blobs (cosign keyless)
+        if: ${{ github.ref_type == 'tag' }}
+        run: |
+          set -euo pipefail
+          # Keyless OIDC: a detached .sig + .pem (Fulcio cert) per tarball and SBOM,
+          # for offline verification (cosign verify-blob) without GitHub. The .sha256
+          # files still ship as a no-tooling integrity check.
+          for f in dist/*.tar.gz dist/*.cdx.json; do
+            cosign sign-blob --yes \
+              --output-signature "${f}.sig" \
+              --output-certificate "${f}.pem" \
+              "$f"
+          done
+          ls -la dist/
+
+      # SLSA build provenance: a signed in-toto attestation binding each tarball's
+      # digest to this workflow run. Stored in GitHub's attestation API (not a release
+      # asset); verify with `gh attestation verify <tarball> --repo neuralmagic/vllm-vcr`.
+      - name: Attest build provenance
+        if: ${{ github.ref_type == 'tag' }}
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: 'dist/*.tar.gz'
 
       # On a tag: publish to the release. On workflow_dispatch: smoke only (the build
       # above is the test). `gh release create || true` is idempotent across the matrix.

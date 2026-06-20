@@ -4,3 +4,6 @@
 # The inventory README stays tracked.
 /traces/*
 !/traces/README.md
+
+# mdBook render output (the doc site is built in CI and deployed to Pages).
+/book

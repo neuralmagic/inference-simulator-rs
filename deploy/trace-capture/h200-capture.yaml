@@ -6,7 +6,7 @@
 #       | HTTP
 #   frontend   vllm-rs serve --data-parallel-size-local 0   binds handshake :5570
 #       | ZMQ
-#   tap        inference-sim-tap                            :5570 <-> :5580, trace -> /trace
+#   tap        vllm-vcr record                            :5570 <-> :5580, trace -> /trace
 #       | ZMQ
 #   engine     vllm serve --headless                        connects handshake :5580, 1x GPU
 #
@@ -96,7 +96,7 @@ spec:
         # --- Recording tap ---------------------------------------------------------------
         - name: tap
           image: quay.io/wseaton/mock-engine-nixl:trace-capture-v8
-          command: ["/usr/local/bin/inference-sim-tap"]
+          command: ["/usr/local/bin/vllm-vcr", "record"]
           # Handshake/data addresses use the binary's defaults (frontend
           # :5570, engine :5580, data :29560/:29561), matching the frontend
           # and engine args below.

@@ -1,7 +1,7 @@
 # GPU-free llm-d P/D deployment
 
 A self-contained copy of the llm-d v0.7.0 prefill/decode deployment, repointed
-at the `inference-simulator-rs` image. It stands up the llm-d control plane
+at the `vllm-vcr` image. It stands up the llm-d control plane
 (Router/EPP, InferencePool, routing sidecar) in front of GPU-free model servers
 that run the vLLM Rust frontend over this simulator. The image includes libnixl
 and UCX for CPU NIXL transfers. No GPUs or model weights are required.
@@ -21,8 +21,8 @@ What's vendored (from the llm-d guide, adapted to CPU + our image):
 
 - Build & push the image (from the repo root):
   ```bash
-  podman build -t ghcr.io/neuralmagic/inference-simulator-rs:dev .
-  podman push ghcr.io/neuralmagic/inference-simulator-rs:dev
+  podman build -t ghcr.io/neuralmagic/vllm-vcr:dev .
+  podman push ghcr.io/neuralmagic/vllm-vcr:dev
   ```
   If you use a custom tag, update `modelserver/kustomization.yaml` before applying.
 - A cluster with the llm-d control-plane deps:

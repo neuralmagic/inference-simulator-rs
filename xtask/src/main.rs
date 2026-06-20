@@ -36,7 +36,7 @@ const PLATFORMS: &[Platform] = &[
 ];
 
 #[derive(Parser)]
-#[command(name = "xtask", about = "inference-simulator-rs repo automation")]
+#[command(name = "xtask", about = "vllm-vcr repo automation")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

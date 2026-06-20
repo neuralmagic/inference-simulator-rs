@@ -10,7 +10,6 @@
 
 use std::time::Duration;
 
-use clap::Parser as _;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::protocol::{
@@ -18,10 +17,10 @@ use vllm_engine_core_client::protocol::{
 };
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 
-use inference_simulator_rs::trace::{
+use vllm_vcr::trace::{
     TraceFinishReason, TraceMeta, TraceRecord, prompt_block_hashes, write_trace,
 };
-use inference_simulator_rs::{Opt, run};
+use vllm_vcr::{Opt, run};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const BLOCK_SIZE: usize = 16;
@@ -78,7 +77,7 @@ async fn agent_loop_replays_offline_via_prefix_matching() {
     let addr = format!("ipc:///tmp/inf-sim-closed-loop-{}.ipc", std::process::id());
     let trace_arg = trace_path.to_str().unwrap().to_string();
     let args = vec![
-        "inference-sim",
+        "play",
         "--handshake-address",
         &addr,
         "--replay-tokens",

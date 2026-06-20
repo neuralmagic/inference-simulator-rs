@@ -41,7 +41,7 @@ loadgen (HTTP)            real vLLM engine (--headless, owns the GPU)
     |                          ^
     | /v1/...                  | ZMQ (engine handshake :5580)
     v                          |
-vLLM frontend  --ZMQ-->  inference-sim-tap  (relays bytes verbatim, writes trace.jsonl)
+vLLM frontend  --ZMQ-->  vllm-vcr record  (relays bytes verbatim, writes trace.jsonl)
  (vllm-rs serve)         frontend handshake :5570
 ```
 
@@ -64,7 +64,7 @@ a tag. The per-line engine + tap/frontend images live in `models.toml` under
 ```toml
 [lines."v0.23.0"]
 engine_image = "docker.io/vllm/vllm-openai:v0.23.0@sha256:6d8429e3..."  # release, by digest
-tap_image    = "ghcr.io/neuralmagic/inference-simulator-rs:vllm0.23"     # built for this line
+tap_image    = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"     # built for this line
 ```
 
 For a conformance capture, pin the engine to the **release tag's** published image for
@@ -72,7 +72,7 @@ the line you are validating (the `tag` field in `compat.toml`, e.g. `v0.23.0`), 
 digest, that digest is the ground truth for "which vLLM this golden measures" (record it
 in the manifest entry's provenance). The `nightly` line instead points at the post-merge
 image at its `protocol_rev`. The tap and frontend stay on the per-line capture image
-(`inference-sim-tap` + `vllm-rs`), built against that line's `protocol_rev` so the wire
+(`vllm-vcr record` + `vllm-rs`), built against that line's `protocol_rev` so the wire
 parses, which is exactly what CI's `docker.yml` publishes as `:vllm<line>`.
 
 ## Capture hygiene
@@ -153,7 +153,7 @@ The `config_hash` is the profile-once/replay-many cache key. It fingerprints the
 capture config (model, GPU, TP, scheduler flags) so a trace cannot be replayed against
 a config it was not captured for. The tap stamps it into the trace metadata line via
 `--config-hash`, and the sim asserts it at replay via `--expect-config-hash` (see
-`crates/sim-tap/src/bin/inference_sim_tap.rs` and `crates/sim-trace/src/trace.rs`).
+`src/record.rs` and `crates/sim-trace/src/trace.rs`).
 
 The recipe is `ConfigFingerprint` in `crates/sim-trace/src/config_hash.rs`: a lowercase-hex
 SHA-256 over a versioned, order-fixed canonical form (scheme tag `config-fingerprint-v3`)
@@ -275,7 +275,7 @@ unit-tested independently of any real capture.
 ## The GPU-free replay half
 
 The replay-many half needs no GPU anywhere. `deploy/trace-capture/offline-replay.yaml`
-runs the same python frontend with `inference-sim` (not a real engine) in the engine
+runs the same python frontend with `vllm-vcr play` (not a real engine) in the engine
 slot, serving a captured trace with content-keyed matching:
 
 ```
@@ -283,7 +283,7 @@ agent (port-forward :8000)
     | HTTP
 frontend  (vllm serve --data-parallel-size-local 0, no GPU)
     | ZMQ
-sim       (inference-sim --replay-tokens trace.jsonl --replay-match prefix)
+sim       (vllm-vcr play --replay-tokens trace.jsonl --replay-match prefix)
 ```
 
 The frontend MUST run the same model/tokenizer as the capture (prefix matching is on

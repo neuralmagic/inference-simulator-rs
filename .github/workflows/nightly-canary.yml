@@ -58,16 +58,16 @@ jobs:
           cargo build --workspace
           cargo test --workspace --lib
 
-      - name: Package standalone binaries
+      - name: Package standalone binary
         run: |
           set -euo pipefail
           target=x86_64-unknown-linux-musl
-          cargo build --release --target "$target" -p inference-simulator-rs -p sim-tap
-          name="inference-sim-nightly-${target}"
+          cargo build --release --target "$target" -p vllm-vcr
+          name="vllm-vcr-nightly-${target}"
           mkdir -p dist staging
           bindir="target/${target}/release"
-          cp "$bindir/inference-sim" "$bindir/inference-sim-tap" "$bindir/inference-sim-trace" staging/
-          tar -C staging -czf "dist/${name}.tar.gz" inference-sim inference-sim-tap inference-sim-trace
+          cp "$bindir/vllm-vcr" staging/
+          tar -C staging -czf "dist/${name}.tar.gz" vllm-vcr
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
 
       # Rolling prerelease: one `nightly` tag/release, force-moved to today's main

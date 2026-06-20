@@ -191,7 +191,7 @@ def build_job(c: dict, lines: dict) -> dict:
                             "name": "tap",
                             **floating,
                             "image": line["tap_image"],
-                            "command": ["/usr/local/bin/inference-sim-tap"],
+                            "command": ["/usr/local/bin/vllm-vcr", "record"],
                             "args": tap_args(c),
                             "env": env({"RUST_LOG": "info"}),
                             "resources": {

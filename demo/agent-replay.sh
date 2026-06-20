@@ -49,7 +49,7 @@ say "Now the GPU goes away. Entirely."
 run just agentic-capture-down
 sleep 8
 run kubectl -n $NS get pods -l llm-d.ai/guide=trace-capture-agentic
-say "Load the cassette into the simulator (CPU frontend + inference-sim, no GPU):"
+say "Load the cassette into the simulator (CPU frontend + vllm-vcr play, no GPU):"
 kubectl -n $NS delete pod -l llm-d.ai/guide=offline-replay --wait=false >/dev/null 2>&1 || true
 sleep 3
 until pod=$(live_pod llm-d.ai/guide=offline-replay) && [ -n "$pod" ] \

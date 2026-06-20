@@ -2,7 +2,7 @@
 
 Convert a JSONL engine trace into the [Chrome Trace Event Format](https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview)
 and view it on <https://ui.perfetto.dev>. The converter is the `perfetto`
-subcommand of `inference-sim-trace`; it reads the same trace files the replay and
+subcommand of `vllm-vcr inspect`; it reads the same trace files the replay and
 calibration paths use (`.gz` transparent), and optionally overlays the tap's
 step-stats sidecar.
 
@@ -22,21 +22,21 @@ For the trace schema itself, see `crates/sim-trace/src/trace.rs`; for the sideca
 Write a Perfetto JSON file and drag it onto <https://ui.perfetto.dev>:
 
 ```bash
-cargo run --bin inference-sim-trace -- perfetto trace.jsonl -o trace.perfetto.json
+cargo run --bin vllm-vcr -- inspect perfetto trace.jsonl -o trace.perfetto.json
 ```
 
 Or let it serve the trace and open the UI for you (blocks until Ctrl-C, since the
 hosted UI fetches the file from this process):
 
 ```bash
-cargo run --bin inference-sim-trace -- perfetto trace.jsonl --open
+cargo run --bin vllm-vcr -- inspect perfetto trace.jsonl --open
 ```
 
-Overlay the step-stats sidecar (`inference-sim-tap --step-stats-out`) for the
+Overlay the step-stats sidecar (`vllm-vcr record --step-stats-out`) for the
 batch-level counters and the per-step scheduler track:
 
 ```bash
-cargo run --bin inference-sim-trace -- perfetto trace.jsonl \
+cargo run --bin vllm-vcr -- inspect perfetto trace.jsonl \
   --step-stats trace-step-stats.jsonl --open
 ```
 

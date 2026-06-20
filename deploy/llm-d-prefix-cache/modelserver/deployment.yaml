@@ -31,7 +31,7 @@ spec:
       serviceAccountName: mock-pc-sa
       containers:
         - name: modelserver
-          image: ghcr.io/neuralmagic/inference-simulator-rs:vllm0.23
+          image: ghcr.io/neuralmagic/vllm-vcr:vllm0.23
           imagePullPolicy: Always
           env:
             - name: MODEL

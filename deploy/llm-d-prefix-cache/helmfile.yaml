@@ -1,5 +1,5 @@
 # Self-contained llm-d precise-prefix-cache-routing deployment driven by the
-# inference-simulator-rs image. GPU-free: a single pool of mock model servers (real vLLM
+# vllm-vcr image. GPU-free: a single pool of mock model servers (real vLLM
 # Rust frontend + our mock engine) publish KV-cache events over ZMQ; the real llm-d Router
 # (EPP) indexes them and routes by prefix-cache locality.
 #

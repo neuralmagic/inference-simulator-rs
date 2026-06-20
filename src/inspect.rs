@@ -1,5 +1,5 @@
-//! CLI for converting benchmark reports to the inference-sim trace format,
-//! summarizing existing traces, and running calibration comparisons.
+//! `vllm-vcr inspect`: convert benchmark reports to the trace format, summarize
+//! existing traces, render Perfetto views, and run calibration comparisons.
 
 use std::fs;
 use std::io::{self, BufWriter, Write as _};
@@ -7,29 +7,19 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use inference_simulator_rs::calibrate::{self, PromptReplay, SessionPacing, SimDriver};
-use inference_simulator_rs::perfetto::{Overlays, PerfettoOptions, write_perfetto};
-use inference_simulator_rs::step_stats::{read_step_stats, step_spans, step_stats_counters};
-use inference_simulator_rs::trace::{TraceWriter, open_trace_reader, read_trace_file};
-use inference_simulator_rs::trace_convert::{
+use clap::Subcommand;
+use sim_s3::TraceUri;
+use vllm_vcr::calibrate::{self, PromptReplay, SessionPacing, SimDriver};
+use vllm_vcr::perfetto::{Overlays, PerfettoOptions, write_perfetto};
+use vllm_vcr::step_stats::{read_step_stats, step_spans, step_stats_counters};
+use vllm_vcr::trace::{TraceWriter, open_trace_reader, read_trace_file};
+use vllm_vcr::trace_convert::{
     ConvertOptions, convert_guidellm, summarize_trace, write_conversion, write_summary,
 };
-use sim_s3::TraceUri;
-
-#[derive(Parser)]
-#[command(
-    name = "inference-sim-trace",
-    about = "Convert benchmark reports to inference-sim trace format, summarize traces, and run calibration."
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
 
 /// Output format for calibration reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-enum ReportFormat {
+pub(crate) enum ReportFormat {
     /// Human-readable text report.
     #[default]
     Text,
@@ -39,7 +29,7 @@ enum ReportFormat {
 
 /// Magnitude profile for the synthesized demo trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-enum DemoProfile {
+pub(crate) enum DemoProfile {
     /// Realistic magnitudes (TTFT ~50-400ms, ITL ~10-60ms).
     #[default]
     Realistic,
@@ -49,7 +39,7 @@ enum DemoProfile {
 
 /// Which e2e harness runs: closed-loop sampled batches or open-loop arrival replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-enum E2eHarness {
+pub(crate) enum E2eHarness {
     /// Sample N requests and drive them closed-loop.
     #[default]
     Sampled,
@@ -59,8 +49,8 @@ enum E2eHarness {
 }
 
 #[derive(Subcommand)]
-enum Command {
-    /// Convert a guidellm benchmark report (JSON) to an inference-sim trace (JSONL).
+pub(crate) enum InspectCommand {
+    /// Convert a guidellm benchmark report (JSON) to a vllm-vcr trace (JSONL).
     FromGuidellm {
         /// Path to the guidellm report JSON file.
         input: PathBuf,
@@ -289,11 +279,9 @@ fn block_on<T>(fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
         .block_on(fut)
 }
 
-fn run() -> Result<ExitCode> {
-    let cli = Cli::parse();
-
-    match cli.command {
-        Command::FromGuidellm {
+pub(crate) fn run(command: InspectCommand) -> Result<ExitCode> {
+    match command {
+        InspectCommand::FromGuidellm {
             input,
             output,
             model,
@@ -312,7 +300,7 @@ fn run() -> Result<ExitCode> {
 
             eprintln!("wrote {} records to {}", records.len(), output.display());
         }
-        Command::Summarize { input } => {
+        InspectCommand::Summarize { input } => {
             let input = materialize_input(&input)?;
             let reader = open_trace_reader(&input)?;
             let (meta, stats) = summarize_trace(reader)?;
@@ -321,7 +309,7 @@ fn run() -> Result<ExitCode> {
             let mut writer = BufWriter::new(stdout.lock());
             write_summary(&mut writer, &meta, &stats)?;
         }
-        Command::Perfetto {
+        InspectCommand::Perfetto {
             input,
             output,
             step_stats,
@@ -376,7 +364,7 @@ fn run() -> Result<ExitCode> {
                     .context("writing perfetto trace to stdout")?;
             }
         }
-        Command::GenDemo {
+        InspectCommand::GenDemo {
             output,
             records,
             seed,
@@ -389,7 +377,7 @@ fn run() -> Result<ExitCode> {
             calibrate::write_demo_trace(&output, &meta, &recs)?;
             eprintln!("wrote {} records to {}", recs.len(), output.display());
         }
-        Command::Calibrate {
+        InspectCommand::Calibrate {
             trace,
             samples,
             seed,
@@ -415,7 +403,7 @@ fn run() -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
-        Command::CalibrateE2e {
+        InspectCommand::CalibrateE2e {
             trace,
             requests,
             seed,
@@ -457,16 +445,12 @@ fn run() -> Result<ExitCode> {
                     outcome.max_send_lag_ms,
                 );
                 if let Some(dump_path) = dump_trace {
-                    let meta = inference_simulator_rs::trace::TraceMeta {
+                    let meta = vllm_vcr::trace::TraceMeta {
                         source: Some("replay-arrivals".to_string()),
                         ..Default::default()
                     };
                     let mut writer = TraceWriter::create(&dump_path)?;
-                    inference_simulator_rs::trace::write_trace(
-                        &mut writer,
-                        &meta,
-                        &outcome.measured,
-                    )?;
+                    vllm_vcr::trace::write_trace(&mut writer, &meta, &outcome.measured)?;
                     writer.finish()?;
                     eprintln!(
                         "wrote {} measured records to {}",
@@ -612,16 +596,15 @@ async fn calibrate_e2e_impl(
     use std::collections::HashMap;
     use std::time::Instant;
 
-    use clap::Parser as _;
     use futures::StreamExt;
-    use inference_simulator_rs::latency::{NUM_CONCURRENCY_BUCKETS, concurrency_bucket};
-    use inference_simulator_rs::trace::TraceRecord;
-    use inference_simulator_rs::{Opt, run};
     use rand::Rng;
     use rand::SeedableRng as _;
     use tokio_util::sync::CancellationToken;
     use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
     use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
+    use vllm_vcr::latency::{NUM_CONCURRENCY_BUCKETS, concurrency_bucket};
+    use vllm_vcr::trace::TraceRecord;
+    use vllm_vcr::{Opt, run};
 
     let (_meta, all_records) = read_trace_file(trace_path)?;
 
@@ -642,7 +625,7 @@ async fn calibrate_e2e_impl(
     let trace_path_str = trace_path.to_string_lossy().to_string();
 
     let mut args: Vec<String> = vec![
-        "inference-sim".to_string(),
+        "play".to_string(),
         "--handshake-address".to_string(),
         addr.clone(),
         "--max-num-seqs".to_string(),
@@ -846,22 +829,4 @@ async fn calibrate_e2e_impl(
         request_total: None,
         verdict,
     })
-}
-
-fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(io::stderr)
-        .init();
-
-    match run() {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("error: {e:#}");
-            ExitCode::FAILURE
-        }
-    }
 }

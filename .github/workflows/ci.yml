@@ -169,9 +169,10 @@ jobs:
         run: cargo test --workspace --lib
 
       # Assume the least-privilege golden-fetch role via GitHub OIDC. The role
-      # (llm-d-conformance-ci) trusts repo:neuralmagic/inference-simulator-rs:* and
-      # grants only s3:GetObject on the conformance/ prefix. Skipped when the line
-      # has no goldens, so the no-capture state needs no AWS.
+      # (llm-d-conformance-ci) trusts repo:neuralmagic/vllm-vcr:* and grants only
+      # s3:GetObject on the conformance/ prefix. Skipped when the line has no
+      # goldens, so the no-capture state needs no AWS. NOTE: the IAM trust policy's
+      # sub condition must be updated to the new repo path on the GitHub rename.
       - name: Configure AWS credentials (golden fetch, vLLM ${{ matrix.line }})
         if: ${{ matrix.has_goldens }}
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0

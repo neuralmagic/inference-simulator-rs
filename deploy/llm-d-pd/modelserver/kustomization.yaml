@@ -8,5 +8,5 @@ resources:
 
 # Repoint the image here (e.g. to a freshly built tag) without editing the Deployments.
 images:
-  - name: ghcr.io/neuralmagic/inference-simulator-rs
+  - name: ghcr.io/neuralmagic/vllm-vcr
     newTag: vllm0.23

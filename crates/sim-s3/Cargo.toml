@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "S3 object I/O for inference-sim trace files: materialize a remote trace to a local scratch path before the sync readers run, and upload a finalized local trace after the gzip trailer is written. Kept separate from sim-trace so the schema crate stays free of the AWS SDK and an async runtime."
+description = "S3 object I/O for vllm-vcr trace files: materialize a remote trace to a local scratch path before the sync readers run, and upload a finalized local trace after the gzip trailer is written. Kept separate from sim-trace so the schema crate stays free of the AWS SDK and an async runtime."
 
 [dependencies]
 anyhow = { workspace = true }

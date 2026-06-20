@@ -6,9 +6,9 @@ name: Docker
 # and manual dispatch (all trusted refs).
 #
 # Per-line tagging (docs/versioning.md "Versioning"):
-#   inference-sim:<simver>-vllm<line>   immutable, the real artifact (sim ver x vLLM line)
-#   inference-sim:vllm<line>            floating, -> latest sim for that line
-#   inference-sim:latest                sim-head x the default=true line only
+#   vllm-vcr:<simver>-vllm<line>   immutable, the real artifact (sim ver x vLLM line)
+#   vllm-vcr:vllm<line>            floating, -> latest sim for that line
+#   vllm-vcr:latest                sim-head x the default=true line only
 on:
   push:
     branches: [main]

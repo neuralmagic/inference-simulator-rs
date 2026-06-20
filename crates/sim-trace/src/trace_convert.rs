@@ -1,4 +1,4 @@
-//! Convert guidellm benchmark reports to the inference-sim trace format.
+//! Convert guidellm benchmark reports to the vllm-vcr trace format.
 //!
 //! guidellm (v0.6.0, https://github.com/vllm-project/guidellm) serializes results as
 //! `GenerativeBenchmarksReport` JSON. The per-request data lives at:

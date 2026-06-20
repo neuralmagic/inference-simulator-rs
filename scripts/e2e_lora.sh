@@ -31,7 +31,7 @@ DECODE_TOKENS="${DECODE_TOKENS:-12}"
 FRONTEND_BIN="${FRONTEND_BIN:-$HOME/git/vllm-fork/rust/target/debug/vllm-rs}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENGINE_BIN="$REPO_ROOT/target/debug/inference-sim"
+ENGINE_BIN="$REPO_ROOT/target/debug/vllm-vcr"
 BASE_URL="http://${HTTP_HOST}:${HTTP_PORT}"
 LOG_DIR="$(mktemp -d)"
 
@@ -79,7 +79,7 @@ frontend_pid=$!
 # 2. Engine: slow inter-token latency so a request stays in decode (emitting scheduler_stats
 #    every step) across the scrape window.
 echo "starting mock engine (itl=${ITL_MS}ms) ..."
-"$ENGINE_BIN" \
+"$ENGINE_BIN" play \
     --handshake-address "tcp://127.0.0.1:${HANDSHAKE_PORT}" \
     --inter-token-latency "$ITL_MS" \
     --log-requests \

@@ -1,4 +1,4 @@
-# inference-simulator-rs task runner.
+# vllm-vcr task runner.
 #
 # The capture workflow end to end:
 #   just image-build && just image-push     # tap/frontend image (linux/amd64)
@@ -9,7 +9,7 @@
 #   just calibrate /tmp/trace-capture-h200/tap-trace.jsonl
 #   just plots /tmp/trace-capture-h200/tap-trace.jsonl docs/images
 
-image := env_var_or_default("IMAGE", "ghcr.io/neuralmagic/inference-simulator-rs:dev")
+image := env_var_or_default("IMAGE", "ghcr.io/neuralmagic/vllm-vcr:dev")
 namespace := env_var_or_default("NAMESPACE", "inference-sim")
 deploy := "trace-capture-h200"
 
@@ -113,7 +113,7 @@ agentic-capture-fetch out="/tmp/agentic-tap-trace.jsonl":
     kubectl -n {{namespace}} exec deploy/trace-capture-h200-agentic -c tap -- cat /trace/trace.jsonl > {{out}}
     @wc -l {{out}}
 
-# Offline replay rig: python frontend + inference-sim, zero GPU (then: replay-load-trace).
+# Offline replay rig: python frontend + vllm-vcr play, zero GPU (then: replay-load-trace).
 replay-up:
     kubectl apply -f deploy/trace-capture/offline-replay.yaml
 
@@ -137,11 +137,11 @@ replay-load-trace trace:
 
 # Summarize a trace (per-concurrency TTFT/ITL quantiles).
 summarize trace:
-    cargo run --release --bin inference-sim-trace -- summarize {{trace}}
+    cargo run --release --bin vllm-vcr -- inspect summarize {{trace}}
 
 # Model-level calibration: source vs replay vs knob-fit, request-total gate.
 calibrate trace:
-    cargo run --release --bin inference-sim-trace -- calibrate {{trace}}
+    cargo run --release --bin vllm-vcr -- inspect calibrate {{trace}}
 
 # Rebuild every README/deck figure from the committed traces (~30 min: the
 # arrival replays run in real time). sim-comparison.png is the one exception;
@@ -153,7 +153,7 @@ figures out_dir="docs/images":
 # The calibrate verdict may fail on real loaded traces: the TTFT marginal is
 # engine-mechanical (queueing), gated wire-level by `just replay`, not here.
 plots trace out_dir="docs/images":
-    -cargo run --release --bin inference-sim-trace -- calibrate {{trace}} \
+    -cargo run --release --bin vllm-vcr -- inspect calibrate {{trace}} \
         --dump-samples /tmp/calib-samples.json
     uv run scripts/plot_calibration.py --samples /tmp/calib-samples.json \
         --trace {{trace}} --out-dir {{out_dir}}
@@ -167,7 +167,7 @@ compare +labeled_traces:
 
 # Open-loop arrival replay against a captured schedule (runs in real time).
 replay trace latency_trace tolerance="0.10":
-    cargo run --release --bin inference-sim-trace -- calibrate-e2e {{trace}} \
+    cargo run --release --bin vllm-vcr -- inspect calibrate-e2e {{trace}} \
         --replay-arrivals --latency-trace {{latency_trace}} --tolerance {{tolerance}}
 
 # Apply the rig with the engine's prefix cache DISABLED (counterfactual capture).

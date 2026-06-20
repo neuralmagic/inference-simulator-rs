@@ -27,7 +27,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::Parser as _;
 use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::protocol::{
@@ -35,12 +34,12 @@ use vllm_engine_core_client::protocol::{
 };
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 
-use inference_simulator_rs::conformance::{assert_ready_response_schema, assert_same_line};
-use inference_simulator_rs::frontend_connect::SimReadyResponse;
-use inference_simulator_rs::trace::{TraceMeta, read_trace_file, replay_subset};
-use inference_simulator_rs::{Opt, VLLM_TARGET_VERSION, run};
 use sim_compat::{GoldenManifest, GoldenRole};
 use sim_s3::TraceUri;
+use vllm_vcr::conformance::{assert_ready_response_schema, assert_same_line};
+use vllm_vcr::frontend_connect::SimReadyResponse;
+use vllm_vcr::trace::{TraceMeta, read_trace_file, replay_subset};
+use vllm_vcr::{Opt, VLLM_TARGET_VERSION, run};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -119,7 +118,7 @@ async fn check_fidelity(trace_path: &Path) {
 
     let addr = format!("ipc:///tmp/inf-sim-conformance-{}.ipc", std::process::id());
     let opt = Opt::parse_from([
-        "inference-sim",
+        "play",
         "--handshake-address",
         &addr,
         "--replay-tokens",
@@ -169,7 +168,7 @@ async fn check_fidelity(trace_path: &Path) {
         let last = last.as_ref().expect("stream error");
         let expected_finish = record
             .finish_reason
-            .map(inference_simulator_rs::wire::engine_finish_reason)
+            .map(vllm_vcr::wire::engine_finish_reason)
             .unwrap_or(EngineCoreFinishReason::Length);
         assert_eq!(
             last.finish_reason,

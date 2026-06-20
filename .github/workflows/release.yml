@@ -1,19 +1,19 @@
 name: Release
 
-# Publish standalone `inference-sim` + `inference-sim-tap` binaries as GitHub Release
-# assets, one set per supported vLLM line x platform. These are the lightweight path
-# for users who just want to replay a trace, run the mock engine, or run the tap to
+# Publish the standalone `vllm-vcr` binary (record/play/inspect) as GitHub Release
+# assets, one per supported vLLM line x platform. These are the lightweight path for
+# users who just want to replay a trace, run the mock engine, or run the tap to
 # capture, without pulling the multi-GB container (which carries UCX + libnixl + vllm-rs
-# for the full P/D + capture topology). The binaries are pure Rust (no NIXL in the
-# default build, the `zeromq` crate is pure Rust), so they build static (musl) on Linux.
+# for the full P/D + capture topology). The binary is pure Rust (no NIXL in the default
+# build, the `zeromq` crate is pure Rust), so it builds static (musl) on Linux.
 #
-# `inference-sim` + `inference-sim-tap` are per-line because the wire protocol
-# (vllm-engine-core-client rev) is compiled in; the handshake guard aborts loudly if a
-# binary meets a peer on a different line. `inference-sim-trace` (offline trace tooling:
-# convert/calibrate/summarize/perfetto) never handshakes an external peer, so it is
-# line-agnostic and published once per platform (built on the default line). Tag a
-# release (v*) to publish; workflow_dispatch builds everything as a smoke test without
-# uploading.
+# Per-line because the wire protocol (vllm-engine-core-client rev) is compiled in:
+# `vllm-vcr record`/`play` bake the protocol, and the handshake guard aborts loudly if
+# a binary meets a peer on a different line. `vllm-vcr inspect` (offline trace tooling:
+# convert/calibrate/summarize/perfetto) never handshakes an external peer, so the
+# default-line binary doubles as the line-agnostic inspect tool and is also published
+# unsuffixed once per platform. Tag a release (v*) to publish; workflow_dispatch builds
+# everything as a smoke test without uploading.
 on:
   push:
     tags: ['v*']
@@ -79,35 +79,36 @@ jobs:
       - name: Pin vLLM rev (line ${{ matrix.line }})
         run: cargo xtask pin-vllm "${{ matrix.line }}"
 
-      # Default features only: no NIXL, so these stay small pure-Rust binaries.
-      - name: Build inference-sim + inference-sim-tap (${{ matrix.target }})
-        run: cargo build --release --target "${{ matrix.target }}" -p inference-simulator-rs -p sim-tap
+      # Default features only: no NIXL, so this stays a small pure-Rust binary.
+      - name: Build vllm-vcr (${{ matrix.target }})
+        run: cargo build --release --target "${{ matrix.target }}" -p vllm-vcr
 
       - name: Package
         id: pkg
         run: |
           set -euo pipefail
-          name="inference-sim-vllm${{ matrix.line }}-${{ matrix.target }}"
+          name="vllm-vcr-vllm${{ matrix.line }}-${{ matrix.target }}"
           mkdir -p dist staging
           bindir="target/${{ matrix.target }}/release"
-          cp "$bindir/inference-sim" "$bindir/inference-sim-tap" staging/
-          tar -C staging -czf "dist/${name}.tar.gz" inference-sim inference-sim-tap
+          cp "$bindir/vllm-vcr" staging/
+          tar -C staging -czf "dist/${name}.tar.gz" vllm-vcr
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
           ls -la dist/
 
-      # inference-sim-trace is line-agnostic (no external handshake), so it ships
-      # once per platform. It is already built by the package build above; only the
-      # default-line jobs package + upload it, so the per-platform asset isn't
-      # rebuilt and clobbered N times across the lines.
-      - name: Package trace tooling (default line only)
+      # `vllm-vcr inspect` is line-agnostic (no external handshake), so the default
+      # line's binary doubles as the general inspect tool and ships once per platform
+      # under an unsuffixed name. It is the same binary already built above; only the
+      # default-line jobs package + upload it, so the per-platform asset isn't rebuilt
+      # and clobbered N times across the lines.
+      - name: Package line-agnostic inspect binary (default line only)
         if: ${{ matrix.default }}
         run: |
           set -euo pipefail
-          name="inference-sim-trace-${{ matrix.target }}"
-          mkdir -p dist staging-trace
+          name="vllm-vcr-${{ matrix.target }}"
+          mkdir -p dist staging-inspect
           bindir="target/${{ matrix.target }}/release"
-          cp "$bindir/inference-sim-trace" staging-trace/
-          tar -C staging-trace -czf "dist/${name}.tar.gz" inference-sim-trace
+          cp "$bindir/vllm-vcr" staging-inspect/
+          tar -C staging-inspect -czf "dist/${name}.tar.gz" vllm-vcr
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
           ls -la dist/
 

@@ -1,9 +1,12 @@
-# inference-simulator-rs
+# vllm-vcr
 
-A vLLM **V1 engine-core** simulator that speaks the ZMQ + msgpack protocol.
-It can run behind a vLLM frontend without model weights or a GPU. With the
-`nixl` feature and a working libnixl/UCX runtime, it also moves simulated
-KV-cache bytes over NIXL for prefill/decode testing.
+Record, play, and inspect vLLM **V1 engine-core** traces. One binary with three
+subcommands: `record` taps a live vLLM frontend ↔ engine-core link and writes a
+trace, `play` runs a mock engine-core that speaks the real ZMQ + msgpack protocol
+(replaying a trace or simulating, no model weights or GPU), and `inspect`
+converts, summarizes, renders, and calibrates traces. With the `nixl` feature and
+a working libnixl/UCX runtime, `play` also moves simulated KV-cache bytes over
+NIXL for prefill/decode testing.
 
 ## Table of contents
 
@@ -50,7 +53,7 @@ The protocol boundary is reused from vLLM's in-tree `vllm-engine-core-client` cr
 
 ```
             ZMQ + msgpack (engine-core protocol)
- vLLM frontend  ◀──────────────────────────────────▶  inference-simulator-rs
+ vLLM frontend  ◀──────────────────────────────────▶  vllm-vcr play
  (Rust or Py)        handshake / ADD / ABORT / UTILITY        │
                                                               ▼
                                               ┌──────────────────────────────┐
@@ -105,12 +108,13 @@ Requires Rust 1.85 or newer. From a checkout:
 cargo install --path . --locked
 ```
 
-That installs `inference-sim` and `inference-sim-trace`. After the repository is
-public, the same default no-NIXL build can be installed from Git:
+That installs the single `vllm-vcr` binary, with `record`, `play`, and `inspect`
+subcommands. After the repository is public, the same default no-NIXL build can
+be installed from Git:
 
 ```bash
-cargo install --git https://github.com/neuralmagic/inference-simulator-rs \
-  --locked inference-simulator-rs
+cargo install --git https://github.com/neuralmagic/vllm-vcr \
+  --locked vllm-vcr
 ```
 
 For a NIXL-enabled install, build on Linux with `libnixl` and UCX available:
@@ -122,7 +126,7 @@ cargo install --path . --locked --features nixl
 For the Kubernetes deployment, build the container image instead:
 
 ```bash
-podman build -t ghcr.io/neuralmagic/inference-simulator-rs:dev .
+podman build -t ghcr.io/neuralmagic/vllm-vcr:dev .
 ```
 
 ## Quick start
@@ -132,7 +136,7 @@ podman build -t ghcr.io/neuralmagic/inference-simulator-rs:dev .
 Start the simulator:
 
 ```bash
-inference-sim --handshake-address tcp://127.0.0.1:29550 --log-requests
+vllm-vcr play --handshake-address tcp://127.0.0.1:29550 --log-requests
 ```
 
 Start a vLLM frontend with the same handshake address. See vLLM's
@@ -264,7 +268,7 @@ that section).
 
 ### Calibration demo
 
-The `inference-sim-trace` binary includes a calibration harness that checks two
+The `vllm-vcr inspect` subcommands include a calibration harness that checks two
 properties of the latency models:
 
 1. `TraceLatency` replay reproduces source-trace quantiles within tolerance.
@@ -278,13 +282,13 @@ arrival-replay scenarios below.
 
 ```bash
 # 1. Generate a synthetic heavy-tailed trace (lognormal TTFT/ITL).
-cargo run --bin inference-sim-trace -- gen-demo -o /tmp/demo.jsonl
+cargo run --bin vllm-vcr -- inspect gen-demo -o /tmp/demo.jsonl
 
 # 2. Model-level calibration (no transport).
-cargo run --bin inference-sim-trace -- calibrate /tmp/demo.jsonl
+cargo run --bin vllm-vcr -- inspect calibrate /tmp/demo.jsonl
 
 # 3. Wire-level: start the simulator and measure client-side.
-cargo run --bin inference-sim-trace -- calibrate-e2e /tmp/demo.jsonl --requests 60
+cargo run --bin vllm-vcr -- inspect calibrate-e2e /tmp/demo.jsonl --requests 60
 ```
 
 `--fast` on `gen-demo` produces a small-magnitude trace for quick e2e testing
@@ -293,7 +297,7 @@ output and `--seed` for determinism.
 
 ### Calibration with engine captures
 
-The recording tap (`inference-sim-tap`, deployment manifests in
+The recording tap (`vllm-vcr record`, deployment manifests in
 [deploy/trace-capture/](deploy/trace-capture/)) sits between the
 vLLM Rust frontend and a headless vLLM engine (Qwen3-8B, TP=1, H200), recording
 per-token inter-token gaps server-side over in-pod localhost ZMQ.
@@ -311,7 +315,7 @@ per-request means because they record first/last token timestamps. The knob mode
 To regenerate from any trace with per-token `itl_ms` arrays:
 
 ```bash
-cargo run --bin inference-sim-trace -- calibrate trace.jsonl --dump-samples samples.json
+cargo run --bin vllm-vcr -- inspect calibrate trace.jsonl --dump-samples samples.json
 uv run scripts/plot_calibration.py --samples samples.json --trace trace.jsonl --out-dir docs/images
 ```
 
@@ -348,7 +352,7 @@ llm-d-inference-sim --port 8001 --model Qwen/Qwen3-8B --mode random \
 cat traces/h200-qwen3-8b/h200-sweep-full.jsonl \
     <(grep -v '"meta"' traces/h200-qwen3-8b/h200-multiturn-mtfit2.jsonl) \
     <(grep -v '"meta"' traces/h200-qwen3-8b/h200-multiturn-nocache4.jsonl) > /tmp/fit.jsonl
-inference-sim --handshake-address tcp://127.0.0.1:5571 \
+vllm-vcr play --handshake-address tcp://127.0.0.1:5571 \
   --latency-trace /tmp/fit.jsonl \
   --max-num-seqs 1024 --max-num-batched-tokens 8192
 ```
@@ -393,7 +397,7 @@ latency is still modeled. `--latency-trace` fits the sim's model from a *differe
 trace, so the gate runs on an arrival process outside the fitting set.
 
 Setup: the same frontend → tap → engine stack as the capture rig, run locally with
-`inference-sim` as the engine, its latency model fit from the canonical H200 fitting
+`vllm-vcr play` as the engine, its latency model fit from the canonical H200 fitting
 set. `deploy/trace-capture/loadgen.py --pattern poisson|burst` drives arrival
 processes the fitting set never contained.
 
@@ -483,10 +487,10 @@ uv run --with httpx deploy/trace-capture/loadgen.py --url http://127.0.0.1:8000 
   --out run.json
 
 # session-paced replay, then the cache-off replay
-cargo run --release --bin inference-sim-trace -- calibrate-e2e tap-multiturn.jsonl \
+cargo run --release --bin vllm-vcr -- inspect calibrate-e2e tap-multiturn.jsonl \
   --replay-arrivals --replay-sessions --latency-trace /tmp/fit.jsonl \
   --sim-arg=--kv-cache-size --sim-arg=65536 --dump-trace replay-measured.jsonl
-cargo run --release --bin inference-sim-trace -- calibrate-e2e tap-multiturn.jsonl \
+cargo run --release --bin vllm-vcr -- inspect calibrate-e2e tap-multiturn.jsonl \
   --replay-arrivals --replay-sessions --cold-prompts ... --dump-trace nocache-measured.jsonl
 
 # per-cohort figure
@@ -506,7 +510,7 @@ tokens. The tap's `--record-tokens` option adds each request's `output_token_ids
 the trace. `finish_reason` is always recorded. With the same tokenizer, recorded token
 ids decode back to generated text, so token-recording traces can contain user content.
 
-On the replay side, `inference-sim --replay-tokens <trace>` serves the recorded ids
+On the replay side, `vllm-vcr play --replay-tokens <trace>` serves the recorded ids
 verbatim instead of random tokens, and ends each stream with the recorded finish
 reason. `--replay-match` controls request-to-record matching:
 
@@ -586,7 +590,7 @@ speculation off.
 just capture-up && bash deploy/trace-capture/run-capture.sh && just capture-down
 
 # 2. Replay the recorded schedule with verbatim per-request bursts and gaps.
-cargo run --release --bin inference-sim-trace -- calibrate-e2e \
+cargo run --release --bin vllm-vcr -- inspect calibrate-e2e \
     /tmp/trace-capture-h200/tap-trace.jsonl --replay-arrivals \
     --sim-arg=--replay-steps=/tmp/trace-capture-h200/tap-trace.jsonl \
     --dump-trace /tmp/spec-replay.jsonl
@@ -614,14 +618,14 @@ tests.
 
 ### Visualizing traces (Perfetto)
 
-`inference-sim-trace perfetto` converts a trace to the Chrome Trace Event Format for
+`vllm-vcr inspect perfetto` converts a trace to the Chrome Trace Event Format for
 <https://ui.perfetto.dev>: per-request prefill/decode spans packed into peak-concurrency
 lanes, batch-level counters, and (with the tap's `--step-stats` sidecar) a step-centric
 track of what the scheduler actually ran each step. `--open` serves it and launches the
 UI. See [docs/perfetto.md](docs/perfetto.md).
 
 ```bash
-cargo run --bin inference-sim-trace -- perfetto trace.jsonl --step-stats trace-step-stats.jsonl --open
+cargo run --bin vllm-vcr -- inspect perfetto trace.jsonl --step-stats trace-step-stats.jsonl --open
 ```
 
 ## Dependencies of note

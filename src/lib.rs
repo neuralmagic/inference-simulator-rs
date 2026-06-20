@@ -10,7 +10,7 @@
 //!   2. a real P/D data path exercised over CPU RDMA.
 
 use anyhow::{Context as _, Result, bail};
-use clap::Parser;
+use clap::Args;
 use sim_protocol::mock_engine::{DEFAULT_MOCK_MAX_MODEL_LEN, MockEngineSockets, default_dtype};
 use sim_s3::TraceUri;
 use tokio::sync::mpsc;
@@ -95,11 +95,11 @@ pub enum SchedulingPolicy {
 pub const VLLM_TARGET_VERSION: &str = env!("VLLM_TARGET_VERSION");
 
 /// Mock engine-core backend for frontend + prefill/decode data-plane testing.
-#[derive(Debug, Clone, Parser)]
-#[command(
-    name = "inference-sim",
-    about = "Run a mock vLLM engine-core backend with an optional NIXL KV data plane."
-)]
+///
+/// An `Args` group, not a top-level `Parser`: it nests under `vllm-vcr play`.
+/// Standalone parsing (tests, the in-process calibration harness) goes through
+/// [`Opt::parse_from`].
+#[derive(Debug, Clone, Args)]
 pub struct Opt {
     /// Frontend-owned ZMQ handshake address.
     #[arg(long, default_value = "tcp://127.0.0.1:29550")]
@@ -370,6 +370,27 @@ fn offset_endpoint_port(endpoint: &str, n: u32) -> String {
 }
 
 impl Opt {
+    /// Parse a standalone `play` argument vector. clap's `Parser::parse_from` is
+    /// unavailable because `Opt` is an `Args` group (it nests under the `play`
+    /// subcommand, see [`Opt`]), so the in-process calibration harness and the
+    /// integration tests use this wrapper instead. `args[0]` is the ignored
+    /// program name, matching clap's `parse_from`.
+    pub fn parse_from<I, T>(args: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            opt: Opt,
+        }
+
+        Wrap::parse_from(args).opt
+    }
+
     /// Build the KV-cache event publisher config for one engine. The endpoint port and the
     /// topic's pod id are offset by `engine_index` so several engines in one process publish
     /// on distinct sockets/streams.
@@ -745,6 +766,46 @@ async fn materialize_remote_inputs(opt: &mut Opt) -> Result<()> {
     Ok(())
 }
 
+/// A cancellation token triggered by SIGINT (Ctrl-C) or SIGTERM, mirroring vLLM's
+/// engine-core signal handlers (k8s sends SIGTERM on pod termination). Both the
+/// `play` and `record` front-ends drain or finalize on it. What happens next is
+/// up to the caller: `play` drains/aborts in-flight requests per
+/// `--shutdown-timeout`; `record` finalizes the gzip trailer and uploads.
+pub fn shutdown_signal() -> CancellationToken {
+    let token = CancellationToken::new();
+    let shutdown = token.clone();
+    tokio::spawn(async move {
+        let signal = wait_for_signal().await;
+        info!(signal, "received shutdown signal");
+        shutdown.cancel();
+    });
+    token
+}
+
+#[cfg(unix)]
+async fn wait_for_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = sigterm.recv() => "SIGTERM",
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to install SIGTERM handler; handling SIGINT only");
+            let _ = tokio::signal::ctrl_c().await;
+            "SIGINT"
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "ctrl-c"
+}
+
 /// Run all requested mock engines until cancellation or one engine task fails.
 pub async fn run(mut opt: Opt, shutdown: CancellationToken) -> Result<()> {
     materialize_remote_inputs(&mut opt).await?;
@@ -789,8 +850,6 @@ pub async fn run(mut opt: Opt, shutdown: CancellationToken) -> Result<()> {
 mod tests {
     use std::io::Write;
 
-    use clap::Parser;
-
     use crate::Opt;
 
     /// Write a one-line trace header with (or without) a config_hash.
@@ -810,7 +869,7 @@ mod tests {
 
     fn opt_replaying(trace: &std::path::Path, expect: &str) -> Opt {
         Opt::parse_from([
-            "inference-sim",
+            "play",
             "--latency-trace",
             trace.to_str().unwrap(),
             "--expect-config-hash",
@@ -821,7 +880,7 @@ mod tests {
     #[test]
     fn verify_config_hash_disabled_is_noop() {
         // Without --expect-config-hash the trace is never read for this check.
-        let opt = Opt::parse_from(["inference-sim", "--latency-trace", "/does/not/exist.jsonl"]);
+        let opt = Opt::parse_from(["play", "--latency-trace", "/does/not/exist.jsonl"]);
         assert!(opt.verify_config_hash().is_ok());
     }
 

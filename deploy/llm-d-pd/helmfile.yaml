@@ -1,4 +1,4 @@
-# Self-contained llm-d prefill/decode deployment driven by the inference-simulator-rs image.
+# Self-contained llm-d prefill/decode deployment driven by the vllm-vcr image.
 # GPU-free: the prefill/decode pods run the real vLLM Rust frontend + our mock engine,
 # moving KV over NIXL/UCX on CPU, behind the real llm-d Router (EPP) and routing sidecar.
 #

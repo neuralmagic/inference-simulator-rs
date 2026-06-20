@@ -9,7 +9,7 @@
 #       | HTTP   chat/completions with inline-base64 image_url content
 #   frontend   vllm serve --data-parallel-size-local 0   (PYTHON, on GPU)  :5570
 #       | ZMQ
-#   tap        inference-sim-tap                          :5570 <-> :5580, trace -> /trace
+#   tap        vllm-vcr record                          :5570 <-> :5580, trace -> /trace
 #       | ZMQ
 #   engine     vllm serve --headless                      gemma-3-27b, 1x H200
 #
@@ -88,7 +88,7 @@ spec:
         # --- Recording tap: serde-default + drain-task + observe>=2-frame mmfix ----
         - name: tap
           image: quay.io/wseaton/mock-engine-nixl:tap-16e91176-mmfix
-          command: ["/usr/local/bin/inference-sim-tap"]
+          command: ["/usr/local/bin/vllm-vcr", "record"]
           args:
             - --trace-out=/trace/trace.jsonl
             - --model=RedHatAI/gemma-3-27b-it-FP8-dynamic

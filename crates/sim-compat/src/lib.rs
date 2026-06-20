@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VllmLine {
     /// Minor line, e.g. `"0.10"`. The grouping key the build matrix and image
-    /// tags use (`inference-sim:<simver>-vllm0.10`).
+    /// tags use (`vllm-vcr:<simver>-vllm0.10`).
     pub line: String,
     /// vLLM release tag, e.g. `"v0.10.1"`. Also the e2e frontend version and the
     /// string the handshake guard checks the peer against.

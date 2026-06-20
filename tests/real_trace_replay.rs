@@ -10,7 +10,6 @@
 
 use std::time::Duration;
 
-use clap::Parser as _;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::protocol::{
@@ -18,8 +17,8 @@ use vllm_engine_core_client::protocol::{
 };
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 
-use inference_simulator_rs::trace::{read_trace_file, replay_subset};
-use inference_simulator_rs::{Opt, run};
+use vllm_vcr::trace::{read_trace_file, replay_subset};
+use vllm_vcr::{Opt, run};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -45,7 +44,7 @@ async fn replays_real_trace_byte_identical() {
 
     let addr = format!("ipc:///tmp/inf-sim-real-replay-{}.ipc", std::process::id());
     let args = vec![
-        "inference-sim",
+        "play",
         "--handshake-address",
         &addr,
         "--replay-tokens",
@@ -91,7 +90,7 @@ async fn replays_real_trace_byte_identical() {
         let last = outputs.last().unwrap().as_ref().unwrap();
         let expected_finish = record
             .finish_reason
-            .map(inference_simulator_rs::wire::engine_finish_reason)
+            .map(vllm_vcr::wire::engine_finish_reason)
             .unwrap_or(EngineCoreFinishReason::Length);
         assert_eq!(
             last.finish_reason,

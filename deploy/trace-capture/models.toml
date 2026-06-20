@@ -33,12 +33,12 @@ model_cache_size = "100Gi"
 # vllm_tag. Add a line here, then point captures at it.
 [lines."v0.23.0"]
 engine_image = "docker.io/vllm/vllm-openai:v0.23.0@sha256:6d8429e38e3747723ca07ee1b17972e09bb9c51c4032b266f24fb1cc3b22ed8f"
-tap_image = "ghcr.io/neuralmagic/inference-simulator-rs:vllm0.23"
+tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
 
 [lines."nightly"]
 # Postmerge image at the nightly protocol_rev; bump alongside compat.toml's nightly rev.
 engine_image = "public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:9c7c74bf1023774cf0e247bf77a038989ee272db"
-tap_image = "ghcr.io/neuralmagic/inference-simulator-rs:vllmnightly"
+tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllmnightly"
 
 # --- capture targets ----------------------------------------------------------------
 # `name` is the Job suffix + label (must be RFC1123: lowercase, digits, '-'); the dotted

@@ -1,4 +1,4 @@
-//! S3 object I/O for inference-sim trace files: a [`TraceUri`] is a local path
+//! S3 object I/O for vllm-vcr trace files: a [`TraceUri`] is a local path
 //! or an `s3://` object, fetched/uploaded via the AWS default credential chain.
 
 use std::fmt;

@@ -99,12 +99,12 @@ agent -> HTTP -> frontend (vllm serve --data-parallel-size-local 0) -> ZMQ :5570
 
 On the cluster: `just replay-up` deploys
 `deploy/trace-capture/offline-replay.yaml` (the same python frontend in
-front of `inference-sim --replay-match prefix`, zero GPU), then
+front of `vllm-vcr play --replay-match prefix`, zero GPU), then
 `just replay-load-trace <trace>` copies the capture in; the sim starts as
 soon as the file appears. Or run the same pair locally:
 
 ```bash
-inference-sim --handshake-address tcp://127.0.0.1:5570 \
+vllm-vcr play --handshake-address tcp://127.0.0.1:5570 \
   --replay-tokens swebench-capture.jsonl.gz --replay-match prefix \
   --latency-trace swebench-capture.jsonl.gz   # optional: replay timing too
 ```

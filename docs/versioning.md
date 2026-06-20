@@ -77,10 +77,10 @@ Conflating them is the classic mistake.
 
 Image tags:
 
-- `inference-sim:0.3.0-vllm0.10` — immutable, the real artifact (sim version ×
+- `vllm-vcr:0.3.0-vllm0.10` — immutable, the real artifact (sim version ×
   vLLM line).
-- `inference-sim:vllm0.10` — floating, → latest sim for that line.
-- `inference-sim:latest` — sim-head × the `default = true` line.
+- `vllm-vcr:vllm0.10` — floating, → latest sim for that line.
+- `vllm-vcr:latest` — sim-head × the `default = true` line.
 
 ## CI matrix mechanics
 
@@ -191,6 +191,6 @@ The CI flow (`.github/workflows/ci.yml`):
 
 The replay-many half needs no GPU and is the same mechanism as the offline replay rig
 (`deploy/trace-capture/offline-replay.yaml`): the python frontend talks to
-`inference-sim` serving the captured trace, no engine, no card. CI runs it headlessly;
+`vllm-vcr play` serving the captured trace, no engine, no card. CI runs it headlessly;
 the rig serves a live agent the same byte-identical streams.
 

@@ -17,6 +17,7 @@ concurrency:
 
 permissions:
   contents: write # refresh the rolling `nightly` prerelease
+  pull-requests: write # open/update the auto-bump PR
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,6 +35,11 @@ env:
 jobs:
   canary:
     runs-on: ubuntu-latest
+    env:
+      # Guards the auto-bump steps. Until the GitHub App secrets are provisioned,
+      # CANARY_APP_ID is empty and the bump steps skip, so the canary still runs
+      # its drift check + rolling prerelease unchanged.
+      CANARY_APP_ID: ${{ secrets.CANARY_APP_ID }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -91,3 +97,47 @@ jobs:
             --title "nightly (vLLM main @ ${SHA:0:12})" \
             --notes "Rolling build against vLLM main commit \`${SHA}\`, overwritten each night. Not a stable release; tracks upstream HEAD to surface protocol drift early."
           gh release upload nightly dist/* --clobber
+
+      # --- Auto-bump compat.toml's nightly protocol_rev ---------------------------
+      # Reached only after the green build+test above, so the PR always proposes a
+      # sha that already builds and passes unit tests. The whole block skips until
+      # the GitHub App secrets exist (see the CANARY_APP_ID job-env guard); the App
+      # token is what lets the bump PR trigger CI (a PR pushed with the default
+      # GITHUB_TOKEN does not, by GitHub's loop-prevention).
+      - name: Mint App token for the bump PR
+        id: app-token
+        if: ${{ env.CANARY_APP_ID != '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CANARY_APP_ID }}
+          private-key: ${{ secrets.CANARY_APP_PRIVATE_KEY }}
+
+      - name: Bump nightly protocol_rev in compat.toml
+        if: ${{ env.CANARY_APP_ID != '' }}
+        run: cargo xtask set-nightly-rev "${{ steps.head.outputs.sha }}"
+
+      # add-paths keeps the PR to compat.toml only; the pin-vllm step above also
+      # edited Cargo.toml, but that pin is derived (CI regenerates it from
+      # compat.toml on merge), not part of the source-of-truth bump. No diff -> the
+      # action opens no PR, so a HEAD that already matches is a clean no-op.
+      - name: Open/update the auto-bump PR
+        if: ${{ env.CANARY_APP_ID != '' }}
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          add-paths: compat.toml
+          base: main
+          branch: auto/nightly-rev-bump
+          delete-branch: true
+          commit-message: "ci: bump nightly protocol_rev to vLLM main ${{ steps.head.outputs.sha }}"
+          title: "ci: bump nightly protocol_rev to latest vLLM main"
+          body: |
+            Automated by the nightly canary.
+
+            vLLM main HEAD [`${{ steps.head.outputs.sha }}`](https://github.com/vllm-project/vllm/commit/${{ steps.head.outputs.sha }})
+            built and passed unit tests against the `nightly` line, so this bumps
+            `compat.toml`'s nightly `protocol_rev` to it.
+
+            On merge, CI re-derives `Cargo.toml` from `compat.toml`
+            (`cargo xtask pin-vllm nightly`). Review the build + conformance results
+            before merging.

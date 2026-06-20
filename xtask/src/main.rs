@@ -15,6 +15,8 @@ const COMPAT_TOML: &str = "compat.toml";
 const MANIFEST_TOML: &str = "conformance/manifest.toml";
 const CARGO_TOML: &str = "Cargo.toml";
 const VLLM_GIT: &str = "https://github.com/vllm-project/vllm.git";
+/// The compat.toml line that tracks vLLM main (auto-bumped by the nightly canary).
+const NIGHTLY_LINE: &str = "nightly";
 
 /// Native per-arch release runners (no cross-compile).
 const PLATFORMS: &[Platform] = &[
@@ -69,6 +71,15 @@ enum Command {
         #[arg(long)]
         rev: Option<String>,
     },
+    /// Bump the `nightly` line's `protocol_rev` in `compat.toml` to a vLLM main
+    /// sha, preserving formatting and comments. This is the persistent
+    /// source-of-truth bump (vs `pin-vllm`'s transient Cargo.toml edit); the
+    /// nightly canary runs it after a green build so the auto-bump PR only ever
+    /// proposes a sha that already builds + passes unit tests.
+    SetNightlyRev {
+        /// The vllm.git main commit sha to pin the `nightly` line to.
+        sha: String,
+    },
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -118,6 +129,7 @@ fn main() -> Result<()> {
         Command::Simver => simver(),
         Command::FrontendArgs { line } => frontend_args(&line),
         Command::PinVllm { line, rev } => pin_vllm(&line, rev.as_deref()),
+        Command::SetNightlyRev { sha } => set_nightly_rev(&sha),
     }
 }
 
@@ -272,6 +284,49 @@ fn apply_pin(
     Ok(())
 }
 
+fn set_nightly_rev(sha: &str) -> Result<()> {
+    let mut doc = read_compat_toml()?;
+    if apply_nightly_rev(&mut doc, sha)? {
+        std::fs::write(COMPAT_TOML, doc.to_string()).context("writing compat.toml")?;
+        eprintln!("bumped nightly protocol_rev -> {sha}");
+    } else {
+        eprintln!("nightly protocol_rev already {sha}; no change");
+    }
+    Ok(())
+}
+
+/// Set the `nightly` `[[vllm]]` line's `protocol_rev` to `sha` in place, preserving
+/// the surrounding formatting and comments. Returns `true` if the value changed, so
+/// the caller (and the canary's `git diff` check) can skip an empty write / no-op PR.
+fn apply_nightly_rev(doc: &mut DocumentMut, sha: &str) -> Result<bool> {
+    let tables = doc["vllm"]
+        .as_array_of_tables_mut()
+        .context("compat.toml [[vllm]] is not an array of tables")?;
+    let entry = tables
+        .iter_mut()
+        .find(|t| t.get("line").and_then(Item::as_str) == Some(NIGHTLY_LINE))
+        .with_context(|| {
+            format!("no [[vllm]] entry with line = \"{NIGHTLY_LINE}\" in compat.toml")
+        })?;
+    let rev = entry
+        .get_mut("protocol_rev")
+        .context("nightly line has no protocol_rev")?
+        .as_value_mut()
+        .context("protocol_rev is not a value")?;
+    if rev.as_str() == Some(sha) {
+        return Ok(false);
+    }
+    *rev = sha.into();
+    Ok(true)
+}
+
+fn read_compat_toml() -> Result<DocumentMut> {
+    std::fs::read_to_string(COMPAT_TOML)
+        .context("reading compat.toml")?
+        .parse::<DocumentMut>()
+        .context("parsing compat.toml")
+}
+
 /// Lines with at least one golden registered (drives the conformance fetch leg).
 fn golden_lines() -> Result<BTreeSet<String>> {
     if !Path::new(MANIFEST_TOML).exists() {
@@ -363,5 +418,56 @@ anyhow = \"1\"
             Some("f"),
         );
         assert_eq!(once, twice);
+    }
+
+    // A trimmed compat.toml with the nightly line first, an inline comment on the
+    // nightly entry, and a second line whose rev must stay untouched.
+    const COMPAT: &str = "\
+# manifest header
+[[vllm]]
+# nightly tracks vLLM main
+line = \"nightly\"
+tag = \"nightly\"
+protocol_rev = \"oldsha\"
+fidelity_validated = false
+
+[[vllm]]
+line = \"0.23\"
+tag = \"v0.23.0\"
+protocol_rev = \"keepsha\"
+default = true
+";
+
+    fn set_nightly(toml: &str, sha: &str) -> (String, bool) {
+        let mut doc: DocumentMut = toml.parse().unwrap();
+        let changed = apply_nightly_rev(&mut doc, sha).unwrap();
+        (doc.to_string(), changed)
+    }
+
+    #[test]
+    fn set_nightly_rev_bumps_only_the_nightly_line() {
+        let (out, changed) = set_nightly(COMPAT, "newsha");
+        assert!(changed);
+        assert!(out.contains(r#"protocol_rev = "newsha""#));
+        assert!(!out.contains("oldsha"));
+        assert!(
+            out.contains(r#"protocol_rev = "keepsha""#),
+            "the 0.23 line's rev must be untouched: {out}"
+        );
+    }
+
+    #[test]
+    fn set_nightly_rev_preserves_comments_and_structure() {
+        let (out, _) = set_nightly(COMPAT, "newsha");
+        assert!(out.contains("# manifest header"));
+        assert!(out.contains("# nightly tracks vLLM main"));
+        assert!(out.contains("fidelity_validated = false"));
+        assert!(out.contains(r#"default = true"#));
+    }
+
+    #[test]
+    fn set_nightly_rev_is_idempotent_no_change() {
+        let (_, changed) = set_nightly(COMPAT, "oldsha");
+        assert!(!changed, "setting the same sha must report no change");
     }
 }

@@ -22,6 +22,12 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
+  # Harden cargo against flaky crates.io fetches. HTTP/2 multiplexing is what
+  # throws the intermittent "curl [16] Error in the HTTP2 framing layer" during
+  # crate downloads; force HTTP/1.1 to dodge that class entirely, and retry the
+  # other transient blips.
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
   # build.rs treats a non-vX.Y tag as the newest line (all capability cfgs on).
   VLLM_TARGET_VERSION: nightly
 

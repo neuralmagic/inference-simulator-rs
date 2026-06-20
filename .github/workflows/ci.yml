@@ -24,6 +24,12 @@ env:
   # off shrinks the cached target/ and speeds cold builds.
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
+  # Harden cargo against flaky crates.io fetches. HTTP/2 multiplexing is what
+  # throws the intermittent "curl [16] Error in the HTTP2 framing layer" during
+  # crate downloads; force HTTP/1.1 to dodge that class entirely, and retry the
+  # other transient blips instead of failing the (non-blocking) nightly line.
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
 
 jobs:
   # One job, ordered fail-fast: fmt is instant, then the compile-heavy steps share a

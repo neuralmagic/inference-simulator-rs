@@ -6,9 +6,13 @@ name: Nightly Canary
 # publishes a rolling `nightly` prerelease with the sha in its notes. A red run
 # = upstream moved the engine-core protocol out from under us (notify-only: this
 # isn't a PR gate, it can't be, it tracks a moving target we don't control).
+# Daily drift check + prerelease; the rev bump is weekly, not daily (the daily runs
+# still track live HEAD, they just don't touch source). Two disjoint-weekday crons
+# keep it to one run per day.
 on:
   schedule:
-    - cron: "0 6 * * *" # 06:00 UTC daily
+    - cron: "0 6 * * 0,2-6" # Sun, Tue-Sat: drift check + prerelease only
+    - cron: "0 6 * * 1" # Mon: also open the rev-bump PR
   workflow_dispatch:
 
 concurrency:
@@ -98,22 +102,20 @@ jobs:
             --notes "Rolling build against vLLM main commit \`${SHA}\`, overwritten each night. Not a stable release; tracks upstream HEAD to surface protocol drift early."
           gh release upload nightly dist/* --clobber
 
-      # --- Auto-bump compat.toml's nightly protocol_rev ---------------------------
-      # Reached only after the green build+test above, so the PR always proposes a
-      # sha that already builds and passes unit tests. The whole block skips until
-      # the GitHub App secrets exist (see the CANARY_APP_ID job-env guard); the App
-      # token is what lets the bump PR trigger CI (a PR pushed with the default
-      # GITHUB_TOKEN does not, by GitHub's loop-prevention).
+      # --- Auto-bump compat.toml's nightly protocol_rev (weekly / on-demand) ------
+      # Monday + manual dispatch only, after the green build+test (so the PR proposes
+      # a sha that already builds). Skips until the App secrets exist; the App token
+      # is what lets the bump PR trigger CI (the default GITHUB_TOKEN can't).
       - name: Mint App token for the bump PR
         id: app-token
-        if: ${{ env.CANARY_APP_ID != '' }}
+        if: ${{ env.CANARY_APP_ID != '' && (github.event_name == 'workflow_dispatch' || github.event.schedule == '0 6 * * 1') }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.CANARY_APP_ID }}
           private-key: ${{ secrets.CANARY_APP_PRIVATE_KEY }}
 
       - name: Bump nightly protocol_rev in compat.toml
-        if: ${{ env.CANARY_APP_ID != '' }}
+        if: ${{ env.CANARY_APP_ID != '' && (github.event_name == 'workflow_dispatch' || github.event.schedule == '0 6 * * 1') }}
         run: cargo xtask set-nightly-rev "${{ steps.head.outputs.sha }}"
 
       # add-paths keeps the PR to compat.toml only; the pin-vllm step above also
@@ -121,7 +123,7 @@ jobs:
       # compat.toml on merge), not part of the source-of-truth bump. No diff -> the
       # action opens no PR, so a HEAD that already matches is a clean no-op.
       - name: Open/update the auto-bump PR
-        if: ${{ env.CANARY_APP_ID != '' }}
+        if: ${{ env.CANARY_APP_ID != '' && (github.event_name == 'workflow_dispatch' || github.event.schedule == '0 6 * * 1') }}
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ steps.app-token.outputs.token }}

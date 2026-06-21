@@ -127,6 +127,10 @@ jobs:
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ steps.app-token.outputs.token }}
+          # Commit via the GitHub API so it's signed with GitHub's key (Verified),
+          # satisfying the default branch's required-signatures rule. The App token's
+          # contents:write is what authorizes the API commit.
+          sign-commits: true
           add-paths: compat.toml
           base: main
           branch: auto/nightly-rev-bump

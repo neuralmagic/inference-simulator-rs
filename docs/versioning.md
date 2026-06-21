@@ -136,10 +136,11 @@ When vLLM cuts N+1:
    multiple lines without a single multi-version binary.
 4. Nightly canary (`.github/workflows/nightly-canary.yml`). The `nightly` line is
    pinned and only moves when bumped; the canary instead pins to the LIVE upstream
-   main HEAD each night (`cargo xtask pin-vllm nightly --rev <sha>`), builds +
-   unit-tests, and publishes a rolling `nightly` prerelease with the sha in its
-   notes. A red scheduled run is the early warning that upstream moved the
-   engine-core protocol. **Done.**
+   main HEAD each night (`cargo xtask pin-vllm nightly --rev <sha>`), builds,
+   runs unit tests, runs the HEAD-client protocol e2e tests, runs the conformance
+   runner, and publishes a rolling `nightly` prerelease with the sha in its notes.
+   A red scheduled run is the early warning that upstream moved the engine-core
+   protocol. **Done.**
 
 ## Open coupling note: the `block_size` / registration drift
 
@@ -193,4 +194,3 @@ The replay-many half needs no GPU and is the same mechanism as the offline repla
 (`deploy/trace-capture/offline-replay.yaml`): the python frontend talks to
 `vllm-vcr play` serving the captured trace, no engine, no card. CI runs it headlessly;
 the rig serves a live agent the same byte-identical streams.
-

@@ -272,6 +272,13 @@ which is the normal state until captures exist. Set `$CONFORMANCE_MANIFEST` to p
 an alternate manifest. The pure assertions live in `src/conformance.rs` and are
 unit-tested independently of any real capture.
 
+The nightly canary is therefore a protocol-drift smoke until nightly captures exist,
+not a true fidelity gate: after pinning to live vLLM `main`, it runs the manifest
+runner for schema/provenance plumbing and also runs the HEAD-client protocol e2e
+tests (`engine_core_e2e` and `tap_e2e`) so a client-wire break still turns the run red.
+When a `line = "nightly"` golden is added, the canary detects it, assumes the same
+golden-fetch role as CI, and replays it before publishing the rolling prerelease.
+
 ## The GPU-free replay half
 
 The replay-many half needs no GPU anywhere. `deploy/trace-capture/offline-replay.yaml`

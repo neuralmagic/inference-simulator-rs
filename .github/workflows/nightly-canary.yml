@@ -2,10 +2,11 @@ name: Nightly Canary
 
 # Early warning on vLLM protocol drift. The `nightly` compat.toml line is pinned
 # and only moves when someone bumps it; this job tracks the LIVE upstream main
-# HEAD instead. It pins the protocol crate to that sha, builds + unit-tests, and
-# publishes a rolling `nightly` prerelease with the sha in its notes. A red run
-# = upstream moved the engine-core protocol out from under us (notify-only: this
-# isn't a PR gate, it can't be, it tracks a moving target we don't control).
+# HEAD instead. It pins the protocol crate to that sha, builds, runs the
+# vLLM-facing protocol/conformance checks, and publishes a rolling `nightly`
+# prerelease with the sha in its notes. A red run = upstream moved the
+# engine-core protocol out from under us (notify-only: this isn't a PR gate, it
+# can't be, it tracks a moving target we don't control).
 # Daily drift check + prerelease; the rev bump is weekly, not daily (the daily runs
 # still track live HEAD, they just don't touch source). Two disjoint-weekday crons
 # keep it to one run per day.
@@ -22,6 +23,7 @@ concurrency:
 permissions:
   contents: write # refresh the rolling `nightly` prerelease
   pull-requests: write # open/update the auto-bump PR
+  id-token: write # assume the golden-fetch role if nightly captures exist
 
 env:
   CARGO_TERM_COLOR: always
@@ -35,6 +37,8 @@ env:
   CARGO_NET_RETRY: "10"
   # build.rs treats a non-vX.Y tag as the newest line (all capability cfgs on).
   VLLM_TARGET_VERSION: nightly
+  CONFORMANCE_BUCKET: "s3://llm-d-artifacts-783952637884"
+  AWS_REGION: us-east-1
 
 jobs:
   canary:
@@ -66,13 +70,45 @@ jobs:
       - name: Pin protocol crate to upstream HEAD
         run: cargo xtask pin-vllm nightly --rev "${{ steps.head.outputs.sha }}"
 
-      # The early-warning signal: build + behavioral unit tests against HEAD. A
-      # failure here is the protocol-drift alert. Omit --locked: the pin moved the
-      # rev off Cargo.lock.
+      - name: Detect nightly conformance goldens
+        id: nightly-goldens
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import subprocess
+
+          matrix = json.loads(subprocess.check_output(["cargo", "xtask", "ci-matrix"], text=True))
+          has_goldens = any(row.get("line") == "nightly" and row.get("has_goldens") for row in matrix)
+          print(f"has_goldens={str(has_goldens).lower()}")
+          PY
+
+      # The early-warning signal: compile, unit behavior, and the real protocol
+      # boundary against HEAD. Omit --locked: the pin moved the rev off Cargo.lock.
       - name: Build + unit test against HEAD
         run: |
           cargo build --workspace
           cargo test --workspace --lib
+
+      # These are the "does the simulator still talk to vLLM's client?" checks:
+      # real EngineCoreClient over ZMQ, request/abort/shutdown/utility calls, tap
+      # record/replay, and byte-identical token replay through the recorded trace.
+      - name: Protocol e2e against HEAD
+        run: |
+          cargo test --test engine_core_e2e -- --nocapture
+          cargo test --test tap_e2e -- --nocapture
+
+      - name: Configure AWS credentials (nightly golden fetch)
+        if: ${{ steps.nightly-goldens.outputs.has_goldens == 'true' }}
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        with:
+          role-to-assume: arn:aws:iam::783952637884:role/llm-d-conformance-ci
+          aws-region: us-east-1
+
+      # There are no nightly goldens yet, so this currently exercises the runner's
+      # schema/provenance plumbing. The detection + OIDC step above makes this a
+      # real replay check as soon as nightly captures land in the manifest.
+      - name: Conformance runner against HEAD
+        run: cargo test --test conformance -- --nocapture
 
       - name: Package standalone binary
         run: |
@@ -141,8 +177,9 @@ jobs:
             Automated by the nightly canary.
 
             vLLM main HEAD [`${{ steps.head.outputs.sha }}`](https://github.com/vllm-project/vllm/commit/${{ steps.head.outputs.sha }})
-            built and passed unit tests against the `nightly` line, so this bumps
-            `compat.toml`'s nightly `protocol_rev` to it.
+            built and passed unit, protocol e2e, and conformance-runner tests
+            against the `nightly` line, so this bumps `compat.toml`'s nightly
+            `protocol_rev` to it.
 
             On merge, CI re-derives `Cargo.toml` from `compat.toml`
             (`cargo xtask pin-vllm nightly`). Review the build + conformance results

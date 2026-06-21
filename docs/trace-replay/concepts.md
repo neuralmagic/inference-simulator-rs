@@ -1,6 +1,6 @@
 # Concepts
 
-This section uses three terms:
+The trace docs use three terms consistently:
 
 - **Captured** — per-token tap recordings from a vLLM engine, taken server-side on
   the engine-core protocol. Figures label these as "real" or "source".
@@ -10,7 +10,8 @@ This section uses three terms:
   so a model fitted on one workload can be evaluated on another.
 - **Direct replay** — recorded values used verbatim, no statistics: arrival
   timestamps (`--replay-arrivals`), session pacing (`--replay-sessions`), prefix
-  structure (block hashes), and opt-in output token ids (`--replay-tokens`).
+  structure (block hashes), per-step gaps (`--replay-steps`), and opt-in output token
+  ids (`--replay-tokens`).
 
 "Replay" in a figure or flag name refers to the workload side (the schedule being
 replayed), not to the timing. Counterfactual gates fit on workload A, directly replay

@@ -82,7 +82,7 @@ span's `token_ids` arg, the hook for a future detokenize-to-text mode.
 | `--name <label>` | Override the process-row label (default: the trace's model) |
 | `--track-per-request` | One labelled row per request instead of packed lanes (good for small traces) |
 | `--open` | Serve over localhost and open the Perfetto UI; blocks until Ctrl-C |
-| `--port <n>` | Port for `--open` (default 9001) |
+| `--port <n>` | Port for `--open`; default `0` lets the OS choose a free ephemeral port |
 
 Records without an `arrival_ms` cannot be placed on a timeline and are dropped
 (the command prints how many); guidellm-converted and `gen-demo` traces have none,
@@ -114,6 +114,7 @@ about), and the step track to see scheduler occupancy.
 - Timestamps are relative to capture start, not wall-clock epoch, so a trace is
   self-contained but not directly correlatable with an external profiler.
 - `--open` runs a minimal localhost HTTP server with permissive CORS so the hosted
-  UI can fetch the file; nothing leaves your machine.
+  UI can fetch the file. The trace stays on your machine; the browser fetches it from
+  `127.0.0.1`.
 - Large traces produce large JSON (a ~2500-request capture is ~50 MB / ~370k
   events); the UI loads it fine but the default zoom fits the whole capture.

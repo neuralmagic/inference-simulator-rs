@@ -5,6 +5,11 @@ The recording tap (`vllm-vcr record`, deployment manifests in
 vLLM Rust frontend and a headless vLLM engine (Qwen3-8B, TP=1, H200), recording
 per-token inter-token gaps server-side over in-pod localhost ZMQ.
 
+This page explains the figures used to validate the trace-fitted latency model. The
+important point: the model is not replaying a single request's gaps. It samples from
+captured observations conditioned on request shape and concurrency, so it can be tested
+out of sample.
+
 The figures below plot captured vs `TraceLatency` vs best-fit `KnobLatency` per-token
 ITL (survival curve and Q-Q plot), and the same trace as pooled per-token ITLs vs
 per-request mean ITLs. Client-side benchmark reports such as guidellm usually expose
@@ -36,8 +41,8 @@ are the tap recording. Both simulators' timing is modeled.
 ![Real engine vs both simulators](../images/sim-comparison.png)
 
 The step model over-predicts TTFT for this saturated fixed-concurrency workload by
-~70ms at the median (a known calibration gap in the out-of-sample fit).
-The knob model clamps both tails by construction.
+about 70ms at the median, a known calibration gap in the out-of-sample fit. The knob
+model clamps both tails by construction.
 
 Note: the trace's std-devs (TTFT 80ms, ITL 8ms) exceed llm-d-inference-sim's config
 validation, which caps std-dev at 30% of the mean, so it runs with the largest spread
@@ -85,5 +90,5 @@ calibrated under the same model:
 
 ![Low-rate cold-multiturn replay](../images/step-model-lowrate.png)
 
-The same fit procedure refits from a Qwen3-30B-A3B (MoE) sweep without constant
-changes and reproduces its counterfactual band.
+The same fit procedure refits from a Qwen3-30B-A3B MoE sweep without constant changes
+and reproduces its counterfactual band.

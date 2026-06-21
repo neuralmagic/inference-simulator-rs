@@ -1,50 +1,62 @@
 # vllm-vcr
 
-Record, play, and inspect vLLM **V1 engine-core** traces. One binary with three
-subcommands, named for the VCR metaphor:
+<div class="vcr-hero">
+  <p class="eyebrow">GPU-free vLLM engine-core replay</p>
+  <p class="lead">Record a real vLLM engine once, then replay its protocol behavior, timing, and optional output tokens behind the real vLLM frontend on ordinary CPU hosts.</p>
+</div>
 
-- **`record`** taps a live vLLM frontend ↔ engine-core link (a transparent ZMQ
-  proxy) and writes a JSONL trace.
+`vllm-vcr` is a single binary with three subcommands:
+
+- **`record`** taps a live vLLM frontend ↔ engine-core link as a transparent ZMQ
+  proxy and writes a JSONL trace.
 - **`play`** runs a mock engine-core backend that speaks the real ZMQ + msgpack
-  protocol, replaying a recorded trace or simulating from a latency model. No model
-  weights, no GPU.
+  protocol. It can generate synthetic tokens, sample timing from a fitted trace,
+  replay recorded step timing, or serve recorded token ids.
 - **`inspect`** converts benchmark reports, summarizes traces, renders Perfetto
-  timelines, and runs calibration.
+  timelines, and runs calibration checks.
 
-With the `nixl` feature and a working libnixl/UCX runtime, `play` also moves
-simulated KV-cache bytes between prefill and decode instances over NIXL.
+With the optional `nixl` feature and a working libnixl/UCX runtime, `play` can also
+move simulated KV-cache bytes between prefill and decode instances over NIXL.
 
-## Why
+## What it is for
 
-Testing the software *around* a vLLM engine — frontends, cache-aware routers,
-schedulers, autoscalers, whole CI matrices — normally means standing up real GPUs
-and model weights just to get realistic timing and protocol behavior. `vllm-vcr`
-takes the GPU out of that loop:
+Testing the software around a vLLM engine usually means provisioning GPUs and model
+weights before you can exercise frontends, cache-aware routers, schedulers,
+autoscalers, or CI compatibility matrices. `vllm-vcr` keeps the real frontend and
+wire protocol in the loop, but replaces the model backend with a CPU simulator.
 
-1. **CPU-only replay of real engine behavior.** `record` captures a real vLLM
-   engine's per-request timing (TTFT, per-token gaps) and, optionally, its exact
-   output tokens, straight off the engine-core protocol. `play` serves that capture
-   back — sampled from a fitted latency model, or verbatim and byte-for-byte
-   identical — on CPU, with no GPU and no model weights. A trace captured once on an
-   H200 can then drive a frontend, a router, or an entire CI run on commodity
-   machines.
-2. **Faithful frontend compatibility.** It speaks the real ZMQ + msgpack
-   engine-core protocol and sits behind vLLM's Rust or Python frontend unchanged, so
-   the frontend still handles tokenization, chat templates, tool calling, streaming,
-   and OpenAI-compatible request handling. Only the model backend is simulated.
+Use it when you need to:
 
-`llm-d-inference-sim` models prefill/decode in the control plane (it adjusts latency
-and finish metadata) but does not move KV-cache bytes. As an optional third
-capability, `vllm-vcr`'s `play` *can* move simulated KV-cache bytes between prefill
-and decode instances over [NIXL](https://github.com/ai-dynamo/nixl) (UCX backend) for
-P/D data-plane testing — behind the `nixl` feature, and still without CUDA or model
+- replay captured TTFT and inter-token behavior without a GPU;
+- run OpenAI-compatible frontend, streaming, LoRA, scheduler, and router tests
+  against the real engine-core protocol;
+- validate trace fidelity and version compatibility in CI;
+- test prefill/decode control-plane behavior, and optionally the NIXL data plane,
+  without model weights.
+
+It is not a model-quality simulator: generated tokens are random unless you record
+and replay token ids, and latency fidelity depends on traces captured from the
+engine/configuration you care about.
+
+## How it fits
+
+The vLLM frontend remains responsible for tokenization, chat templates, tool calling,
+streaming, metrics, and OpenAI-compatible HTTP handling. `vllm-vcr play` only replaces
+the engine-core process behind that frontend. For prefill/decode work, the default
+data plane is a no-op; the NIXL path is opt-in and still runs without CUDA or model
 weights.
 
-## Where to start
-
-- New here? Read [Architecture](./architecture.md), then [Install](./install.md)
-  and the [Quick start](./quick-start.md).
-- Capturing and replaying real traces? Jump to
-  [Trace replay and calibration](./trace-replay/index.md).
-- Running it across vLLM versions in CI? See [Versioning](./versioning.md) and
-  [Conformance](./conformance.md).
+<div class="vcr-grid">
+  <div class="vcr-card">
+    <h3>New setup</h3>
+    <p>Read <a href="./architecture.html">Architecture</a>, then install the binary and run the quick start.</p>
+  </div>
+  <div class="vcr-card">
+    <h3>Trace replay</h3>
+    <p>Start with <a href="./trace-replay/index.html">Trace replay and calibration</a> for capture, model fit, and replay modes.</p>
+  </div>
+  <div class="vcr-card">
+    <h3>Operations</h3>
+    <p>Use <a href="./versioning.html">Versioning</a> and <a href="./conformance.html">Conformance</a> for multi-line vLLM support.</p>
+  </div>
+</div>

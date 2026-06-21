@@ -1,10 +1,11 @@
 # Prefix cache and agentic multiturn
 
-The agentic scenario (`loadgen.py --pattern multiturn`): sessions arrive poisson at
-`--rate`, each runs `--turns` closed-loop turns whose context grows by the turn's
-prompt plus the model's response, on top of one of `--prefix-count` shared
-`--prefix-tokens` prefixes. The validation run below is ~100 sessions x 5 turns over
-two ~10k-token shared prefixes; 493 of 495 requests were prefix-cache hits.
+The agentic scenario (`loadgen.py --pattern multiturn`) models sessions, not isolated
+requests. Sessions arrive poisson at `--rate`; each session runs `--turns` closed-loop
+turns whose context grows by the turn's prompt plus the model's response, on top of
+one of `--prefix-count` shared `--prefix-tokens` prefixes. The validation run below
+is about 100 sessions x 5 turns over two ~10k-token shared prefixes; 493 of 495
+requests were prefix-cache hits.
 
 Prefix caching is not a latency knob. The engine runs a block-pool prefix cache;
 admission computes each request's cached-token count, the trace-fitted TTFT model
@@ -15,11 +16,11 @@ sharing structure. The tap fingerprints every prompt with chained per-block hash
 block. Replayed prompts therefore share prefixes at the same block boundaries as the
 capture.
 
-Two replay modes apply. Pure open-loop replay fires every turn at its recorded offset;
-`--replay-sessions` restores the generator's semantics (turn N+1 fires when turn N
-completes plus the recorded think gap; sessions are inferred from the hash chains).
-Session pacing matches closed-loop client behavior: cold turns take seconds, so later
-turns are delayed by prior responses. Open-loop replay would fire every turn on the
+Two replay modes apply. Pure open-loop replay fires every turn at its recorded offset.
+`--replay-sessions` restores the generator's semantics: turn N+1 fires when turn N
+completes plus the recorded think gap, with sessions inferred from the hash chains.
+Session pacing matches closed-loop client behavior. Cold turns take seconds, so later
+turns are delayed by prior responses; open-loop replay would fire every turn on the
 original warm schedule.
 
 The figure shows captured vs modeled TTFT survival per turn cohort (turn-1 requests:

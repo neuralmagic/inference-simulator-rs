@@ -5,8 +5,9 @@ re-run the *same agent* fully offline against the sim and get the same
 patches, the same eval results, zero GPU, zero API spend.
 
 The repo side is done: `--replay-tokens <trace> --replay-match prefix` turns
-the sim into a content-keyed cassette player (see "Content-identical replay"
-in the main README). This doc is the runbook for the demo around it.
+the sim into a content-keyed cassette player. See
+[Content-identical replay](./trace-replay/content-identical.md) for the replay mode;
+this page is the runbook for the SWE-bench demo around it.
 
 ## Why this works
 
@@ -67,9 +68,38 @@ recording on and the **python** vLLM frontend, which serves `/v1/messages`
 for Claude Code (vllm-rs doesn't yet; the protocol-pin image c9340e6f3
 already ships the anthropic entrypoint including the billing-header strip):
 
-```
-agent -> HTTP -> frontend (vllm serve --data-parallel-size-local 0) -> ZMQ :5570 -> tap --record-tokens -> :5580 -> engine (GPU)
-```
+<div class="vcr-flow vcr-flow-capture" role="img" aria-label="Agent sends HTTP to the Python vLLM frontend, the recording tap proxies ZMQ to the GPU engine, and token ids are recorded to a trace.">
+  <div class="vcr-node">
+    <span class="vcr-node-kicker">agent</span>
+    <strong>SWE-bench rollout</strong>
+    <span>mini-swe-agent or Claude Code</span>
+  </div>
+  <div class="vcr-connector"><span>HTTP</span></div>
+  <div class="vcr-node">
+    <span class="vcr-node-kicker">frontend</span>
+    <strong>vLLM Python</strong>
+    <span>data-parallel-size-local 0</span>
+  </div>
+  <div class="vcr-connector"><span>ZMQ :5570</span></div>
+  <div class="vcr-node">
+    <span class="vcr-node-kicker">tap</span>
+    <strong>vllm-vcr record</strong>
+    <span>--record-tokens</span>
+  </div>
+  <div class="vcr-connector"><span>ZMQ :5580</span></div>
+  <div class="vcr-node-stack">
+    <div class="vcr-node vcr-node-accent">
+      <span class="vcr-node-kicker">engine</span>
+      <strong>vLLM engine</strong>
+      <span>GPU-backed capture</span>
+    </div>
+    <div class="vcr-node vcr-node-artifact">
+      <span class="vcr-node-kicker">output</span>
+      <strong>token trace</strong>
+      <span>content-sensitive JSONL</span>
+    </div>
+  </div>
+</div>
 
 1. `just agentic-capture-up` deploys
    `deploy/trace-capture/h200-capture-agentic.yaml` (tap has

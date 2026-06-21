@@ -1,0 +1,338 @@
+:root {
+  --content-max-width: 920px;
+  --page-padding: 28px;
+  --vcr-accent: #0f766e;
+  --vcr-accent-2: #2563eb;
+  --vcr-border: color-mix(in srgb, var(--fg) 16%, transparent);
+  --vcr-muted: color-mix(in srgb, var(--fg) 68%, var(--bg));
+  --vcr-surface: color-mix(in srgb, var(--bg) 94%, var(--fg));
+  --vcr-code-bg: color-mix(in srgb, var(--bg) 88%, var(--fg));
+}
+
+.light,
+.rust,
+html:not(.js) {
+  --links: #0f5f8f;
+  --sidebar-active: #0f766e;
+  --table-header-bg: #edf4f2;
+  --table-alternate-bg: #f7faf9;
+  --quote-bg: #f4f8f7;
+  --quote-border: #cfe4df;
+}
+
+.ayu,
+.coal,
+.navy {
+  --vcr-border: color-mix(in srgb, var(--fg) 22%, transparent);
+  --vcr-surface: color-mix(in srgb, var(--bg) 86%, var(--fg));
+  --vcr-code-bg: color-mix(in srgb, var(--bg) 80%, var(--fg));
+}
+
+.content main {
+  padding-block-start: 22px;
+}
+
+.content p,
+.content li {
+  line-height: 1.62;
+}
+
+.content h1,
+.content h2,
+.content h3 {
+  letter-spacing: 0;
+}
+
+.content h1 {
+  margin-block: 0.55em 0.65em;
+  font-size: 3.4rem;
+  line-height: 1.12;
+}
+
+.content h2 {
+  margin-block-start: 2.25em;
+  padding-block-start: 0.35em;
+  border-block-start: 1px solid var(--vcr-border);
+  font-size: 2.35rem;
+}
+
+.content h3 {
+  font-size: 1.78rem;
+}
+
+.content a {
+  text-underline-offset: 0.18em;
+}
+
+.content a:hover {
+  text-decoration-thickness: 0.08em;
+}
+
+.content code {
+  padding: 0.08em 0.28em;
+  border-radius: 4px;
+  background: var(--vcr-code-bg);
+}
+
+.content pre code {
+  padding: 0;
+  background: transparent;
+}
+
+.content pre {
+  border: 1px solid var(--vcr-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px color-mix(in srgb, #000 8%, transparent);
+}
+
+.table-wrapper {
+  margin-block: 1.25em;
+  border: 1px solid var(--vcr-border);
+  border-radius: 8px;
+}
+
+table {
+  width: 100%;
+}
+
+table th,
+table td {
+  padding: 0.68em 0.9em;
+  vertical-align: top;
+}
+
+blockquote {
+  border-block: 0;
+  border-inline-start: 4px solid var(--quote-border);
+  border-radius: 0 8px 8px 0;
+}
+
+.sidebar-scrollbox {
+  padding-block-start: 0.65rem;
+}
+
+.chapter li {
+  margin-block: 0.18rem;
+}
+
+.chapter li.part-title {
+  margin-block-start: 1.25rem;
+  color: var(--vcr-muted);
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.menu-title {
+  font-weight: 700;
+}
+
+.vcr-hero {
+  margin-block: 0 2rem;
+  padding: 1.45rem 1.6rem;
+  border: 1px solid var(--vcr-border);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--vcr-accent) 12%, transparent), transparent 52%),
+    var(--vcr-surface);
+}
+
+.vcr-hero .eyebrow {
+  margin: 0 0 0.45rem;
+  color: var(--vcr-accent);
+  font-size: 1.2rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.vcr-hero .lead {
+  margin: 0;
+  max-width: 72ch;
+  font-size: 1.82rem;
+  line-height: 1.5;
+}
+
+.vcr-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 1rem;
+  margin-block: 1.25rem;
+}
+
+.vcr-card {
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--vcr-border);
+  border-radius: 8px;
+  background: var(--vcr-surface);
+}
+
+.vcr-card h3 {
+  margin-block: 0 0.35rem;
+}
+
+.vcr-card p {
+  margin-block: 0;
+  color: var(--vcr-muted);
+}
+
+.vcr-callout {
+  margin-block: 1.2rem;
+  padding: 0.95rem 1.1rem;
+  border-inline-start: 4px solid var(--vcr-accent-2);
+  border-radius: 0 8px 8px 0;
+  background: var(--vcr-surface);
+}
+
+.vcr-callout p {
+  margin-block: 0;
+}
+
+@media (max-width: 700px) {
+  :root {
+    --page-padding: 18px;
+  }
+
+  .content h1 {
+    font-size: 2.7rem;
+  }
+
+  .vcr-hero {
+    padding: 1.1rem 1.2rem;
+  }
+}
+
+.vcr-flow {
+  display: grid;
+  align-items: stretch;
+  gap: 0.75rem;
+  margin-block: 1.4rem;
+  padding: 1rem;
+  border: 1px solid var(--vcr-border);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--vcr-accent) 8%, transparent), transparent 58%),
+    var(--vcr-surface);
+}
+
+.vcr-flow-arch,
+.vcr-flow-capture,
+.vcr-flow-replay {
+  grid-template-columns: minmax(130px, 1fr) auto minmax(130px, 1fr) auto minmax(130px, 1fr) auto minmax(150px, 1fr);
+}
+
+.vcr-node,
+.vcr-node-stack {
+  min-width: 0;
+}
+
+.vcr-node {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 5.6rem;
+  padding: 0.85rem 0.95rem;
+  border: 1px solid var(--vcr-border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg) 88%, var(--fg));
+  box-shadow: 0 8px 22px color-mix(in srgb, #000 9%, transparent);
+}
+
+.vcr-node strong {
+  display: block;
+  margin-block: 0.12rem 0.18rem;
+  font-size: 1.42rem;
+  line-height: 1.25;
+}
+
+.vcr-node span {
+  color: var(--vcr-muted);
+  font-size: 1.16rem;
+  line-height: 1.35;
+}
+
+.vcr-node .vcr-node-kicker {
+  color: var(--vcr-accent);
+  font-size: 1rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.vcr-node-stack {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.vcr-node-accent {
+  border-color: color-mix(in srgb, var(--vcr-accent) 48%, var(--vcr-border));
+}
+
+.vcr-node-artifact {
+  border-style: dashed;
+}
+
+.vcr-connector {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 7.2rem;
+  color: var(--vcr-muted);
+  font-size: 1.08rem;
+  font-weight: 700;
+  line-height: 1.25;
+  text-align: center;
+}
+
+.vcr-connector::before {
+  content: "";
+  position: absolute;
+  inset-inline: 0.15rem;
+  top: 50%;
+  border-block-start: 2px solid color-mix(in srgb, var(--vcr-accent) 55%, var(--fg));
+  opacity: 0.7;
+}
+
+.vcr-connector::after {
+  content: "";
+  position: absolute;
+  inset-inline-end: -0.05rem;
+  top: calc(50% - 0.42rem);
+  border-block: 0.42rem solid transparent;
+  border-inline-start: 0.68rem solid var(--vcr-accent);
+}
+
+.vcr-connector span {
+  position: relative;
+  z-index: 1;
+  max-width: 8.4rem;
+  padding: 0.24rem 0.46rem;
+  border-radius: 999px;
+  border: 1px solid var(--vcr-border);
+  background: color-mix(in srgb, var(--bg) 92%, var(--fg));
+}
+
+@media (max-width: 900px) {
+  .vcr-flow-arch,
+  .vcr-flow-capture,
+  .vcr-flow-replay {
+    grid-template-columns: 1fr;
+  }
+
+  .vcr-connector {
+    min-height: 2rem;
+    min-width: 0;
+  }
+
+  .vcr-connector::before,
+  .vcr-connector::after {
+    display: none;
+  }
+
+  .vcr-connector span {
+    max-width: none;
+    border: 1px solid var(--vcr-border);
+  }
+}

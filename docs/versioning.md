@@ -41,29 +41,35 @@ A manifest at repo root defines the support window. The manifest diff *is* the
 release.
 
 ```toml
-# compat.toml — the N-3 support window. Oldest line drops as N advances.
+# compat.toml — the rolling support window. Oldest release line drops as N advances.
 
 [[vllm]]
-line = "0.10"                 # N (head)
-tag  = "v0.10.1"              # vLLM release tag; also the e2e frontend version
-protocol_rev = "abc123..."    # rev for vllm-engine-core-client at this line
-fidelity_validated = true     # replay gates green against this line's captures
+line = "nightly"              # tracks vLLM main for drift detection
+tag  = "nightly"
+protocol_rev = "9c7c74bf..."
+fidelity_validated = false
+
+[[vllm]]
+line = "0.23"                 # current default line
+tag  = "v0.23.0"              # vLLM release tag; also the e2e frontend version
+protocol_rev = "17bc1445..."  # rev for vllm-engine-core-client at this line
+fidelity_validated = false    # flips true once replay gates validate goldens
 default = true                # what :latest / unsuffixed builds point at
 
 [[vllm]]
-line = "0.9"                  # N-1
-tag  = "v0.9.2"
-protocol_rev = "c9340e6f350a009cf835878abad2a0e379b9e6a4"
-fidelity_validated = true
-
-# ... N-2, N-3
+line = "0.22"                 # older supported release line
+tag  = "v0.22.1"
+protocol_rev = "0decac0d..."
+patch_repo = "https://github.com/wseaton/vllm.git"
+patch_rev = "b48f2434..."
+fidelity_validated = false
 ```
 
 Rules:
 
-- **Pin to vLLM release tags, not arbitrary revs.** `protocol_rev` is the rev of
-  the in-tree Rust crate that ships with that tag. Today's `c9340e6f` becomes
-  "the rev for the 0.9 line."
+- **Pin release lines to release tags, not arbitrary labels.** `tag` is the vLLM
+  release label for the line. `protocol_rev` is the vLLM git rev whose in-tree
+  `vllm-engine-core-client` crate the simulator builds against for that line.
 - **Exactly one `default = true`.** That line is `:latest` and the unsuffixed
   build.
 - **A line enters the window only when `fidelity_validated = true`.** New lines
@@ -77,9 +83,9 @@ Conflating them is the classic mistake.
 
 Image tags:
 
-- `vllm-vcr:0.3.0-vllm0.10` — immutable, the real artifact (sim version ×
+- `vllm-vcr:0.3.0-vllm0.23` — immutable, the real artifact (sim version ×
   vLLM line).
-- `vllm-vcr:vllm0.10` — floating, → latest sim for that line.
+- `vllm-vcr:vllm0.23` — floating, latest sim for that line.
 - `vllm-vcr:latest` — sim-head × the `default = true` line.
 
 ## CI matrix mechanics
@@ -112,7 +118,7 @@ non-blocking annotation rather than blocking the merge.
 The frontend registration already carries `vllm_version`
 (`frontend_connect.rs:43`). On connect, assert the peer's version is in the
 artifact's supported set and refuse with a clear error otherwise. That turns
-"silent msgpack corruption" into "this image speaks vLLM 0.10, peer is 0.8,
+"silent msgpack corruption" into "this image speaks vLLM 0.23, peer is 0.22,
 abort." Cheap, high value, independent of the matrix.
 
 ## Rotation when N advances
@@ -191,6 +197,5 @@ The CI flow (`.github/workflows/ci.yml`):
 
 The replay-many half needs no GPU and is the same mechanism as the offline replay rig
 (`deploy/trace-capture/offline-replay.yaml`): the python frontend talks to
-`vllm-vcr play` serving the captured trace, no engine, no card. CI runs it headlessly;
-the rig serves a live agent the same byte-identical streams.
-
+`vllm-vcr play` serving the captured trace, with no real engine behind it. CI runs it
+headlessly; the rig serves a live agent the same byte-identical streams.

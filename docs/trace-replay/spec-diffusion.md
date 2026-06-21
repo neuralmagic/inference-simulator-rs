@@ -23,11 +23,11 @@ There are two replay modes for this structure:
   records via `--replay-match`). This mode replays recorded timing but does not
   transfer to a different workload.
 
-Either way the simulator re-derives `spec_decoding_stats` from the bursts it emits
-(speculative budget `K = max(itl_tokens) - 1`, a burst of N tokens reported as 1 target
-token plus N-1 accepted drafts), so its scheduler stats use the same structure as the
-capture. Autoregressive traces report no spec stats, matching a vLLM engine with
-speculation off.
+Either way the simulator re-derives `spec_decoding_stats` from the bursts it emits:
+speculative budget `K = max(itl_tokens) - 1`, with a burst of N tokens reported as 1
+target token plus N-1 accepted drafts. Scheduler stats therefore use the same
+structure as the capture. Autoregressive traces report no spec stats, matching a vLLM
+engine with speculation off.
 
 ```bash
 # 1. Capture: vLLM engine with ngram spec decode behind the tap (writes

@@ -94,8 +94,8 @@ The matrix runs per line (see `ci.yml`):
 
 The full-stack e2e integration tests (`tests/engine_core_e2e.rs`,
 `crates/sim-tap/tests/tap_e2e.rs`) drive the *real* `EngineCoreClient`, whose API
-is incomplete on older lines, so they are HEAD-client-targeted and run on the
-default line via the `build-and-test` job, not per matrix leg. The lora lifecycle
+is incomplete on older lines, so they target the default line via the
+`build-and-test` job, not each matrix leg. The lora lifecycle
 e2e test is `#[cfg(vllm_lora_typed)]` so the workspace still compiles tests on
 lines that have the typed client.
 

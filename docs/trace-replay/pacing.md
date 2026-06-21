@@ -1,6 +1,7 @@
 # Replay pacing
 
-Content replay (`--replay-tokens`) and timing are configured independently:
+Content replay (`--replay-tokens`) and timing are independent. Pick the content mode
+first, then choose how quickly and in what shape the engine should emit chunks.
 
 | Mode | Invocation |
 | --- | --- |

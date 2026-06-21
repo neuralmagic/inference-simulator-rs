@@ -9,10 +9,10 @@ TTFT/ITL/request-total quantiles against the capture. The arrivals are verbatim;
 latency is still modeled. `--latency-trace` fits the sim's model from a *different*
 trace, so the gate runs on an arrival process outside the fitting set.
 
-Setup: the same frontend → tap → engine stack as the capture rig, run locally with
-`vllm-vcr play` as the engine, its latency model fit from the canonical H200 fitting
-set. `deploy/trace-capture/loadgen.py --pattern poisson|burst` drives arrival
-processes the fitting set never contained.
+Setup: use the same frontend → tap → engine stack as the capture rig, then run the
+replay locally with `vllm-vcr play` as the engine. The latency model is fit from the
+canonical H200 fitting set, while `deploy/trace-capture/loadgen.py --pattern
+poisson|burst` drives arrival processes the fitting set never contained.
 
 | scenario                          | requests | concurrency seen | TTFT max err | ITL max err | req-total err |
 |-----------------------------------|----------|------------------|--------------|-------------|---------------|
@@ -40,9 +40,8 @@ totals.
 
 Replayed prompts are unique-token synthetics: the captured workloads carry
 `cached_tokens: 0`, and identical fill tokens would silently turn every replayed
-request into a prefix-cache hit. Workloads with prefix reuse (multiturn/agentic) need
-the prefix structure replayed too, which is the next
-scenario.
+request into a prefix-cache hit. Workloads with prefix reuse, such as multiturn and
+agentic traces, also need prefix structure replayed; that is the next scenario.
 
 To reproduce against any trace with `arrival_ms`:
 

@@ -1,21 +1,21 @@
 # Status
 
-- **Protocol:** implemented end-to-end. The vLLM Rust frontend serves streaming and
-  non-streaming OpenAI completions through this backend over the ZMQ/msgpack
-  protocol, with tokenizer/detokenizer and chat template, no GPU, no model
-  weights, no NIXL. Run `./scripts/e2e.sh`.
-- **Control plane (wire-compat):** the engine produces and consumes the vLLM
-  NixlConnector `kv_transfer_params` schema
-  (`do_remote_prefill`/`do_remote_decode`, `remote_engine_id`/`remote_host`/
-  `remote_port`/`remote_block_ids`/`remote_request_id`/`tp_size`/`remote_num_tokens`),
-  driven per-request. Exercised against a routing-sidecar emulation
-  (`scripts/pd_control.sh`), no NIXL required.
-- **NIXL data plane:** the implemented path registers a paged KV pool on prefill,
-  serves a `PoolDescriptor` over a TCP metadata side channel, lets decode load the
-  remote metadata, and posts paged NIXL READs. `tests/nixl_loopback.rs` covers this
-  with distinct prefill/decode agents in one process over loopback (Linux + libnixl).
-  If NIXL initialization fails, the runtime logs a warning and falls back to
-  `NoopDataPlane`.
+`vllm-vcr` is usable today for protocol-level frontend testing, trace replay,
+calibration, and GPU-free prefill/decode control-plane experiments. The NIXL data
+plane is implemented behind an optional feature and needs a Linux host with libnixl
+and UCX.
+
+| Area | State | Validation |
+| --- | --- | --- |
+| Engine-core protocol | Streaming and non-streaming OpenAI flows work through the vLLM Rust frontend over ZMQ/msgpack, with tokenizer, detokenizer, chat template, and frontend metrics intact. | `./scripts/e2e.sh` |
+| Trace timing | TTFT, inter-token gaps, multi-token chunks, prefix-cache structure, and arrival/session pacing can be captured, modeled, and replayed. | `inspect calibrate`, `inspect calibrate-e2e`, trace replay tests |
+| Content replay | `record --record-tokens` plus `play --replay-tokens` can serve recorded token ids and finish reasons. | `tests/engine_core_e2e.rs`, `tests/closed_loop_prefix_replay.rs` |
+| P/D control plane | The simulator produces and consumes vLLM NixlConnector `kv_transfer_params` per request. | `scripts/pd_control.sh` |
+| NIXL data plane | Prefill registers a paged KV pool and serves metadata; decode fetches metadata and posts paged NIXL reads. | `tests/nixl_loopback.rs` on Linux + libnixl |
+| Multi-version support | The build matrix pins one `vllm-engine-core-client` rev per supported line and uses conformance goldens when available. | CI matrix + `tests/conformance.rs` |
+
+If NIXL initialization fails at runtime, the engine logs a warning and falls back to
+`NoopDataPlane`, so protocol tests can still run.
 
 ```bash
 ./scripts/pd_control.sh              # macOS: control-plane schema round trip

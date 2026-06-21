@@ -1,7 +1,10 @@
 # Calibration demo
 
-The `vllm-vcr inspect` subcommands include a calibration harness that checks two
-properties of the latency models:
+The `vllm-vcr inspect` subcommands include a calibration harness for quick local
+checks. The synthetic demo trace is deliberately heavy-tailed, so it shows the
+difference between the trace-fitted model and simple mean/std-dev knobs.
+
+The harness checks two properties:
 
 1. `TraceLatency` replay reproduces source-trace quantiles within tolerance.
 2. `KnobLatency` cannot reproduce heavy tails: its `[0.3*mean, 1.7*mean]` clamp caps

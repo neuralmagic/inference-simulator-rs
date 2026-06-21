@@ -6,7 +6,7 @@ the trace. `finish_reason` is always recorded. With the same tokenizer, recorded
 ids decode back to generated text, so token-recording traces can contain user content.
 
 On the replay side, `vllm-vcr play --replay-tokens <trace>` serves the recorded ids
-verbatim instead of random tokens, and ends each stream with the recorded finish
+verbatim instead of random tokens and ends each stream with the recorded finish
 reason. `--replay-match` controls request-to-record matching:
 
 - `index` (default): the trailing `-<index>` of the request id, where the index is the
@@ -25,7 +25,8 @@ reason. `--replay-match` controls request-to-record matching:
 Unmatched requests fall back to random tokens in both modes. These modes provide
 deterministic streams for testing routers, EPPs, guardrails, and client SDK streaming
 behavior without a GPU. Prefix mode can replay a closed-loop agentic workload offline
-when the agent is deterministic; `tests/closed_loop_prefix_replay.rs` covers this case.
+when the agent is deterministic; `tests/closed_loop_prefix_replay.rs` covers that
+case.
 
 Every trace touchpoint (`--trace-out`, `--latency-trace`, `--replay-tokens`, trace
 conversion and replay harnesses) reads and writes gzip transparently when the path ends

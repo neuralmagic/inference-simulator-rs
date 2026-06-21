@@ -32,6 +32,9 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # post the sticky docs-preview comment on PRs
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -47,6 +50,29 @@ jobs:
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: book
+
+      # PR preview: attach this PR's rendered book and link it from a sticky comment,
+      # so reviewers can grab the exact build without digging through the run's
+      # artifacts list. (GitHub Pages serves one site per repo, so there's no native
+      # per-PR live URL; the artifact is the GitHub-native preview.)
+      - name: Upload PR preview artifact
+        id: preview
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docs-preview
+          path: book
+      - name: Comment the preview link
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
+        with:
+          header: docs-preview
+          message: |
+            📖 **Docs preview** for this PR is built and attached as the `docs-preview` artifact.
+
+            **[⬇️ Download `docs-preview`](${{ steps.preview.outputs.artifact-url }})**, unzip, and open `index.html` in a browser.
+
+            _Rebuilt for ${{ github.event.pull_request.head.sha }}._
 
   # Deploy only from main / dispatch; PRs stop after the build check above.
   # mdBook output uses relative asset paths, so it serves correctly under the

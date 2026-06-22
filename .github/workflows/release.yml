@@ -48,7 +48,7 @@ jobs:
     outputs:
       include: ${{ steps.parse.outputs.include }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
@@ -71,7 +71,7 @@ jobs:
       # (a non-vX.Y tag like "nightly" is treated as newest).
       VLLM_TARGET_VERSION: ${{ matrix.tag }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -136,7 +136,7 @@ jobs:
       # graph transitively covers the sim-* members. The default-line inspect tarball
       # is the same binary as that line's main tarball, so it shares this SBOM.
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@8b3c737da4b541bf0fb5a3e0488ff20535badac9 # v2.82.1
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
         with:
           tool: cargo-cyclonedx@0.5.9
 

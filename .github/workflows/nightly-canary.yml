@@ -57,6 +57,13 @@ jobs:
         with:
           target: x86_64-unknown-linux-musl
 
+      - uses: ./.github/actions/setup-sccache
+        with:
+          role-arn: ${{ vars.SCCACHE_ROLE_ARN }}
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          region: ${{ vars.SCCACHE_REGION }}
+          key-prefix: ${{ vars.SCCACHE_S3_KEY_PREFIX }}
+
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 

@@ -125,7 +125,10 @@ capture matrix lives in `deploy/trace-capture/models.toml`: one `[[capture]]` pe
 model × scenario (`baseline` / `nocache` / `specdecode` / `multimodal`), each pinned to a
 line's engine + tap/frontend images. `gen-capture-jobs.py` turns a target into a Job; the
 scenario drives the engine *and* tap flags so the `config_hash` matches the engine config
-(prefix-cache, spec-decode). To add a model or scenario, edit `models.toml`, no YAML by hand.
+(prefix-cache, spec-decode). Generated conformance Jobs enable `--record-tokens` and
+`--step-stats-out`, so the trace is usable as a fidelity golden and the sidecar stats are
+available for timing inspection. To add a model or scenario, edit `models.toml`, no YAML by
+hand.
 
 All capture Jobs target `conformance-queue` (`conformance-queue.yaml`), a dedicated Kueue
 queue with a one-GPU quota, so they run **one at a time**: submit as many as you like and
@@ -140,6 +143,10 @@ The flow (wrapped by the justfile):
 just conformance-queue                  # apply the one-GPU queue (once)
 just conformance-list                   # see the targets in models.toml
 just conformance-capture qwen3-8b       # ship loadgen scripts + submit the Job
+just conformance-capture \
+  nightly-qwen3-8b-mt-s7 \
+  nightly-qwen3-8b-mt-s13 \
+  nightly-qwen3-8b-nocache-s7           # rolling vLLM main goldens
 
 # raw equivalent:
 python3 deploy/trace-capture/gen-capture-jobs.py qwen3-8b | kubectl apply -f -
@@ -150,6 +157,8 @@ kubectl logs -f job/trace-qwen3-8b -c loadgen
 
 To capture a new line (e.g. a new release or `nightly`), add a `[lines.<vllm_tag>]` entry
 (engine image digest + the tap/frontend image built for that line) and point captures at it.
+The built-in nightly set is deliberately small: two multiturn seeds with prefix caching
+enabled plus one nocache multiturn capture, all against Qwen3-8B.
 
 ## Fetch the trace + step stats
 
@@ -158,14 +167,14 @@ fetch":
 
 ```bash
 NAMESPACE=${NAMESPACE:-inference-sim}
-POD=$(kubectl get pod -n "$NAMESPACE" -l job-name=trace-validation-cached -o name)
+JOB=trace-nightly-qwen3-8b-mt-s7
 
 # The trace, and the per-step SchedulerStats sidecar if captured.
-kubectl exec -n "$NAMESPACE" "$POD" -c loadgen -- cat /trace/trace.jsonl > trace.jsonl
-kubectl exec -n "$NAMESPACE" "$POD" -c loadgen -- cat /trace/step-stats.jsonl > step-stats.jsonl
+kubectl exec -n "$NAMESPACE" "job/$JOB" -c loadgen -- cat /trace/trace.jsonl > "$JOB.jsonl"
+kubectl exec -n "$NAMESPACE" "job/$JOB" -c loadgen -- cat /trace/step-stats.jsonl > "$JOB.step-stats.jsonl"
 
 # Let the Job complete and release the GPU.
-kubectl exec -n "$NAMESPACE" "$POD" -c loadgen -- touch /trace/fetched
+kubectl exec -n "$NAMESPACE" "job/$JOB" -c loadgen -- touch /trace/fetched
 ```
 
 Compress before upload (`.jsonl.gz`); the trace tooling and the sim read gzip
@@ -242,6 +251,21 @@ config_hash = "<the trace's config_hash>"             # replay asserts --expect-
 workload    = "multiturn"                              # human-readable workload label
 role        = "fidelity"                              # "schema" or "fidelity"
 ```
+
+Nightly entries use `line = "nightly"` and live under the `conformance/nightly/...`
+prefix, for example
+`conformance/nightly/H200/Qwen/Qwen3-8B/multiturn-seed7.jsonl.gz`. Once any nightly
+entry lands, the nightly canary detects it and fetches/replays it before refreshing the
+rolling prerelease.
+
+The `Nightly Golden Capture` workflow automates this operator loop. It runs on a
+nightly schedule and can also be manually dispatched with an alternate target list.
+It authenticates to the conformance cluster with GitHub OIDC, submits the configured
+Kueue capture targets, uploads the token-recording traces, and opens or updates a PR
+with the generated nightly manifest block. It expects these repository variables:
+
+- `CONFORMANCE_CLUSTER_URL` — Kubernetes API server URL for the capture cluster.
+- `CONFORMANCE_CAPTURE_ROLE_ARN` — AWS role allowed to write `conformance/*` objects.
 
 A line gains `has_goldens = true` in the CI matrix automatically once it has a
 `[[golden]]` entry; that is what turns on the AWS fetch leg for it (lines without

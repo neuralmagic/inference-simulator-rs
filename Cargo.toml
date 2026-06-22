@@ -26,6 +26,7 @@ sim-s3 = { path = "crates/sim-s3" }
 vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "17bc1445562435b608041d434e9738440954159c" }
 
 anyhow = "1.0.100"
+base64 = "0.22.1"
 clap = { version = "4.5.38", features = ["derive", "env"] }
 clap_complete = "4.5.58"
 flate2 = "1.1.9"
@@ -96,7 +97,7 @@ vllm-engine-core-client = { workspace = true }
 # crate resolves identically on macOS (stub) and in the image (real). Optional: only
 # compiled with the `nixl`/`nixl-stub` features so the default (bird-one) build needs nothing.
 nixl-sys = { git = "https://github.com/ai-dynamo/nixl.git", rev = "41685d39", optional = true }
-base64 = { version = "0.22.1", optional = true }
+base64 = { workspace = true, optional = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true }

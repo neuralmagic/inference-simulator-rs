@@ -3,11 +3,16 @@
 //! in the workflows, re-parsing the manifest each time).
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::io::{BufRead as _, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
+use serde_json::{Value as JsonValue, json};
+use sha2::{Digest as _, Sha256};
 use sim_compat::{CompatManifest, GoldenManifest};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
@@ -15,6 +20,7 @@ const COMPAT_TOML: &str = "compat.toml";
 const MANIFEST_TOML: &str = "conformance/manifest.toml";
 const CARGO_TOML: &str = "Cargo.toml";
 const VLLM_GIT: &str = "https://github.com/vllm-project/vllm.git";
+const KUBE_OIDC_AUDIENCE_ENCODED: &str = "https%3A%2F%2Fkubernetes.default.svc";
 /// The compat.toml line that tracks vLLM main (auto-bumped by the nightly canary).
 const NIGHTLY_LINE: &str = "nightly";
 
@@ -80,6 +86,44 @@ enum Command {
         /// The vllm.git main commit sha to pin the `nightly` line to.
         sha: String,
     },
+    /// Emit one `[[golden]]` TOML entry for a captured nightly trace.
+    NightlyGoldenEntry {
+        /// Uncompressed trace JSONL path.
+        #[arg(long)]
+        trace: PathBuf,
+        /// Uploaded gzip/archive path whose sha256 should be pinned.
+        #[arg(long)]
+        archive: PathBuf,
+        /// S3 key under CONFORMANCE_BUCKET.
+        #[arg(long)]
+        bucket_path: String,
+        /// Human-readable workload label.
+        #[arg(long)]
+        workload: String,
+    },
+    /// Replace the generated nightly-goldens block in conformance/manifest.toml.
+    SetNightlyGoldens {
+        /// TOML file containing generated `[[golden]]` entries.
+        #[arg(long)]
+        entries_file: PathBuf,
+        /// Manifest to update.
+        #[arg(long, default_value = MANIFEST_TOML)]
+        manifest: PathBuf,
+    },
+    /// Write a kubeconfig that authenticates through GitHub Actions OIDC.
+    GithubOidcKubeconfig {
+        /// Kubernetes API server URL.
+        #[arg(long)]
+        cluster_url: String,
+        /// Path to the built xtask binary used as the kubectl exec plugin.
+        #[arg(long)]
+        plugin_path: PathBuf,
+        /// Kubeconfig path to write.
+        #[arg(long)]
+        kubeconfig: PathBuf,
+    },
+    /// Print a Kubernetes ExecCredential using a fresh GitHub Actions OIDC token.
+    GithubOidcExecCredential,
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -121,6 +165,24 @@ struct ReleaseRow {
     os: &'static str,
 }
 
+#[derive(Serialize)]
+struct ExecCredential<'a> {
+    #[serde(rename = "apiVersion")]
+    api_version: &'static str,
+    kind: &'static str,
+    status: ExecCredentialStatus<'a>,
+}
+
+#[derive(Serialize)]
+struct ExecCredentialStatus<'a> {
+    token: &'a str,
+    #[serde(
+        rename = "expirationTimestamp",
+        skip_serializing_if = "Option::is_none"
+    )]
+    expiration_timestamp: Option<String>,
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::CiMatrix => ci_matrix(),
@@ -130,6 +192,22 @@ fn main() -> Result<()> {
         Command::FrontendArgs { line } => frontend_args(&line),
         Command::PinVllm { line, rev } => pin_vllm(&line, rev.as_deref()),
         Command::SetNightlyRev { sha } => set_nightly_rev(&sha),
+        Command::NightlyGoldenEntry {
+            trace,
+            archive,
+            bucket_path,
+            workload,
+        } => nightly_golden_entry(&trace, &archive, &bucket_path, &workload),
+        Command::SetNightlyGoldens {
+            entries_file,
+            manifest,
+        } => set_nightly_goldens(&entries_file, &manifest),
+        Command::GithubOidcKubeconfig {
+            cluster_url,
+            plugin_path,
+            kubeconfig,
+        } => github_oidc_kubeconfig(&cluster_url, &plugin_path, &kubeconfig),
+        Command::GithubOidcExecCredential => github_oidc_exec_credential(),
     }
 }
 
@@ -293,6 +371,212 @@ fn set_nightly_rev(sha: &str) -> Result<()> {
         eprintln!("nightly protocol_rev already {sha}; no change");
     }
     Ok(())
+}
+
+fn nightly_golden_entry(
+    trace: &Path,
+    archive: &Path,
+    bucket_path: &str,
+    workload: &str,
+) -> Result<()> {
+    let meta = read_trace_meta(trace)?;
+    let config_hash = meta
+        .get("config_hash")
+        .and_then(JsonValue::as_str)
+        .context("trace meta missing config_hash")?;
+    let sha256 = sha256_hex(archive)?;
+
+    println!();
+    println!("[[golden]]");
+    println!("line = \"nightly\"");
+    println!("bucket_path = {}", serde_json::to_string(bucket_path)?);
+    println!("sha256 = \"{sha256}\"");
+    println!("config_hash = \"{config_hash}\"");
+    println!("workload = {}", serde_json::to_string(workload)?);
+    println!("role = \"fidelity\"");
+    Ok(())
+}
+
+fn set_nightly_goldens(entries_file: &Path, manifest: &Path) -> Result<()> {
+    let entries = std::fs::read_to_string(entries_file)
+        .with_context(|| format!("reading {}", entries_file.display()))?;
+    let mut text = std::fs::read_to_string(manifest)
+        .with_context(|| format!("reading {}", manifest.display()))?;
+    text = replace_nightly_goldens_block(&text, &entries);
+    std::fs::write(manifest, text).with_context(|| format!("writing {}", manifest.display()))?;
+    Ok(())
+}
+
+fn github_oidc_kubeconfig(cluster_url: &str, plugin_path: &Path, kubeconfig: &Path) -> Result<()> {
+    if cluster_url.trim().is_empty() {
+        bail!("cluster URL is required");
+    }
+    if plugin_path.as_os_str().is_empty() {
+        bail!("plugin path is required");
+    }
+
+    if let Some(parent) = kubeconfig.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(kubeconfig, kubeconfig_json(cluster_url, plugin_path)?)
+        .with_context(|| format!("writing {}", kubeconfig.display()))?;
+    chmod_600(kubeconfig)?;
+    eprintln!("wrote GitHub OIDC kubeconfig to {}", kubeconfig.display());
+    Ok(())
+}
+
+fn github_oidc_exec_credential() -> Result<()> {
+    let token = fetch_github_oidc_token()?;
+    let expiration_timestamp = match jwt_expiration_timestamp(&token) {
+        Ok(ts) => Some(ts),
+        Err(err) => {
+            eprintln!("warning: could not decode OIDC token expiration: {err:#}");
+            None
+        }
+    };
+    let credential = ExecCredential {
+        api_version: "client.authentication.k8s.io/v1beta1",
+        kind: "ExecCredential",
+        status: ExecCredentialStatus {
+            token: &token,
+            expiration_timestamp,
+        },
+    };
+    println!("{}", serde_json::to_string(&credential)?);
+    Ok(())
+}
+
+fn kubeconfig_json(cluster_url: &str, plugin_path: &Path) -> Result<String> {
+    let config = json!({
+        "apiVersion": "v1",
+        "kind": "Config",
+        "clusters": [{
+            "name": "conformance",
+            "cluster": {
+                "server": cluster_url,
+            },
+        }],
+        "contexts": [{
+            "name": "conformance",
+            "context": {
+                "cluster": "conformance",
+                "user": "github-oidc",
+            },
+        }],
+        "current-context": "conformance",
+        "users": [{
+            "name": "github-oidc",
+            "user": {
+                "exec": {
+                    "apiVersion": "client.authentication.k8s.io/v1beta1",
+                    "command": plugin_path.display().to_string(),
+                    "args": ["github-oidc-exec-credential"],
+                    "interactiveMode": "Never",
+                },
+            },
+        }],
+    });
+    serde_json::to_string_pretty(&config).context("serializing kubeconfig")
+}
+
+fn fetch_github_oidc_token() -> Result<String> {
+    let request_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL")
+        .context("ACTIONS_ID_TOKEN_REQUEST_URL is not set; is id-token: write enabled?")?;
+    let request_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+        .context("ACTIONS_ID_TOKEN_REQUEST_TOKEN is not set; is id-token: write enabled?")?;
+    let url = format!("{request_url}&audience={KUBE_OIDC_AUDIENCE_ENCODED}");
+    let output = ProcessCommand::new("curl")
+        .args(["-sS", "-f", "-H"])
+        .arg(format!("Authorization: bearer {request_token}"))
+        .arg(&url)
+        .output()
+        .context("requesting GitHub OIDC token with curl")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("GitHub OIDC token request failed: {}", stderr.trim());
+    }
+    let response: JsonValue =
+        serde_json::from_slice(&output.stdout).context("parsing GitHub OIDC response JSON")?;
+    response
+        .get("value")
+        .and_then(JsonValue::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .context("GitHub OIDC response did not include a token value")
+}
+
+fn jwt_expiration_timestamp(token: &str) -> Result<String> {
+    let payload = token
+        .split('.')
+        .nth(1)
+        .context("JWT is missing a payload segment")?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(payload)
+        .context("decoding JWT payload")?;
+    let claims: JsonValue = serde_json::from_slice(&payload).context("parsing JWT payload JSON")?;
+    let exp = claims
+        .get("exp")
+        .and_then(JsonValue::as_i64)
+        .context("JWT payload is missing numeric exp")?;
+    let timestamp = chrono::DateTime::<chrono::Utc>::from_timestamp(exp, 0)
+        .context("JWT exp is out of range")?;
+    Ok(timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+#[cfg(unix)]
+fn chmod_600(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn chmod_600(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn read_trace_meta(trace: &Path) -> Result<JsonValue> {
+    let file =
+        std::fs::File::open(trace).with_context(|| format!("opening {}", trace.display()))?;
+    let mut lines = BufReader::new(file).lines();
+    let first = lines
+        .next()
+        .transpose()
+        .context("reading trace meta line")?
+        .context("trace is empty")?;
+    let value: JsonValue = serde_json::from_str(&first).context("parsing trace meta JSON")?;
+    value
+        .get("meta")
+        .cloned()
+        .context("first trace line must be a {\"meta\": ...} object")
+}
+
+fn sha256_hex(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+fn replace_nightly_goldens_block(manifest: &str, entries: &str) -> String {
+    const START: &str = "# BEGIN NIGHTLY GOLDENS";
+    const END: &str = "# END NIGHTLY GOLDENS";
+    let entries = entries.trim();
+    let block = format!("{START}\n{entries}\n{END}");
+
+    if let Some(start_idx) = manifest.find(START) {
+        if let Some(end_rel) = manifest[start_idx..].find(END) {
+            let end_idx = start_idx + end_rel + END.len();
+            let before = manifest[..start_idx].trim_end();
+            let after = manifest[end_idx..].trim_start_matches('\n');
+            return format!("{before}\n\n{block}\n{after}");
+        }
+    }
+
+    format!("{}\n\n{block}\n", manifest.trim_end())
 }
 
 /// Set the `nightly` `[[vllm]]` line's `protocol_rev` to `sha` in place, preserving
@@ -469,5 +753,61 @@ default = true
     fn set_nightly_rev_is_idempotent_no_change() {
         let (_, changed) = set_nightly(COMPAT, "oldsha");
         assert!(!changed, "setting the same sha must report no change");
+    }
+
+    #[test]
+    fn nightly_golden_block_is_appended_when_missing() {
+        let out = replace_nightly_goldens_block("header\n", "[[golden]]\nline = \"nightly\"\n");
+        assert!(out.contains("# BEGIN NIGHTLY GOLDENS"));
+        assert!(out.contains("[[golden]]"));
+        assert!(out.contains("# END NIGHTLY GOLDENS"));
+    }
+
+    #[test]
+    fn nightly_golden_block_replaces_existing_block() {
+        let existing = "\
+header
+
+# BEGIN NIGHTLY GOLDENS
+stale-entry
+# END NIGHTLY GOLDENS
+
+tail
+";
+        let out = replace_nightly_goldens_block(existing, "new");
+        assert!(out.contains("header"));
+        assert!(out.contains("tail"));
+        assert!(out.contains("new"));
+        assert!(!out.contains("stale-entry"));
+    }
+
+    #[test]
+    fn jwt_expiration_is_formatted_for_exec_credential() {
+        let payload = URL_SAFE_NO_PAD.encode(r#"{"exp":1700000000}"#);
+        let token = format!("header.{payload}.signature");
+        assert_eq!(
+            jwt_expiration_timestamp(&token).unwrap(),
+            "2023-11-14T22:13:20Z"
+        );
+    }
+
+    #[test]
+    fn kubeconfig_uses_xtask_exec_plugin() {
+        let json = kubeconfig_json("https://cluster.example", Path::new("/tmp/xtask")).unwrap();
+        let value: JsonValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["kind"], "Config");
+        assert_eq!(
+            value["clusters"][0]["cluster"]["server"],
+            "https://cluster.example"
+        );
+        assert_eq!(value["users"][0]["user"]["exec"]["command"], "/tmp/xtask");
+        assert_eq!(
+            value["users"][0]["user"]["exec"]["args"][0],
+            "github-oidc-exec-credential"
+        );
+        assert_eq!(
+            value["users"][0]["user"]["exec"]["interactiveMode"],
+            "Never"
+        );
     }
 }

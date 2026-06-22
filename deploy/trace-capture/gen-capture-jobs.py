@@ -110,11 +110,27 @@ def tap_args(c: dict) -> list[str]:
         f"--vllm-version={c['vllm_tag']}",
         f"--max-num-seqs={c['max_num_seqs']}",
         f"--engine-config={canonical_engine_config(c)}",
+        "--record-tokens",
+        "--step-stats-out=/trace/step-stats.jsonl",
     ]
 
 
 def env(pairs: dict) -> list[dict]:
     return [{"name": k, "value": v} for k, v in pairs.items()]
+
+
+def loadgen_env(c: dict) -> list[dict]:
+    pairs = {"PHASES": c["phases"], "MODEL": c["model"]}
+    optional = {
+        "mt_seed": "MT_SEED",
+        "mt_rate": "MT_RATE",
+        "sweep_words": "SWEEP_WORDS",
+        "sweep_conc": "SWEEP_CONC",
+    }
+    for key, env_name in optional.items():
+        if key in c:
+            pairs[env_name] = str(c[key])
+    return env(pairs)
 
 
 def build_job(c: dict, lines: dict) -> dict:
@@ -225,7 +241,7 @@ def build_job(c: dict, lines: dict) -> dict:
                             "name": "loadgen",
                             "image": "python:3.12-slim",
                             "command": ["bash", "/scripts/runner.sh"],
-                            "env": env({"PHASES": c["phases"], "MODEL": c["model"]}),
+                            "env": loadgen_env(c),
                             "resources": {
                                 "requests": {"cpu": "2", "memory": "2Gi"},
                                 "limits": {"cpu": "4", "memory": "4Gi"},

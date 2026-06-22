@@ -79,6 +79,13 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
+      - uses: ./.github/actions/setup-sccache
+        with:
+          role-arn: ${{ vars.SCCACHE_ROLE_ARN }}
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          region: ${{ vars.SCCACHE_REGION }}
+          key-prefix: ${{ vars.SCCACHE_S3_KEY_PREFIX }}
+
       # musl-tools provides the musl linker for the static Linux builds. (No-op on macOS.)
       - name: Install musl toolchain (Linux)
         if: ${{ matrix.os == 'linux' }}

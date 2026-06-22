@@ -89,15 +89,15 @@ conformance-queue:
 conformance-list:
     python3 deploy/trace-capture/gen-capture-jobs.py --list
 
-# Submit a conformance capture Job, e.g. `just conformance-capture qwen3-8b`. Ships the
+# Submit conformance capture Job(s), e.g. `just conformance-capture qwen3-8b`. Ships the
 # loadgen scripts as a configmap, then applies the generated Job (Kueue holds it until a
 # GPU is free, so it's safe to submit several; they run one at a time).
-conformance-capture name:
+conformance-capture +names:
     kubectl create configmap validation-scripts -n {{namespace}} \
         --from-file=loadgen.py=deploy/trace-capture/loadgen.py \
         --from-file=runner.sh=deploy/trace-capture/validation-runner.sh \
         --dry-run=client -o yaml | kubectl apply -f -
-    python3 deploy/trace-capture/gen-capture-jobs.py {{name}} | kubectl apply -f -
+    python3 deploy/trace-capture/gen-capture-jobs.py {{names}} | kubectl apply -f -
 
 # --- agentic capture + offline replay (docs/agentic-offline-replay.md) -------------
 
@@ -184,10 +184,11 @@ conformance-status:
     kubectl -n {{namespace}} get pods -l llm-d.ai/guide=trace-capture
     -kubectl -n {{namespace}} logs -l llm-d.ai/guide=trace-capture -c loadgen --tail=2 --prefix
 
-# Fetch a job's tap trace and release it (job completes, GPU freed).
+# Fetch a job's tap trace, optional step stats, and release it (job completes, GPU freed).
 # e.g. `just conformance-fetch trace-qwen3-8b /tmp/qwen3-8b.jsonl`.
 conformance-fetch job out:
     kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- cat /trace/trace.jsonl > {{out}}
+    -kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- cat /trace/step-stats.jsonl > {{out}}.step-stats.jsonl
     -kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- sh -c 'for f in /trace/marker-*; do echo "$f=$(cat $f)"; done'
     kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- touch /trace/fetched
     @wc -l {{out}}

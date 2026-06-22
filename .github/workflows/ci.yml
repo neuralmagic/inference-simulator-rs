@@ -14,7 +14,7 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Least privilege: this workflow only reads the repo.
+# Least privilege by default.
 permissions:
   contents: read
 
@@ -38,17 +38,25 @@ jobs:
   # needs nothing beyond the toolchain.
   build-and-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
 
-      # Sets up the toolchain (rustfmt + clippy) and bundles Swatinem/rust-cache, which
-      # caches ~/.cargo/{registry,git} and target/ keyed on Cargo.lock + toolchain. The
-      # cache is the single biggest speedup; the git deps compile slowly when cold.
+      # Toolchain plus coarse Cargo cache; sccache adds compiler object caching.
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           components: rustfmt, clippy
+
+      - uses: ./.github/actions/setup-sccache
+        with:
+          role-arn: ${{ vars.SCCACHE_ROLE_ARN }}
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          region: ${{ vars.SCCACHE_REGION }}
+          key-prefix: ${{ vars.SCCACHE_S3_KEY_PREFIX }}
 
       - name: Format
         run: cargo fmt --all --check
@@ -155,6 +163,13 @@ jobs:
           persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      - uses: ./.github/actions/setup-sccache
+        with:
+          role-arn: ${{ vars.SCCACHE_ROLE_ARN }}
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          region: ${{ vars.SCCACHE_REGION }}
+          key-prefix: ${{ vars.SCCACHE_S3_KEY_PREFIX }}
 
       # Pin Cargo.toml to this line's rev + fork patch. Cargo rejects patching a git
       # dep to a different rev of the same source, so the rev is swapped in

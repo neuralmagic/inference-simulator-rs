@@ -1,0 +1,109 @@
+# Offline replay: the same python frontend as h200-capture-agentic.yaml, but
+# the engine slot is vllm-vcr play serving a captured trace with content-keyed
+# matching. No tap, no GPU anywhere in the pod. A live agent pointed at :8000
+# gets back the captured streams byte-identically; the closed loop replays an
+# entire agentic rollout (SWE-bench etc.) with zero GPU.
+#
+#   agent  (port-forward :8000)
+#       | HTTP (/v1/messages or /v1/chat/completions)
+#   frontend   vllm serve --data-parallel-size-local 0      binds rpc :5570, no GPU
+#       | ZMQ
+#   sim        vllm-vcr play --replay-match prefix          dials :5570, serves the trace
+#
+# The frontend MUST run the same model/tokenizer as the capture: prefix
+# matching happens on token ids, so identical text must tokenize identically.
+# Keep it on the protocol-pin image (c9340e6f3) like everything else.
+#
+# Getting the trace in: the sim container waits for the trace file to appear,
+# so after the pod starts:
+#   kubectl cp trace.jsonl.gz weaton-dev/<pod>:/trace/trace.jsonl.gz -c sim
+#
+# Timing axes are independent (see README "Replay pacing"): add
+# --latency-trace /trace/trace.jsonl.gz to the sim args for captured pacing,
+# or leave it off for instant replay.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: offline-replay
+  labels:
+    llm-d.ai/guide: offline-replay
+    llm-d.ai/model: Qwen3-Coder-30B-A3B
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      llm-d.ai/guide: offline-replay
+  strategy:
+    type: Recreate # the ZMQ handshake is one-shot; never two pods mid-rewire
+  template:
+    metadata:
+      labels:
+        llm-d.ai/guide: offline-replay
+        llm-d.ai/model: Qwen3-Coder-30B-A3B
+    spec:
+      containers:
+        # --- Simulated engine: serves the captured streams --------------------------------
+        - name: sim
+          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v7
+          command: ["/bin/sh", "-c"]
+          # Wait for the trace to be copied in, then start. The frontend's
+          # engine-ready timeout (below) covers this wait.
+          args:
+            - |
+              while [ ! -f /trace/trace.jsonl ] && [ ! -f /trace/trace.jsonl.gz ]; do
+                echo "waiting for trace at /trace/trace.jsonl[.gz] (kubectl cp it in)"; sleep 5
+              done
+              TRACE=/trace/trace.jsonl; [ -f /trace/trace.jsonl.gz ] && TRACE=/trace/trace.jsonl.gz
+              exec /usr/local/bin/vllm-vcr play \
+                --handshake-address tcp://127.0.0.1:5570 \
+                --replay-tokens "$TRACE" \
+                --replay-match prefix \
+                --kv-cache-size 32768 \
+                --latency-trace "$TRACE" \
+                --log-requests
+          env:
+            - { name: RUST_LOG, value: info }
+          resources:
+            requests: { cpu: "2", memory: 2Gi }
+            limits: { cpu: "4", memory: 8Gi }
+          volumeMounts:
+            - { mountPath: /trace, name: trace }
+        # --- Python frontend: identical role to the agentic capture pod -------------------
+        # CPU wheel image of the protocol-pin commit (Dockerfile.frontend-cpu):
+        # the CUDA build can't resolve a platform without a GPU.
+        - name: frontend
+          image: quay.io/wseaton/mock-engine-nixl:vllm-frontend-cpu-c9340e6f3
+          command: ["vllm", "serve"]
+          args:
+            - Qwen/Qwen3-Coder-30B-A3B-Instruct
+            - --data-parallel-size=1
+            - --data-parallel-size-local=0
+            - --data-parallel-address=127.0.0.1
+            - --data-parallel-rpc-port=5570
+            - --host=0.0.0.0
+            - --port=8000
+            - --max-model-len=131072
+            - --enable-auto-tool-choice
+            - --tool-call-parser=qwen3_coder
+          env:
+            - { name: HF_HUB_CACHE, value: /hf-cache }
+            - { name: HF_HUB_DISABLE_XET, value: "1" }
+            # Covers the wait for the trace to be copied in.
+            - { name: VLLM_RPC_TIMEOUT, value: "7200000" }
+          ports:
+            - { name: modelserver, containerPort: 8000, protocol: TCP }
+          readinessProbe:
+            httpGet: { path: /v1/models, port: modelserver }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests: { cpu: "4", memory: 8Gi }
+            limits: { cpu: "8", memory: 16Gi }
+          volumeMounts:
+            - { mountPath: /hf-cache, name: frontend-hf-cache }
+      volumes:
+        - name: frontend-hf-cache
+          emptyDir: { sizeLimit: 5Gi }
+        - name: trace
+          emptyDir: {}

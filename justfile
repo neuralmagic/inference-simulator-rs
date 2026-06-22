@@ -54,9 +54,9 @@ image-push:
 
 # --- cluster capture rig ----------------------------------------------------------
 
-# Apply the manifest and scale the capture pod up (1x GPU; queues if none free).
+# Apply the manifests via kustomize and scale the capture pod up (1x GPU; queues if none free).
 capture-up:
-    kubectl apply -f deploy/trace-capture/h200-capture.yaml
+    kustomize build deploy/trace-capture/overlays/{{namespace}} | kubectl apply -f -
     kubectl -n {{namespace}} scale deploy {{deploy}} --replicas=1
 
 # Scale the capture pod down (always do this when finished).
@@ -83,7 +83,7 @@ capture-fetch out="/tmp/tap-trace.jsonl":
 
 # Apply the one-GPU conformance queue (serializes captures; run once).
 conformance-queue:
-    kubectl apply -f deploy/trace-capture/conformance-queue.yaml
+    kustomize build deploy/trace-capture/overlays/{{namespace}} | kubectl apply -f -
 
 # List the capture targets defined in models.toml.
 conformance-list:
@@ -103,7 +103,7 @@ conformance-capture +names:
 
 # Agentic capture rig: python frontend (/v1/messages) + tap + GPU engine.
 agentic-capture-up:
-    kubectl apply -f deploy/trace-capture/h200-capture-agentic.yaml
+    kustomize build deploy/trace-capture/overlays/{{namespace}} | kubectl apply -f -
     kubectl -n {{namespace}} scale deploy trace-capture-h200-agentic --replicas=1
 
 agentic-capture-down:
@@ -115,7 +115,7 @@ agentic-capture-fetch out="/tmp/agentic-tap-trace.jsonl":
 
 # Offline replay rig: python frontend + vllm-vcr play, zero GPU (then: replay-load-trace).
 replay-up:
-    kubectl apply -f deploy/trace-capture/offline-replay.yaml
+    kustomize build deploy/trace-capture/overlays/{{namespace}} | kubectl apply -f -
 
 replay-down:
     kubectl -n {{namespace}} scale deploy offline-replay --replicas=0

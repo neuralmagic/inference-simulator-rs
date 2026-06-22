@@ -27,7 +27,7 @@ MANIFEST = Path(__file__).with_name("models.toml")
 
 # Scalar keys a [[capture]] may inherit from [defaults] (or override).
 INHERITED = (
-    "namespace queue service_account gpu gpu_memory_utilization tp block_size "
+    "namespace queue gpu gpu_memory_utilization tp block_size "
     "max_num_seqs max_model_len enforce_eager engine_cpu_request engine_cpu_limit "
     "engine_memory_request engine_memory_limit model_cache_size"
 ).split()
@@ -168,7 +168,6 @@ def build_job(c: dict, lines: dict) -> dict:
                 },
                 "spec": {
                     "restartPolicy": "Never",
-                    "serviceAccountName": c["service_account"],
                     "initContainers": [
                         {
                             "name": "engine",

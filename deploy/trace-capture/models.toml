@@ -13,7 +13,6 @@
 [defaults]
 namespace = "inference-sim"
 queue = "conformance-queue"
-service_account = "modelexpress-p2p-nvidia-gpu-vllm-sa"
 gpu = "H200"
 gpu_memory_utilization = 0.90
 tp = 1

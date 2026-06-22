@@ -1,0 +1,172 @@
+# Agentic trace capture: same tap-in-the-middle layout as h200-capture.yaml,
+# but the frontend is the NATIVE PYTHON vLLM API server instead of vllm-rs,
+# because agent drivers like Claude Code speak the Anthropic Messages API
+# (/v1/messages), which vllm-rs does not serve yet. The pinned commit ships
+# the anthropic entrypoint including the x-anthropic-billing-header strip, so
+# Claude Code traffic prefix-matches cleanly.
+#
+#   Claude Code / pi / mini-swe-agent  (port-forward :8000)
+#       | HTTP (/v1/messages or /v1/chat/completions)
+#   frontend   vllm serve --data-parallel-size-local 0     binds rpc :5570, no GPU
+#       | ZMQ
+#   tap        vllm-vcr record --record-tokens           :5570 <-> :5580, trace -> /trace
+#       | ZMQ
+#   engine     vllm serve --headless                       connects :5580, 1x GPU
+#
+# Version pinning is load-bearing (see h200-capture.yaml): engine AND frontend
+# run the postmerge CI image for exactly the protocol-pin commit c9340e6f3.
+#
+# Agent client env (Claude Code):
+#   ANTHROPIC_BASE_URL=http://localhost:8000
+#   ANTHROPIC_AUTH_TOKEN=dummy
+#   ANTHROPIC_DEFAULT_OPUS_MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct   (and SONNET/HAIKU likewise)
+#   CLAUDE_CODE_ATTRIBUTION_HEADER=0             (belt and braces; the frontend strips it too)
+#
+# Operational notes:
+#   - Same one-shot handshake rule as h200-capture.yaml: any container restart
+#     means delete the pod.
+#   - The frontend runs the per-commit CPU wheel image (Dockerfile.frontend-cpu):
+#     the CUDA CI image crashes on a GPU-less container ("Failed to infer
+#     device type"), and only the CPU build resolves a platform without one.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trace-capture-h200-agentic
+  labels:
+    llm-d.ai/guide: trace-capture-agentic
+    llm-d.ai/model: Qwen3-Coder-30B-A3B
+spec:
+  replicas: 1 # scale to 0 when not capturing (and remember: re-applying resets scale)
+  selector:
+    matchLabels:
+      llm-d.ai/guide: trace-capture-agentic
+  strategy:
+    type: Recreate # never two pods fighting over the GPU
+  template:
+    metadata:
+      labels:
+        llm-d.ai/guide: trace-capture-agentic
+        llm-d.ai/model: Qwen3-Coder-30B-A3B
+    spec:
+      containers:
+        # --- Real engine: identical to h200-capture.yaml ----------------------------------
+        - name: engine
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:c9340e6f350a009cf835878abad2a0e379b9e6a4
+          command: ["vllm", "serve"]
+          args:
+            - Qwen/Qwen3-Coder-30B-A3B-Instruct
+            - --headless
+            - --data-parallel-address=127.0.0.1
+            - --data-parallel-rpc-port=5580
+            - --data-parallel-size=1
+            - --tensor-parallel-size=1
+            - --gpu-memory-utilization=0.90
+            # Agent contexts grow far past the loadgen sizes; give the full window.
+            - --max-model-len=131072
+            - --enforce-eager
+          env:
+            - { name: HF_HUB_CACHE, value: /models }
+            - { name: HF_HUB_DISABLE_XET, value: "1" }
+            - { name: VLLM_RPC_TIMEOUT, value: "7200000" }
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - { mountPath: /dev/shm, name: shm }
+            - { mountPath: /.cache, name: torch-compile-cache }
+            - { mountPath: /.triton, name: triton-cache }
+            - { mountPath: /.config, name: vllm-config }
+            - { mountPath: /models, name: model-cache }
+        # --- Recording tap: identical to h200-capture.yaml --------------------------------
+        - name: tap
+          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v7
+          # The python frontend binds its rpc port late in startup (config +
+          # tokenizer resolution first), unlike vllm-rs which binds instantly.
+          # If the tap binds :5580 first, the engine's HELLO arrives while the
+          # frontend is still deaf and the tap dies mid-handshake. Gate on the
+          # frontend listening before the tap ever binds the engine side.
+          #
+          # The image must be in protocol lockstep with the pin (v6+ = commit
+          # c9340e6f3): the tap re-emits handshake structs, and a stale build
+          # makes the frontend reject the READY response (missing block_size).
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              until (exec 3<>/dev/tcp/127.0.0.1/5570) 2>/dev/null; do
+                echo "waiting for frontend to listen on :5570"; sleep 2
+              done
+              exec /usr/local/bin/vllm-vcr record \
+                --frontend-handshake=tcp://127.0.0.1:5570 \
+                --engine-handshake=tcp://127.0.0.1:5580 \
+                --input-address=tcp://127.0.0.1:29560 \
+                --output-address=tcp://127.0.0.1:29561 \
+                --trace-out=/trace/trace.jsonl \
+                --model=Qwen/Qwen3-Coder-30B-A3B-Instruct \
+                --gpu=H200 \
+                --tp=1 \
+                --block-size=16 \
+                --record-tokens
+          env:
+            - { name: RUST_LOG, value: info }
+          resources:
+            requests: { cpu: "2", memory: 1Gi }
+            limits: { cpu: "4", memory: 2Gi }
+          volumeMounts:
+            - { mountPath: /trace, name: trace }
+        # --- Python frontend: API server only, serves /v1/messages ------------------------
+        - name: frontend
+          image: quay.io/wseaton/mock-engine-nixl:vllm-frontend-cpu-c9340e6f3
+          command: ["vllm", "serve"]
+          args:
+            - Qwen/Qwen3-Coder-30B-A3B-Instruct
+            - --data-parallel-size=1
+            - --data-parallel-size-local=0
+            - --data-parallel-address=127.0.0.1
+            - --data-parallel-rpc-port=5570
+            - --host=0.0.0.0
+            - --port=8000
+            # Must match the engine's cap, or the frontend admits requests the
+            # engine rejects.
+            - --max-model-len=131072
+            # Qwen3-Coder emits XML-style tool calls; qwen3_coder is its parser.
+            - --enable-auto-tool-choice
+            - --tool-call-parser=qwen3_coder
+          env:
+            # Own HF cache (config + tokenizer only, no weights): avoids racing
+            # the engine's weight download in a shared cache dir.
+            - { name: HF_HUB_CACHE, value: /hf-cache }
+            - { name: HF_HUB_DISABLE_XET, value: "1" }
+            - { name: VLLM_RPC_TIMEOUT, value: "7200000" }
+          ports:
+            - { name: modelserver, containerPort: 8000, protocol: TCP }
+          readinessProbe:
+            httpGet: { path: /v1/models, port: modelserver }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests: { cpu: "4", memory: 8Gi }
+            limits: { cpu: "8", memory: 16Gi }
+          volumeMounts:
+            - { mountPath: /hf-cache, name: frontend-hf-cache }
+      volumes:
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 8Gi }
+        - name: torch-compile-cache
+          emptyDir: {}
+        - name: triton-cache
+          emptyDir: {}
+        - name: vllm-config
+          emptyDir: {}
+        - name: model-cache
+          emptyDir: { sizeLimit: 100Gi }
+        - name: frontend-hf-cache
+          emptyDir: { sizeLimit: 5Gi }
+        - name: trace
+          emptyDir: {}

@@ -1,0 +1,12 @@
+# RWX cache for gemma-4-31B-it-FP8-Dynamic weights (~61 GB bf16), so redeploys
+# skip the pull. Same storage class as the other gemma caches.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gemma4-31b-bf16-model-cache
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: shared-vast
+  resources:
+    requests:
+      storage: 100Gi

@@ -1,0 +1,48 @@
+# Dedicated Kueue queue that serializes conformance captures to ONE Job at a time.
+#
+# The capture Jobs (validation-jobs.yaml) each request 1 H200. On the shared
+# benchmark-queue -> llm-d-cluster-queue (gpu-h200 nominalQuota: 8) they would
+# admit in parallel. Conformance captures must run one at a time (capture hygiene:
+# one workload per pod lifetime, no cross-capture GPU/scheduler interference), so
+# they target THIS queue instead.
+#
+# How the serialization works: conformance-queue has a gpu-h200 nominalQuota of 1
+# and NO cohort, so it cannot borrow. The first Job consumes the single GPU of
+# quota; the second stays suspended (pending admission) until the first completes
+# and releases it. CPU/memory quota is sized for one capture pod (engine 8c/64Gi +
+# tap/frontend/loadgen sidecars ~= 16c/75Gi) with headroom, so the GPU is the only
+# binding limit.
+#
+# CAVEAT (logical overcommit): this queue's 1 GPU is independent of
+# llm-d-cluster-queue's 8 (no shared cohort), so the cluster's Kueue accounting is
+# 9 logical H200s against 8 physical. In the rare case all 8 are already busy when
+# a capture admits, the capture pod waits at the scheduler. Conformance captures
+# are deliberate and infrequent, so this is acceptable. To remove the overcommit,
+# carve 1 GPU out of llm-d-cluster-queue (8 -> 7) and put both queues in one
+# cohort -- that edits shared infra, so it's left to a cluster admin.
+#
+# Apply once before submitting captures:
+#   kubectl apply -f deploy/trace-capture/conformance-queue.yaml
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: conformance-queue
+spec:
+  namespaceSelector: {} # any namespace whose LocalQueue points here
+  queueingStrategy: BestEffortFIFO
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: gpu-h200 # reuse the existing ResourceFlavor (H200 nodes)
+          resources:
+            - { name: cpu, nominalQuota: "24" }
+            - { name: memory, nominalQuota: 96Gi }
+            - { name: nvidia.com/gpu, nominalQuota: "1" } # the serializer: one at a time
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: conformance-queue
+  namespace: inference-sim
+spec:
+  clusterQueue: conformance-queue

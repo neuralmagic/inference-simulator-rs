@@ -1,0 +1,12 @@
+# RWX cache for gemma-3-27b-it-FP8-dynamic weights (~27 GB FP8), so redeploys skip
+# the pull. Same storage class as the other capture caches.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gemma3-model-cache
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: shared-vast
+  resources:
+    requests:
+      storage: 100Gi

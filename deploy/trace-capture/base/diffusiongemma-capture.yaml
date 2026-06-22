@@ -1,0 +1,217 @@
+# Real-engine trace capture for DiffusionGemma (image-in / text-out multimodal).
+#
+# Same three-container tap topology as h200-capture.yaml, but with the PYTHON
+# frontend (mature multimodal input processor) and a diffusiongemma-capable
+# engine:
+#
+#   loadgen / curl (port-forward :8000)
+#       | HTTP   chat/completions with image_url content
+#   frontend   vllm serve --data-parallel-size-local 0   (PYTHON, CPU)  :5570
+#       | ZMQ
+#   tap        vllm-vcr record                          :5570 <-> :5580, trace -> /trace
+#       | ZMQ
+#   engine     vllm serve --headless                      diffusiongemma, 1x H200
+#
+# WHY THESE VERSIONS (the load-bearing part):
+#   - DiffusionGemma support landed in vLLM via PR #45163, merge commit
+#     eb28452b10a1376d143b2847a78b31726db346dd (2026-06-12). Engine + frontend
+#     are pinned to that exact commit.
+#   - The recording tap is built at protocol rev c9340e6f (see Cargo.toml).
+#     Between c9340e6f and eb28452 the engine-core-client protocol crate
+#     (handshake.rs + data-path structs) did NOT change -- only a test file --
+#     so the existing tap brokers the handshake and decodes EngineCoreRequest
+#     (which already carries mm_features) correctly. NO TAP REBUILD NEEDED.
+#     The LATER commit 6c5872e (#45417) DOES touch handshake.rs; do not jump to
+#     it without rebuilding the tap against its protocol_rev.
+#   - Tradeoff of staying at eb28452: we miss #45417's "unset HF default
+#     max_new_tokens" fix, so requests MUST set max_tokens explicitly.
+#
+#   - Model RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic is UNGATED
+#     (gated:false), so no HF_TOKEN -- anonymous CDN pull. FP8 is native on
+#     H200 (Hopper).
+#
+# RISKS TO WATCH on first bring-up:
+#   - DiffusionGemma uses model-runner-v2 (VLLM_USE_V2_MODEL_RUNNER=1) + the
+#     spec-decode multi-token-block path. The v2-runner + headless-DP combo is
+#     the untested integration point. If the engine won't register, this is the
+#     first suspect.
+#   - torch-compile fix #45643 is still open upstream, so --enforce-eager.
+#
+# Same operational rules as h200-capture.yaml: containers handshake once in
+# order; if any restarts, delete the pod. Idle GPU pods are reaped ~35 min.
+# Fetch the trace before scaling down (emptyDir).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trace-capture-diffusiongemma
+  labels:
+    llm-d.ai/guide: trace-capture
+    llm-d.ai/model: diffusiongemma-26B-A4B
+spec:
+  replicas: 1 # scale to 0 when not capturing (re-applying resets scale)
+  selector:
+    matchLabels:
+      llm-d.ai/guide: trace-capture-dg
+  strategy:
+    type: Recreate # never two pods fighting over the GPU
+  template:
+    metadata:
+      labels:
+        llm-d.ai/guide: trace-capture-dg
+        llm-d.ai/model: diffusiongemma-26B-A4B
+    spec:
+      containers:
+        # --- Real engine: headless diffusiongemma at the protocol-pinned commit ----------
+        - name: engine
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:16e91176cf77bf0f40ae48da22365a5e21b517af
+          command: ["vllm", "serve"]
+          args:
+            - RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic
+            - --headless
+            - --data-parallel-address=127.0.0.1
+            - --data-parallel-rpc-port=5580
+            - --data-parallel-size=1
+            - --tensor-parallel-size=1
+            - --trust-remote-code
+            - --gpu-memory-utilization=0.85   # recipe: headroom for denoising activation memory
+            - --max-model-len=16384
+            - --max-num-seqs=4               # recipe: diffusion state buffers OOM above ~4
+            - --enforce-eager                # torch-compile fix #45643 still open upstream
+            - --generation-config=vllm       # recipe: ignore checkpoint's max_tokens=256 cap
+            - '--diffusion-config={"canvas_length": 256}'
+            - '--limit-mm-per-prompt={"image": 7}'        # recipe: enable/profile the image path
+            - '--mm-processor-kwargs={"max_soft_tokens": 1120}'
+            - '--hf-overrides={"diffusion_sampler":"entropy_bound","diffusion_entropy_bound":0.1}'
+          env:
+            - { name: VLLM_USE_V2_MODEL_RUNNER, value: "1" }   # diffusiongemma requires the v2 runner
+            - { name: HF_HUB_CACHE, value: /models }
+            - { name: HF_HUB_DISABLE_XET, value: "1" }         # xet crawls behind istio egress
+            - { name: VLLM_RPC_TIMEOUT, value: "7200000" }
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - { mountPath: /dev/shm, name: shm }
+            - { mountPath: /.cache, name: torch-compile-cache }
+            - { mountPath: /.triton, name: triton-cache }
+            - { mountPath: /.config, name: vllm-config }
+            - { mountPath: /models, name: model-cache }
+        # --- Recording tap: serde-default fix + drain-task fix (per-socket recv tasks
+        # so a large multimodal message can't wedge the select! loop) + observe_request
+        # accepts 3+ frame multimodal requests (aux tensor frames) so they get traced --
+        - name: tap
+          image: quay.io/wseaton/mock-engine-nixl:tap-16e91176-mmfix
+          command: ["/usr/local/bin/vllm-vcr", "record"]
+          args:
+            - --trace-out=/trace/trace.jsonl
+            - --model=RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic
+            - --gpu=H200
+            - --tp=1
+            - --record-tokens                      # content-identical replay
+            - --step-stats-out=/trace/step-stats.jsonl  # diffusion = multi-token steps via spec-decode path
+          env:
+            - { name: RUST_LOG, value: info }
+          resources:
+            requests: { cpu: "2", memory: 1Gi }
+            limits: { cpu: "4", memory: 2Gi }
+          volumeMounts:
+            - { mountPath: /trace, name: trace }
+        # --- Python frontend: OpenAI server, no local engine (api-server only) ------------
+        # Uses the SAME curated CUDA image as the engine (known-good dep set). The
+        # fresh-resolved CPU wheel image hit two dep issues for this bleeding-edge
+        # diffusiongemma build: V2-runner-needs-Triton, and starlette 1.3.1 breaking
+        # prometheus-fastapi-instrumentator. Running on a GPU sidesteps both. dpl=0
+        # means NO local inference -- the GPU is just for platform/Triton init; the
+        # frontend still does the multimodal input processing (image -> mm_features).
+        # (The eventual CPU replay uses the Rust sim, not this frontend, so replay
+        # stays GPU-free.)
+        - name: frontend
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:16e91176cf77bf0f40ae48da22365a5e21b517af
+          # DEBUG: temporary, to pinpoint why AsyncMPClient never submits an ADD to
+          # the remote headless engine at dp_size=1. SYS_PTRACE lets py-spy dump the
+          # hung request's Python stack. Remove both once diagnosed.
+          securityContext:
+            capabilities:
+              add: ["SYS_PTRACE"]
+          command: ["vllm", "serve"]
+          args:
+            - RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic
+            - --data-parallel-size=1
+            - --data-parallel-size-local=0
+            # Python frontend is the DP head node; it BINDS the RPC port the tap
+            # dials (:5570). (vllm-rs used --handshake-port here; Python uses -dpa/-dpp.)
+            - --data-parallel-address=127.0.0.1
+            - --data-parallel-rpc-port=5570
+            - --host=0.0.0.0
+            - --port=8000
+            - --max-model-len=16384
+            - --trust-remote-code
+            - --generation-config=vllm
+            - '--diffusion-config={"canvas_length": 256}'
+            - '--limit-mm-per-prompt={"image": 7}'        # frontend profiles/processes images too
+            - '--mm-processor-kwargs={"max_soft_tokens": 1120}'
+            - '--hf-overrides={"diffusion_sampler":"entropy_bound","diffusion_entropy_bound":0.1}'
+            - '--default-chat-template-kwargs={"enable_thinking":true}'
+          env:
+            - { name: VLLM_ENGINE_READY_TIMEOUT_S, value: "3600" }  # engine startup includes weight download
+            - { name: HF_HUB_DISABLE_XET, value: "1" }
+            - { name: HF_HUB_CACHE, value: /models-fe }  # frontend's own tokenizer/config cache
+            # Match the engine's runner (V2). The frontend has a GPU now, so Triton
+            # is available and V2 config validates. A V1-coordinator/V2-engine
+            # mismatch stalls the data-plane (engine never pulls request frames).
+            - { name: VLLM_USE_V2_MODEL_RUNNER, value: "1" }
+            - { name: VLLM_LOGGING_LEVEL, value: "DEBUG" }  # DEBUG: temporary, pinpoint submit stall
+            - { name: PYTHONPATH, value: "/opt/inject" }    # DEBUG: auto-import mmdbg sitecustomize
+          ports:
+            - { name: modelserver, containerPort: 8000, protocol: TCP }
+          readinessProbe:
+            httpGet: { path: /v1/models, port: modelserver }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+              nvidia.com/gpu: "1"   # platform/Triton init only; dpl=0 does no inference
+            limits:
+              cpu: "8"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - { mountPath: /models-fe, name: fe-models }
+            - { mountPath: /.cache, name: fe-cache }
+            - { mountPath: /.triton, name: fe-triton }
+            - { mountPath: /.config, name: fe-config }
+            - { mountPath: /opt/inject, name: mmdbg }  # DEBUG: monkeypatch sitecustomize
+      volumes:
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 8Gi }
+        - name: torch-compile-cache
+          emptyDir: {}
+        - name: triton-cache
+          emptyDir: {}
+        - name: vllm-config
+          emptyDir: {}
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: dg-model-cache   # persists weights across redeploys (no 25GB re-pull)
+        - name: trace
+          emptyDir: {}
+        - name: fe-models
+          emptyDir: {}
+        - name: fe-cache
+          emptyDir: {}
+        - name: fe-triton
+          emptyDir: {}
+        - name: fe-config
+          emptyDir: {}
+        - name: mmdbg  # DEBUG: monkeypatch sitecustomize (configMap)
+          configMap:
+            name: mmdbg-sitecustomize

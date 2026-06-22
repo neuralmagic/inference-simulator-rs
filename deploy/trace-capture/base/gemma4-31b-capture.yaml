@@ -1,0 +1,149 @@
+# Trace capture for gemma-4-31B FP8 (image-in / text-out). frontend -> tap -> engine,
+# same topology as gemma4-capture.yaml; RedHatAI/gemma-4-31B-it-FP8-Dynamic (ungated)
+# on the 16e91176 engine + tap-16e91176-mmfix (no rebuild). FP8 image output is
+# gibberish; bf16 is the clean run (gemma4-31b-bf16-capture.yaml). Set max_tokens
+# explicitly; fetch /trace before scaling down (emptyDir).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trace-capture-gemma4-31b
+  labels:
+    llm-d.ai/guide: trace-capture
+    llm-d.ai/model: gemma-4-31B
+spec:
+  replicas: 1 # scale to 0 when not capturing (re-applying resets scale)
+  selector:
+    matchLabels:
+      llm-d.ai/guide: trace-capture-g4-31b
+  strategy:
+    type: Recreate # never two pods fighting over the GPU
+  template:
+    metadata:
+      labels:
+        llm-d.ai/guide: trace-capture-g4-31b
+        llm-d.ai/model: gemma-4-31B
+    spec:
+      containers:
+        # --- Real engine: headless gemma-4-31B at the protocol-pinned commit -------
+        - name: engine
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:16e91176cf77bf0f40ae48da22365a5e21b517af
+          command: ["vllm", "serve"]
+          args:
+            - RedHatAI/gemma-4-31B-it-FP8-Dynamic
+            - --headless
+            - --data-parallel-address=127.0.0.1
+            - --data-parallel-rpc-port=5580
+            - --data-parallel-size=1
+            - --tensor-parallel-size=1
+            - --trust-remote-code
+            - --gpu-memory-utilization=0.85
+            - --max-model-len=16384
+            - --enforce-eager                # skip torch.compile; only need a few requests
+            - --generation-config=vllm       # ignore checkpoint generation defaults
+            - '--limit-mm-per-prompt={"image": 2, "audio": 0, "video": 0}'  # image-only; cap omni profiling
+          env:
+            - { name: HF_HUB_CACHE, value: /models }
+            - { name: HF_HUB_DISABLE_XET, value: "1" }         # xet crawls behind istio egress
+            - { name: VLLM_RPC_TIMEOUT, value: "7200000" }
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - { mountPath: /dev/shm, name: shm }
+            - { mountPath: /.cache, name: torch-compile-cache }
+            - { mountPath: /.triton, name: triton-cache }
+            - { mountPath: /.config, name: vllm-config }
+            - { mountPath: /models, name: model-cache }
+        # --- Recording tap: serde-default + drain-task + observe>=2-frame mmfix ----
+        - name: tap
+          image: quay.io/wseaton/mock-engine-nixl:tap-16e91176-mmfix
+          command: ["/usr/local/bin/vllm-vcr", "record"]
+          args:
+            - --trace-out=/trace/trace.jsonl
+            - --model=RedHatAI/gemma-4-31B-it-FP8-Dynamic
+            - --gpu=H200
+            - --tp=1
+            - --record-tokens                           # content-identical replay
+            - --step-stats-out=/trace/step-stats.jsonl  # per-token ITL (autoregressive)
+          env:
+            - { name: RUST_LOG, value: info }
+          resources:
+            requests: { cpu: "2", memory: 1Gi }
+            limits: { cpu: "4", memory: 2Gi }
+          volumeMounts:
+            - { mountPath: /trace, name: trace }
+        # --- Python frontend: OpenAI server, no local engine (api-server only) ------
+        # Same curated CUDA image as the engine (known-good dep set). dpl=0 means NO
+        # local inference -- the GPU is just for platform init; the frontend still
+        # does the multimodal input processing (image -> mm_features). The eventual
+        # CPU replay uses the Rust sim, not this frontend, so replay stays GPU-free.
+        - name: frontend
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:16e91176cf77bf0f40ae48da22365a5e21b517af
+          command: ["vllm", "serve"]
+          args:
+            - RedHatAI/gemma-4-31B-it-FP8-Dynamic
+            - --data-parallel-size=1
+            - --data-parallel-size-local=0
+            # Python frontend is the DP head node; it BINDS the RPC port the tap
+            # dials (:5570).
+            - --data-parallel-address=127.0.0.1
+            - --data-parallel-rpc-port=5570
+            - --host=0.0.0.0
+            - --port=8000
+            - --max-model-len=16384
+            - --trust-remote-code
+            - --generation-config=vllm
+            - '--limit-mm-per-prompt={"image": 2, "audio": 0, "video": 0}'
+          env:
+            - { name: VLLM_ENGINE_READY_TIMEOUT_S, value: "3600" }  # engine startup includes weight download
+            - { name: HF_HUB_DISABLE_XET, value: "1" }
+            - { name: HF_HUB_CACHE, value: /models-fe }  # frontend's own tokenizer/config cache
+          ports:
+            - { name: modelserver, containerPort: 8000, protocol: TCP }
+          readinessProbe:
+            httpGet: { path: /v1/models, port: modelserver }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+              nvidia.com/gpu: "1"   # platform init only; dpl=0 does no inference
+            limits:
+              cpu: "8"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - { mountPath: /models-fe, name: fe-models }
+            - { mountPath: /.cache, name: fe-cache }
+            - { mountPath: /.triton, name: fe-triton }
+            - { mountPath: /.config, name: fe-config }
+      volumes:
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 8Gi }
+        - name: torch-compile-cache
+          emptyDir: {}
+        - name: triton-cache
+          emptyDir: {}
+        - name: vllm-config
+          emptyDir: {}
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: gemma4-31b-model-cache   # persists weights across redeploys
+        - name: trace
+          emptyDir: {}
+        - name: fe-models
+          emptyDir: {}
+        - name: fe-cache
+          emptyDir: {}
+        - name: fe-triton
+          emptyDir: {}
+        - name: fe-config
+          emptyDir: {}

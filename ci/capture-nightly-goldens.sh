@@ -63,6 +63,42 @@ print(" ".join(accounts))
 PY
 }
 
+validate_capture_matrix() {
+    python3 - "${TARGETS}" <<'PY'
+import sys
+import tomllib
+
+targets = sys.argv[1].split()
+with open("deploy/trace-capture/models.toml", "rb") as f:
+    models = tomllib.load(f)
+with open("compat.toml", "rb") as f:
+    compat = tomllib.load(f)
+
+captures = {c["name"]: c for c in models.get("capture", [])}
+defaults = models.get("defaults", {})
+selected = []
+missing = []
+for target in targets:
+    capture = captures.get(target)
+    if capture:
+        selected.append({**defaults, **capture})
+    else:
+        missing.append(target)
+
+if missing:
+    raise SystemExit(f"unknown capture target(s): {' '.join(missing)}")
+
+if any(c.get("vllm_tag") == "nightly" for c in selected):
+    nightly = next(v for v in compat["vllm"] if v["line"] == "nightly")
+    engine_image = models["lines"]["nightly"]["engine_image"]
+    if nightly["protocol_rev"] not in engine_image:
+        raise SystemExit(
+            "nightly engine_image must include compat.toml nightly protocol_rev "
+            f"{nightly['protocol_rev']}: {engine_image}"
+        )
+PY
+}
+
 on_error() {
     local status=$?
     local line="${1:-unknown}"
@@ -79,6 +115,8 @@ if [[ ! "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
     log "ERROR: invalid Kubernetes namespace: ${NAMESPACE}"
     exit 1
 fi
+
+validate_capture_matrix
 
 log "Starting nightly golden capture"
 log "Configuration: namespace=${NAMESPACE} targets=${TARGETS} manifest=${MANIFEST} out_dir=${OUT_DIR} poll=${POLL_SECONDS}s timeout=${TIMEOUT_SECONDS}s"

@@ -6,10 +6,10 @@
 //!   EngineCoreClient (acts as "real frontend")
 //!       |
 //!       v
-//!   inference-sim-tap  (the binary under test)
+//!   vllm-vcr record  (the binary under test)
 //!       |
 //!       v
-//!   inference_simulator_rs::run (acts as "real engine")
+//!   vllm_vcr::run (acts as "real engine")
 //! ```
 //!
 //! The test drives 2-3 normal requests plus one aborted request through the
@@ -27,10 +27,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use inference_simulator_rs::trace::{TraceFinishReason, TraceRecord, read_trace};
-use inference_simulator_rs::{Opt, run};
+use vllm_vcr::trace::{TraceFinishReason, TraceRecord, read_trace};
+use vllm_vcr::{Opt, run};
 
-use clap::Parser as _;
 use vllm_engine_core_client::protocol::{
     EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams,
 };
@@ -58,7 +57,7 @@ fn make_request(id: &str, prompt_len: usize, max_tokens: u32) -> EngineCoreReque
 /// response downstream instead of fabricating one.
 async fn start_sim(handshake_address: &str) -> CancellationToken {
     let args = vec![
-        "inference-sim",
+        "play",
         "--handshake-address",
         handshake_address,
         "--inter-token-latency",
@@ -102,9 +101,11 @@ async fn tap_records_trace() {
     let _ = std::fs::remove_file(&trace_path);
 
     // Step 1: Start the tap binary. It will bind the upstream side first, then
-    // connect downstream. The tap binary path comes from CARGO_BIN_EXE.
-    let tap_bin = env!("CARGO_BIN_EXE_inference-sim-tap");
+    // connect downstream. The recording front-end is the `record` subcommand of
+    // the unified binary; its path comes from CARGO_BIN_EXE.
+    let tap_bin = env!("CARGO_BIN_EXE_vllm-vcr");
     let mut tap_child = Command::new(tap_bin)
+        .arg("record")
         .arg("--frontend-handshake")
         .arg(&frontend_handshake)
         .arg("--engine-handshake")
@@ -120,7 +121,7 @@ async fn tap_records_trace() {
         .arg("--record-tokens")
         .env("RUST_LOG", "info")
         .spawn()
-        .expect("failed to spawn inference-sim-tap");
+        .expect("failed to spawn vllm-vcr record");
 
     // Give the tap a moment to bind its upstream sockets.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -339,7 +340,7 @@ async fn tap_records_trace() {
         let _ = std::fs::remove_file(p);
     }
     let replay_args = vec![
-        "inference-sim",
+        "play",
         "--handshake-address",
         &replay_addr,
         "--replay-tokens",

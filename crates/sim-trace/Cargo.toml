@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "JSONL trace schema, latency models, and guidellm conversion for the inference simulator. Free of the vLLM engine-core protocol dependency."
 
 [dependencies]

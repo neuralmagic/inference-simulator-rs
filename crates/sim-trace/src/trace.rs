@@ -668,7 +668,7 @@ mod tests {
             ..sample_meta()
         };
         let path = std::env::temp_dir().join(format!(
-            "inference-sim-meta-gz-test-{}.jsonl.gz",
+            "vllm-vcr-meta-gz-test-{}.jsonl.gz",
             std::process::id()
         ));
         let mut writer = TraceWriter::create(&path).unwrap();
@@ -834,7 +834,7 @@ mod tests {
         let meta = sample_meta();
         let records = sample_records();
         let path = std::env::temp_dir().join(format!(
-            "inference-sim-trace-gz-test-{}.jsonl.gz",
+            "vllm-vcr-trace-gz-test-{}.jsonl.gz",
             std::process::id()
         ));
 
@@ -857,7 +857,7 @@ mod tests {
         let meta = sample_meta();
         let records = sample_records();
         let path = std::env::temp_dir().join(format!(
-            "inference-sim-trace-plain-test-{}.jsonl",
+            "vllm-vcr-trace-plain-test-{}.jsonl",
             std::process::id()
         ));
 

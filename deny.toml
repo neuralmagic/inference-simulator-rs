@@ -1,0 +1,71 @@
+# cargo-deny config: supply-chain gate for the dependency graph (RUSTSEC
+# advisories, license compatibility against our dual Apache-2.0/MIT licensing,
+# and source allowlisting). Run locally or in CI with `cargo deny check`.
+
+[graph]
+# Evaluate exactly the platforms we ship (see release.yml), so the result is the
+# same on a dev mac and on the Linux CI runner instead of depending on the host's
+# resolved graph (e.g. Linux-only transitives like bincode are otherwise invisible
+# on macOS).
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+version = 2
+# Deny on any RUSTSEC vulnerability (and yanked crates, the v2 default). Scope the
+# "unmaintained" lint to our own direct deps: a transitive going unmaintained
+# (e.g. bincode 1.3.3, RUSTSEC-2025-0141) isn't actionable for us, but an
+# unmaintained crate WE pick should surface. Add an id to `ignore` with a
+# justification only when a vuln fix isn't yet available.
+unmaintained = "workspace"
+ignore = [
+    # rustls-webpki 0.101.7 cert-validation/CRL bugs. Reached only through the AWS
+    # SDK's legacy hyper-0.14 connector (aws-smithy-http-client `legacy-rustls-ring`);
+    # our S3 client uses the rustls-aws-lc path (rustls 0.23 / webpki 0.103), so this
+    # code is compiled but never on our TLS path. Clears when aws-smithy-http-client
+    # drops the legacy connector (or we prune the AWS feature graph). TODO: revisit.
+    { id = "RUSTSEC-2026-0098", reason = "AWS SDK legacy rustls-0.21 connector, not our TLS path" },
+    { id = "RUSTSEC-2026-0099", reason = "AWS SDK legacy rustls-0.21 connector, not our TLS path" },
+    { id = "RUSTSEC-2026-0104", reason = "AWS SDK legacy rustls-0.21 connector, not our TLS path" },
+]
+
+[licenses]
+version = 2
+# Permissive licenses compatible with shipping under Apache-2.0 OR MIT. Keep this
+# tight; a new dep with a license outside the set fails CI on purpose.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    # Public-domain-equivalent, OSI-approved; pulled by a Windows-only zeromq
+    # transitive (win_uds) we never actually build.
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions are a warning, not a gate (the AWS SDK + git deps pull a
+# wide graph; surfacing dupes without blocking).
+multiple-versions = "warn"
+# Deny `*` version requirements, except our own internal workspace path deps.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The git deps we pin on purpose (see compat.toml / Cargo.toml).
+allow-git = [
+    "https://github.com/vllm-project/vllm.git",
+    "https://github.com/wseaton/vllm.git",
+    "https://github.com/ai-dynamo/nixl.git",
+]

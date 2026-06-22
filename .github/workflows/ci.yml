@@ -14,7 +14,7 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Least privilege: this workflow only reads the repo.
+# Least privilege by default.
 permissions:
   contents: read
 
@@ -24,6 +24,12 @@ env:
   # off shrinks the cached target/ and speeds cold builds.
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
+  # Harden cargo against flaky crates.io fetches. HTTP/2 multiplexing is what
+  # throws the intermittent "curl [16] Error in the HTTP2 framing layer" during
+  # crate downloads; force HTTP/1.1 to dodge that class entirely, and retry the
+  # other transient blips instead of failing the (non-blocking) nightly line.
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
 
 jobs:
   # One job, ordered fail-fast: fmt is instant, then the compile-heavy steps share a
@@ -32,17 +38,25 @@ jobs:
   # needs nothing beyond the toolchain.
   build-and-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      # Sets up the toolchain (rustfmt + clippy) and bundles Swatinem/rust-cache, which
-      # caches ~/.cargo/{registry,git} and target/ keyed on Cargo.lock + toolchain. The
-      # cache is the single biggest speedup; the git deps compile slowly when cold.
+      # Toolchain plus coarse Cargo cache; sccache adds compiler object caching.
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           components: rustfmt, clippy
+
+      - uses: ./.github/actions/setup-sccache
+        with:
+          role-arn: ${{ vars.SCCACHE_ROLE_ARN }}
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          region: ${{ vars.SCCACHE_REGION }}
+          key-prefix: ${{ vars.SCCACHE_S3_KEY_PREFIX }}
 
       - name: Format
         run: cargo fmt --all --check
@@ -65,6 +79,20 @@ jobs:
       - name: Check (nixl-stub)
         run: cargo check --all-targets --locked --features nixl-stub
 
+  # Supply-chain gate: RUSTSEC advisories, license compatibility, and source
+  # allowlisting over the whole dependency graph (config in deny.toml). The
+  # advisories check is time-sensitive, so a newly published CVE can turn this red
+  # on an unrelated push; that's the gate working (address or ignore-with-reason).
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check
+
   # Read compat.toml and emit the N-3 support window as a JSON matrix. Keeping the
   # parse in its own tiny job means the heavy per-line build job can `needs:` a
   # ready-made list instead of re-parsing the manifest per matrix leg.
@@ -77,43 +105,20 @@ jobs:
     outputs:
       include: ${{ steps.parse.outputs.include }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      # tomllib is stdlib on the ubuntu-latest python3 (3.12), so no pip install.
-      # Emit one matrix entry per [[vllm]] line as compact JSON on $GITHUB_OUTPUT.
-      - name: Parse compat.toml into a build matrix
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      # `cargo xtask ci-matrix` reads compat.toml + conformance/manifest.toml via
+      # sim-compat and emits one row per [[vllm]] line (compact JSON on stdout).
+      - name: Build matrix from compat.toml
         id: parse
-        run: |
-          include=$(python3 - <<'PY'
-          import json, tomllib, os
-          with open("compat.toml", "rb") as f:
-              compat = tomllib.load(f)
-          # Lines that have at least one golden registered drive the AWS fetch; the
-          # rest skip credentials entirely.
-          golden_lines = set()
-          if os.path.exists("conformance/manifest.toml"):
-              with open("conformance/manifest.toml", "rb") as f:
-                  manifest = tomllib.load(f)
-              golden_lines = {g["line"] for g in manifest.get("golden", [])}
-          rows = []
-          for v in compat.get("vllm", []):
-              rows.append({
-                  "line": v["line"],
-                  "tag": v["tag"],
-                  "protocol_rev": v["protocol_rev"],
-                  "fidelity_validated": bool(v.get("fidelity_validated", False)),
-                  "default": bool(v.get("default", False)),
-                  "has_goldens": v["line"] in golden_lines,
-              })
-          print(json.dumps(rows, separators=(",", ":")))
-          PY
-          )
-          echo "include=${include}" >> "$GITHUB_OUTPUT"
+        run: echo "include=$(cargo xtask ci-matrix)" >> "$GITHUB_OUTPUT"
 
   # Per-line build + conformance. One leg per compat.toml line, each compiling the
-  # protocol crate against that line's rev (pinned into Cargo.toml by ci/pin-vllm-rev.py;
+  # protocol crate against that line's rev (pinned into Cargo.toml by cargo xtask pin-vllm;
   # see that script for why --config can't do it). fmt/clippy stay in build-and-test
   # above: they don't depend on the vLLM rev, so running them once is enough.
   #
@@ -146,25 +151,34 @@ jobs:
       # compat.toml default for every leg. Drives the advertised vllm_version and the
       # conformance line check; build.rs reads this env first (see build.rs / src/lib.rs).
       VLLM_TARGET_VERSION: ${{ matrix.tag }}
-      # Object-store bucket holding the golden captures (NOT in the repo; fetched by
-      # sha). Each manifest entry's bucket_path is the key within it (the conformance/
-      # prefix the fetch role is scoped to).
+      # Object-store bucket holding the golden captures (NOT in the repo). The
+      # conformance runner reads each manifest bucket_path straight from here via
+      # sim-s3 (it joins this bucket onto the key); the fetch role is scoped to
+      # the conformance/ prefix.
       CONFORMANCE_BUCKET: "s3://llm-d-artifacts-783952637884"
       AWS_REGION: us-east-1
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
 
+      - uses: ./.github/actions/setup-sccache
+        with:
+          role-arn: ${{ vars.SCCACHE_ROLE_ARN }}
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          region: ${{ vars.SCCACHE_REGION }}
+          key-prefix: ${{ vars.SCCACHE_S3_KEY_PREFIX }}
+
       # Pin Cargo.toml to this line's rev + fork patch. Cargo rejects patching a git
       # dep to a different rev of the same source, so the rev is swapped in
       # [workspace.dependencies] (not via --config); the per-line fork [patch] is
-      # rewritten or removed. After this the rev no longer matches Cargo.lock, so the
-      # build/test below deliberately omit --locked. compat.toml is the source of truth.
+      # rewritten or removed. Refresh Cargo.lock so Rust compiles against that pin.
       - name: Pin vLLM rev (line ${{ matrix.line }})
-        run: python3 ci/pin-vllm-rev.py "${{ matrix.line }}"
+        run: |
+          cargo xtask pin-vllm "${{ matrix.line }}"
+          cargo update -p vllm-engine-core-client
 
       - name: Build (vLLM ${{ matrix.line }} @ ${{ matrix.tag }})
         run: cargo build --workspace
@@ -177,9 +191,10 @@ jobs:
         run: cargo test --workspace --lib
 
       # Assume the least-privilege golden-fetch role via GitHub OIDC. The role
-      # (llm-d-conformance-ci) trusts repo:neuralmagic/inference-simulator-rs:* and
-      # grants only s3:GetObject on the conformance/ prefix. Skipped when the line
-      # has no goldens, so the no-capture state needs no AWS.
+      # (llm-d-conformance-ci) trusts repo:neuralmagic/vllm-vcr:* and grants only
+      # s3:GetObject on the conformance/ prefix. Skipped when the line has no
+      # goldens, so the no-capture state needs no AWS. NOTE: the IAM trust policy's
+      # sub condition must be updated to the new repo path on the GitHub rename.
       - name: Configure AWS credentials (golden fetch, vLLM ${{ matrix.line }})
         if: ${{ matrix.has_goldens }}
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
@@ -187,45 +202,16 @@ jobs:
           role-to-assume: arn:aws:iam::783952637884:role/llm-d-conformance-ci
           aws-region: us-east-1
 
-      # Fetch this line's goldens from the private bucket and verify their sha256
-      # against conformance/manifest.toml before replaying.
-      - name: Fetch + verify goldens (vLLM ${{ matrix.line }})
-        if: ${{ matrix.has_goldens }}
-        run: |
-          set -euo pipefail
-          mkdir -p goldens
-          python3 - "${{ matrix.line }}" <<'PY' > goldens/fetch-plan.tsv
-          import sys, tomllib
-          line = sys.argv[1]
-          with open("conformance/manifest.toml", "rb") as f:
-              manifest = tomllib.load(f)
-          for g in manifest.get("golden", []):
-              if g["line"] != line:
-                  continue
-              # bucket_path<TAB>sha256
-              print("\t".join([g["bucket_path"], g["sha256"]]))
-          PY
-          # Mirror the bucket key under goldens/ (not just the basename) so the path's
-          # model/workload structure is preserved and the conformance runner resolves
-          # each golden at $CONFORMANCE_GOLDENS/<bucket_path>.
-          while IFS=$'\t' read -r bucket_path sha256; do
-            local_file="goldens/${bucket_path}"
-            mkdir -p "$(dirname "$local_file")"
-            echo "==> fetch ${CONFORMANCE_BUCKET}/${bucket_path}"
-            aws s3 cp "${CONFORMANCE_BUCKET}/${bucket_path}" "${local_file}"
-            echo "${sha256}  ${local_file}" | sha256sum --check --strict
-          done < goldens/fetch-plan.tsv
-
       # The runner is tests/conformance.rs: manifest-driven, CPU-only. It reads
-      # conformance/manifest.toml, resolves each golden for this build's line under
-      # $CONFORMANCE_GOLDENS/<basename(bucket_path)>, and asserts line + provenance
-      # (config_hash) + schema + fidelity (see docs/conformance.md). It skips cleanly
-      # when no golden was fetched, so the step is safe before captures exist. The
-      # hard-gate-vs-informational distinction is the job-level continue-on-error
-      # (fidelity_validated lines block; others annotate only).
+      # conformance/manifest.toml, fetches each golden for this build's line
+      # straight from $CONFORMANCE_BUCKET via sim-s3 (using the AWS creds the OIDC
+      # step exported), verifies the integrity sha256, and asserts line +
+      # provenance (config_hash) + schema + fidelity (see docs/conformance.md). It
+      # skips cleanly when no golden is listed for the line, so the step is safe
+      # before captures exist. The hard-gate-vs-informational distinction is the
+      # job-level continue-on-error (fidelity_validated lines block; others
+      # annotate only).
       - name: Conformance replay (vLLM ${{ matrix.line }})
-        env:
-          CONFORMANCE_GOLDENS: goldens
         run: |
           set -euo pipefail
           cargo test --test conformance -- --nocapture

@@ -1,0 +1,30 @@
+# Keep crates and pinned GitHub Actions fresh. Pairs with the cargo-deny gate
+# (advisories/licenses/bans) and the SHA-pinned actions across the workflows:
+# dependabot bumps the pin AND the trailing `# vX` comment in one PR.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR per week for the routine minor/patch churn instead of a flood.
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      # The vLLM engine-core protocol rev is pinned per compat.toml line and bumped
+      # by the nightly canary (cargo xtask set-nightly-rev), not dependabot. The
+      # NIXL rev is pinned to the libnixl the image builds from. Both are git revs
+      # dependabot must not touch.
+      - dependency-name: "vllm-engine-core-client"
+      - dependency-name: "nixl-sys"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns: ["*"]

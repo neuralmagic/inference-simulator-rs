@@ -59,11 +59,11 @@ fn dealer_input_stream(dealer: DealerSocket) -> impl Stream<Item = Result<Engine
 /// Decode a `ZmqMessage` into an `EngineInput`.
 fn decode_request(message: ZmqMessage) -> Result<EngineInput> {
     let frames = message.into_vec();
-    if frames.is_empty() {
-        bail!("empty engine request message");
-    }
-    if frames.len() != 2 {
-        bail!("invalid frame count for engine request: {}", frames.len());
+    if frames.len() < 2 {
+        bail!(
+            "engine request needs at least 2 frames, got {}",
+            frames.len()
+        );
     }
 
     let request_type_frame = frames[0].as_ref();
@@ -73,6 +73,12 @@ fn decode_request(message: ZmqMessage) -> Result<EngineInput> {
 
     let input = match request_type {
         EngineCoreRequestType::Add => {
+            // The Python frontend's MsgpackEncoder splits large tensor payloads
+            // (multimodal pixels, prompt embeds) out of the primary msgpack frame
+            // into trailing aux frames, so a multimodal Add arrives as >2 frames.
+            // The request decoder records those payloads as aux-frame indices, and
+            // replay serves trace tokens regardless of prompt content, so decode
+            // frame[1] and drop the aux frames (frames[2..]).
             let request: Box<EngineCoreRequest> = decode_msgpack(frames[1].as_ref())?;
             EngineInput::Request(request)
         }
@@ -130,5 +136,57 @@ pub(crate) async fn run_io_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an `Add` engine request message: type frame, the msgpack request,
+    /// then `aux_frames` trailing aux frames (what the Python frontend appends
+    /// for split tensor payloads).
+    fn add_message(req: &EngineCoreRequest, aux_frames: usize) -> ZmqMessage {
+        let mut msg = ZmqMessage::from(vec![0u8]); // 0 == Add
+        msg.push_back(encode_msgpack(req).expect("encode request").into());
+        for i in 0..aux_frames {
+            msg.push_back(vec![0xABu8; i + 1].into());
+        }
+        msg
+    }
+
+    #[test]
+    fn decodes_text_add_with_exactly_two_frames() {
+        let req = EngineCoreRequest {
+            request_id: "req-text".to_string(),
+            ..Default::default()
+        };
+        let EngineInput::Request(decoded) =
+            decode_request(add_message(&req, 0)).expect("decode 2-frame add")
+        else {
+            panic!("expected EngineInput::Request");
+        };
+        assert_eq!(decoded.request_id, "req-text");
+    }
+
+    #[test]
+    fn decodes_multimodal_add_ignoring_trailing_aux_frames() {
+        // A multimodal Add arrives as >2 frames (frame[1] msgpack + aux tensor
+        // frames). Decode must read frame[1] and ignore the aux frames.
+        let req = EngineCoreRequest {
+            request_id: "req-mm".to_string(),
+            ..Default::default()
+        };
+        let EngineInput::Request(decoded) =
+            decode_request(add_message(&req, 3)).expect("decode 5-frame multimodal add")
+        else {
+            panic!("expected EngineInput::Request");
+        };
+        assert_eq!(decoded.request_id, "req-mm");
+    }
+
+    #[test]
+    fn rejects_messages_with_fewer_than_two_frames() {
+        assert!(decode_request(ZmqMessage::from(vec![0u8])).is_err());
     }
 }

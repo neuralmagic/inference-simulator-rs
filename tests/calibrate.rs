@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use inference_simulator_rs::calibrate;
+use vllm_vcr::calibrate;
 
 // Test (a): gen-demo + model-level calibrate
 //
@@ -72,14 +72,13 @@ fn calibrate_model_level_proves_both_claims() {
 
 #[tokio::test]
 async fn calibrate_e2e_smoke() {
-    use clap::Parser as _;
     use futures::StreamExt;
-    use inference_simulator_rs::{Opt, run};
     use rand::Rng;
     use rand::SeedableRng as _;
     use tokio_util::sync::CancellationToken;
     use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
     use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
+    use vllm_vcr::{Opt, run};
 
     let result = tokio::time::timeout(Duration::from_secs(120), async {
         // Generate a fast trace to a temp file.
@@ -101,7 +100,7 @@ async fn calibrate_e2e_smoke() {
         );
         let trace_str = trace_path.to_string_lossy().to_string();
         let args = vec![
-            "inference-sim",
+            "play",
             "--handshake-address",
             &addr,
             "--max-num-seqs",
@@ -209,7 +208,7 @@ async fn calibrate_e2e_smoke() {
 
 #[tokio::test]
 async fn replay_arrivals_constant_trace() {
-    use inference_simulator_rs::trace::{TraceMeta, TraceRecord};
+    use vllm_vcr::trace::{TraceMeta, TraceRecord};
 
     let result = tokio::time::timeout(Duration::from_secs(120), async {
         let n = 25usize;
@@ -290,7 +289,7 @@ async fn replay_arrivals_constant_trace() {
 
 #[tokio::test]
 async fn replay_dump_round_trips_burst_structure() {
-    use inference_simulator_rs::trace::{TraceMeta, TraceRecord};
+    use vllm_vcr::trace::{TraceMeta, TraceRecord};
 
     let result = tokio::time::timeout(Duration::from_secs(120), async {
         let n = 12usize;

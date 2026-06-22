@@ -17,7 +17,6 @@
 use std::io::Write;
 use std::time::Duration;
 
-use clap::Parser as _;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::protocol::{
@@ -25,10 +24,10 @@ use vllm_engine_core_client::protocol::{
 };
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 
-use inference_simulator_rs::trace::{
+use vllm_vcr::trace::{
     TraceFinishReason, TraceMeta, TraceRecord, append_record, prompt_block_hashes,
 };
-use inference_simulator_rs::{Opt, run};
+use vllm_vcr::{Opt, run};
 
 const BLOCK_SIZE: usize = 16;
 
@@ -88,7 +87,7 @@ async fn diffusion_multimodal_trace_replays_byte_identical() {
 
     let addr = format!("ipc:///tmp/inf-sim-dg-replay-{}.ipc", std::process::id());
     let opt = Opt::parse_from([
-        "inference-sim",
+        "play",
         "--handshake-address",
         &addr,
         "--replay-tokens",

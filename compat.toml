@@ -28,10 +28,11 @@
 [[vllm]]
 # Bleeding edge: tracks vLLM main so the build/conformance matrix flags wire drift
 # the day a post-merge commit breaks it. No fork (main already carries #45848).
-# Bump protocol_rev to the latest main sha regularly (eventually via automation).
+# protocol_rev is bumped to the latest green main sha by the canary's weekly
+# (Monday / on-demand) PR. See .github/workflows/nightly-canary.yml.
 line = "nightly"
 tag = "nightly"
-protocol_rev = "9c7c74bf1023774cf0e247bf77a038989ee272db"
+protocol_rev = "8dd1b702f27edeed24a4336f531b01c346e04253"
 fidelity_validated = false
 
 [[vllm]]

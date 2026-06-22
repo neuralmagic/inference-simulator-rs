@@ -1,6 +1,6 @@
 //! End-to-end integration tests for the simulator over real ZMQ transport.
 //!
-//! Each test spins up the full `inference_simulator_rs::run` task (the real engine loop,
+//! Each test spins up the full `vllm_vcr::run` task (the real engine loop,
 //! IO loop, and ZMQ handshake) and connects a real `EngineCoreClient` from the
 //! `vllm-engine-core-client` dependency. No mocks, no stubs: this is the only coverage
 //! of the engine-core protocol path end to end, including the two-phase async KV-pull
@@ -16,11 +16,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use clap::Parser as _;
 use futures::StreamExt;
-use inference_simulator_rs::{Opt, run};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+use vllm_vcr::{Opt, run};
 // The typed lora client API (LoraRequest, client.add_lora/remove_lora) only
 // exists on 0.23+; the lora lifecycle test below is gated to match.
 #[cfg(vllm_lora_typed)]
@@ -48,7 +47,7 @@ impl Drop for SimGuard {
 async fn harness(name: &str, extra_flags: &[&str]) -> (EngineCoreClient, SimGuard) {
     let addr = format!("ipc:///tmp/inf-sim-e2e-{}-{name}.ipc", std::process::id());
 
-    let mut args: Vec<&str> = vec!["inference-sim", "--handshake-address", &addr];
+    let mut args: Vec<&str> = vec!["play", "--handshake-address", &addr];
     args.extend_from_slice(extra_flags);
     let opt = Opt::parse_from(&args);
 
@@ -138,9 +137,7 @@ async fn token_stream_round_trip() {
 
 #[tokio::test]
 async fn replay_tokens_serves_recorded_stream() {
-    use inference_simulator_rs::trace::{
-        TraceFinishReason, TraceMeta, TraceRecord, TraceWriter, write_trace,
-    };
+    use vllm_vcr::trace::{TraceFinishReason, TraceMeta, TraceRecord, TraceWriter, write_trace};
 
     // A two-record trace, written out of arrival order to prove the sim maps
     // replay indices through the canonical arrival ordering.

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VllmLine {
     /// Minor line, e.g. `"0.10"`. The grouping key the build matrix and image
-    /// tags use (`inference-sim:<simver>-vllm0.10`).
+    /// tags use (`vllm-vcr:<simver>-vllm0.10`).
     pub line: String,
     /// vLLM release tag, e.g. `"v0.10.1"`. Also the e2e frontend version and the
     /// string the handshake guard checks the peer against.
@@ -153,8 +153,9 @@ pub enum GoldenRole {
 pub struct GoldenEntry {
     /// vLLM line this golden validates; matches a [`VllmLine::line`].
     pub line: String,
-    /// Key within the private bucket (CI fetches `$CONFORMANCE_BUCKET/<bucket_path>`),
-    /// under the `conformance/` prefix, e.g. `conformance/0.23/sweep.jsonl.gz`.
+    /// Where the golden lives, fetched directly via sim-s3 by the conformance
+    /// runner. Either a full `s3://bucket/key` URI, or a bare key resolved under
+    /// `$CONFORMANCE_BUCKET` (e.g. `conformance/0.23/sweep.jsonl.gz`).
     pub bucket_path: String,
     /// Content hash. CI fetches and verifies the capture against this.
     pub sha256: String,

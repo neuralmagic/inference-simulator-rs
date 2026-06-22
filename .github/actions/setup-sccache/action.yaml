@@ -1,0 +1,63 @@
+name: "Setup sccache"
+description: "Configure sccache with the shared S3 backend"
+inputs:
+  role-arn:
+    description: "AWS role to assume for sccache S3 access"
+    required: true
+  bucket:
+    description: "S3 bucket for sccache objects"
+    required: true
+  region:
+    description: "AWS region for the sccache bucket"
+    required: true
+  key-prefix:
+    description: "S3 key prefix for this repository's sccache objects"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate sccache configuration
+      shell: bash
+      env:
+        SCCACHE_ROLE_ARN: ${{ inputs.role-arn }}
+        SCCACHE_BUCKET: ${{ inputs.bucket }}
+        SCCACHE_REGION: ${{ inputs.region }}
+        SCCACHE_S3_KEY_PREFIX: ${{ inputs.key-prefix }}
+      run: |
+        set -euo pipefail
+        test -n "$SCCACHE_ROLE_ARN" || { echo "SCCACHE_ROLE_ARN is required"; exit 1; }
+        test -n "$SCCACHE_BUCKET" || { echo "SCCACHE_BUCKET is required"; exit 1; }
+        test -n "$SCCACHE_REGION" || { echo "SCCACHE_REGION is required"; exit 1; }
+        test -n "$SCCACHE_S3_KEY_PREFIX" || { echo "SCCACHE_S3_KEY_PREFIX is required"; exit 1; }
+
+    - name: Configure AWS credentials for sccache
+      uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.region }}
+
+    - name: Export sccache environment
+      shell: bash
+      env:
+        SCCACHE_BUCKET: ${{ inputs.bucket }}
+        SCCACHE_REGION: ${{ inputs.region }}
+        SCCACHE_S3_KEY_PREFIX: ${{ inputs.key-prefix }}
+      run: |
+        set -euo pipefail
+        {
+          echo "RUSTC_WRAPPER=sccache"
+          echo "SCCACHE_BUCKET=${SCCACHE_BUCKET}"
+          echo "SCCACHE_REGION=${SCCACHE_REGION}"
+          echo "SCCACHE_S3_KEY_PREFIX=${SCCACHE_S3_KEY_PREFIX}"
+          echo "SCCACHE_S3_USE_SSL=true"
+          echo "SCCACHE_S3_RW_MODE=READ_WRITE"
+          echo "SCCACHE_LOG=warn"
+          echo "SCCACHE_ERROR_LOG=${RUNNER_TEMP}/sccache.log"
+        } >> "$GITHUB_ENV"
+        echo "Configured sccache S3 backend for prefix ${SCCACHE_S3_KEY_PREFIX}"
+
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+      with:
+        version: "v0.16.0"

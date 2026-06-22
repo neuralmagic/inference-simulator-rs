@@ -5,11 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "Engine-core recording tap: a transparent ZMQ proxy between a real vLLM frontend and engine-core that records per-request timing into a JSONL trace."
-
-[[bin]]
-name = "inference-sim-tap"
-path = "src/bin/inference_sim_tap.rs"
 
 [dependencies]
 sim-trace = { workspace = true }
@@ -18,18 +15,11 @@ sim-compat = { workspace = true }
 vllm-engine-core-client = { workspace = true }
 
 anyhow = { workspace = true }
+# Only for the TokenRecording ValueEnum that the record front-end parses.
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 zeromq = { workspace = true }
-
-[dev-dependencies]
-# The tap's e2e test drives the simulator itself as the "real engine" behind
-# the tap, so it needs the root crate. Root never depends on sim-tap, so this
-# introduces no cycle.
-inference-simulator-rs = { path = "../.." }
-futures = { workspace = true }

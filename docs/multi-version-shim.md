@@ -30,7 +30,7 @@ the **same** source ("patches must point to different sources"). So the per-line
 rev is swapped in `[workspace.dependencies]`, not via `--config patch`. `build.rs`
 cannot do it either: dependency resolution happens before any build script runs.
 
-`ci/pin-vllm-rev.py <line>` reads `compat.toml` and rewrites `Cargo.toml`: it sets
+`cargo xtask pin-vllm <line>` reads `compat.toml` and rewrites `Cargo.toml`: it sets
 the `vllm-engine-core-client` rev to the line's `protocol_rev`, and inserts,
 rewrites, or removes the fork `[patch]` to match the line's `patch_repo`/`patch_rev`
 (a fork is a *different* source, so it is allowed to `[patch]`). The committed
@@ -46,7 +46,7 @@ block first, so it's idempotent. After the rewrite the rev no longer matches
 older-line build must too:
 
 ```sh
-python3 ci/pin-vllm-rev.py 0.22
+cargo xtask pin-vllm 0.22
 VLLM_TARGET_VERSION=v0.22.1 cargo build --workspace   # no --locked
 ```
 
@@ -93,9 +93,9 @@ The matrix runs per line (see `ci.yml`):
 - `cargo test --test conformance` — the conformance runner (skips until goldens).
 
 The full-stack e2e integration tests (`tests/engine_core_e2e.rs`,
-`crates/sim-tap/tests/tap_e2e.rs`) drive the *real* `EngineCoreClient`, whose API
-is incomplete on older lines, so they are HEAD-client-targeted and run on the
-default line via the `build-and-test` job, not per matrix leg. The lora lifecycle
+`tests/tap_e2e.rs`) drive the *real* `EngineCoreClient`, whose API
+is incomplete on older lines, so they target the default line via the
+`build-and-test` job, not each matrix leg. The lora lifecycle
 e2e test is `#[cfg(vllm_lora_typed)]` so the workspace still compiles tests on
 lines that have the typed client.
 
@@ -104,8 +104,10 @@ lines that have the typed client.
 - **nightly** (`nightly`): tracks vLLM main, `protocol_rev` is the latest post-merge
   commit (bumped regularly). No fork (main carries everything). build.rs treats the
   non-`vX.Y` tag as the newest line, so all capability cfgs are on. It exists to catch
-  wire drift before a release lands: the day a main commit breaks the protocol, the
-  nightly build/conformance leg goes red. `fidelity_validated = false`.
+  wire drift before a release lands: the live-HEAD nightly canary pins to upstream
+  `main`, builds, runs unit tests, runs the HEAD-client protocol e2e suite, and runs
+  the conformance runner. `fidelity_validated = false` because nightly has no golden
+  capture set yet.
 - **0.23** (`v0.23.0`, default): builds against upstream `17bc1445`, unit tests +
   conformance green. No fork (`#45848` is upstream here).
 - **0.22** (`v0.22.1`): library + bins + unit tests + conformance all build; the
@@ -130,7 +132,7 @@ bump. The fix is `vllm-project/vllm#45848` backported onto the 0.22 base:
 - it adds the field defaults (temperature/top_p/repetition_penalty=1.0,
   max_tokens=16, the rest zero/None/empty) and nothing else.
 - both the 0.21 and 0.22 lines carry it via `patch_repo`/`patch_rev` in
-  `compat.toml`; `ci/pin-vllm-rev.py` inserts the `[patch]` block per leg (the
+  `compat.toml`; `cargo xtask pin-vllm` inserts the `[patch]` block per leg (the
   committed `Cargo.toml` has none, since the default line builds upstream).
 
 ## Follow-ups

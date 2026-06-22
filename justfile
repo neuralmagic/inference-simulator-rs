@@ -1,4 +1,4 @@
-# inference-simulator-rs task runner.
+# vllm-vcr task runner.
 #
 # The capture workflow end to end:
 #   just image-build && just image-push     # tap/frontend image (linux/amd64)
@@ -9,7 +9,7 @@
 #   just calibrate /tmp/trace-capture-h200/tap-trace.jsonl
 #   just plots /tmp/trace-capture-h200/tap-trace.jsonl docs/images
 
-image := env_var_or_default("IMAGE", "ghcr.io/neuralmagic/inference-simulator-rs:dev")
+image := env_var_or_default("IMAGE", "ghcr.io/neuralmagic/vllm-vcr:dev")
 namespace := env_var_or_default("NAMESPACE", "inference-sim")
 deploy := "trace-capture-h200"
 
@@ -33,23 +33,15 @@ image-build:
     podman build --platform linux/amd64 -t {{image}} .
 
 # Build the capture image for a specific compat.toml line, e.g. `just image-build-line 0.22`.
-# Pins Cargo.toml to the line's rev/fork via ci/pin-vllm-rev.py (leaves the tree dirty;
-# restore with `git checkout Cargo.toml Cargo.lock`), stamps VLLM_TARGET_VERSION for build.rs,
+# Pins Cargo.toml/Cargo.lock to the line's rev/fork, stamps VLLM_TARGET_VERSION for build.rs,
 # and builds the vllm-rs frontend from the same source as the tap. Tags as <image>-vllm<line>.
 # amd64 only; on Apple Silicon prefer a native remote builder over local emulation.
 image-build-line line:
     #!/usr/bin/env bash
     set -euo pipefail
-    python3 ci/pin-vllm-rev.py "{{line}}"
-    eval "$(python3 - "{{line}}" <<'PY'
-    import sys, tomllib
-    line = sys.argv[1]
-    v = next(x for x in tomllib.load(open("compat.toml", "rb"))["vllm"] if x["line"] == line)
-    repo = v.get("patch_repo") or "https://github.com/vllm-project/vllm.git"
-    ref = v.get("patch_rev") or v["protocol_rev"]
-    print(f'TAG={v["tag"]}; FREPO={repo}; FREF={ref}')
-    PY
-    )"
+    cargo xtask pin-vllm "{{line}}"
+    cargo update -p vllm-engine-core-client
+    eval "$(cargo xtask frontend-args "{{line}}")"
     podman build --platform linux/amd64 \
         --build-arg VLLM_TARGET_VERSION="$TAG" \
         --build-arg VLLM_REPO="$FREPO" \
@@ -97,15 +89,15 @@ conformance-queue:
 conformance-list:
     python3 deploy/trace-capture/gen-capture-jobs.py --list
 
-# Submit a conformance capture Job, e.g. `just conformance-capture qwen3-8b`. Ships the
+# Submit conformance capture Job(s), e.g. `just conformance-capture qwen3-8b`. Ships the
 # loadgen scripts as a configmap, then applies the generated Job (Kueue holds it until a
 # GPU is free, so it's safe to submit several; they run one at a time).
-conformance-capture name:
+conformance-capture +names:
     kubectl create configmap validation-scripts -n {{namespace}} \
         --from-file=loadgen.py=deploy/trace-capture/loadgen.py \
         --from-file=runner.sh=deploy/trace-capture/validation-runner.sh \
         --dry-run=client -o yaml | kubectl apply -f -
-    python3 deploy/trace-capture/gen-capture-jobs.py {{name}} | kubectl apply -f -
+    python3 deploy/trace-capture/gen-capture-jobs.py {{names}} | kubectl apply -f -
 
 # --- agentic capture + offline replay (docs/agentic-offline-replay.md) -------------
 
@@ -121,7 +113,7 @@ agentic-capture-fetch out="/tmp/agentic-tap-trace.jsonl":
     kubectl -n {{namespace}} exec deploy/trace-capture-h200-agentic -c tap -- cat /trace/trace.jsonl > {{out}}
     @wc -l {{out}}
 
-# Offline replay rig: python frontend + inference-sim, zero GPU (then: replay-load-trace).
+# Offline replay rig: python frontend + vllm-vcr play, zero GPU (then: replay-load-trace).
 replay-up:
     kubectl apply -f deploy/trace-capture/offline-replay.yaml
 
@@ -145,11 +137,11 @@ replay-load-trace trace:
 
 # Summarize a trace (per-concurrency TTFT/ITL quantiles).
 summarize trace:
-    cargo run --release --bin inference-sim-trace -- summarize {{trace}}
+    cargo run --release --bin vllm-vcr -- inspect summarize {{trace}}
 
 # Model-level calibration: source vs replay vs knob-fit, request-total gate.
 calibrate trace:
-    cargo run --release --bin inference-sim-trace -- calibrate {{trace}}
+    cargo run --release --bin vllm-vcr -- inspect calibrate {{trace}}
 
 # Rebuild every README/deck figure from the committed traces (~30 min: the
 # arrival replays run in real time). sim-comparison.png is the one exception;
@@ -161,7 +153,7 @@ figures out_dir="docs/images":
 # The calibrate verdict may fail on real loaded traces: the TTFT marginal is
 # engine-mechanical (queueing), gated wire-level by `just replay`, not here.
 plots trace out_dir="docs/images":
-    -cargo run --release --bin inference-sim-trace -- calibrate {{trace}} \
+    -cargo run --release --bin vllm-vcr -- inspect calibrate {{trace}} \
         --dump-samples /tmp/calib-samples.json
     uv run scripts/plot_calibration.py --samples /tmp/calib-samples.json \
         --trace {{trace}} --out-dir {{out_dir}}
@@ -175,7 +167,7 @@ compare +labeled_traces:
 
 # Open-loop arrival replay against a captured schedule (runs in real time).
 replay trace latency_trace tolerance="0.10":
-    cargo run --release --bin inference-sim-trace -- calibrate-e2e {{trace}} \
+    cargo run --release --bin vllm-vcr -- inspect calibrate-e2e {{trace}} \
         --replay-arrivals --latency-trace {{latency_trace}} --tolerance {{tolerance}}
 
 # Apply the rig with the engine's prefix cache DISABLED (counterfactual capture).
@@ -192,10 +184,11 @@ conformance-status:
     kubectl -n {{namespace}} get pods -l llm-d.ai/guide=trace-capture
     -kubectl -n {{namespace}} logs -l llm-d.ai/guide=trace-capture -c loadgen --tail=2 --prefix
 
-# Fetch a job's tap trace and release it (job completes, GPU freed).
+# Fetch a job's tap trace, optional step stats, and release it (job completes, GPU freed).
 # e.g. `just conformance-fetch trace-qwen3-8b /tmp/qwen3-8b.jsonl`.
 conformance-fetch job out:
     kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- cat /trace/trace.jsonl > {{out}}
+    -kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- cat /trace/step-stats.jsonl > {{out}}.step-stats.jsonl
     -kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- sh -c 'for f in /trace/marker-*; do echo "$f=$(cat $f)"; done'
     kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- touch /trace/fetched
     @wc -l {{out}}

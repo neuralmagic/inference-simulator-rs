@@ -1,0 +1,125 @@
+name: Nightly Golden Capture
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Space-separated deploy/trace-capture/models.toml capture targets"
+        type: string
+        required: false
+        default: "nightly-qwen3-8b-mt-s7 nightly-qwen3-8b-mt-s13 nightly-qwen3-8b-nocache-s7"
+      namespace:
+        description: "Kubernetes namespace for capture jobs"
+        type: string
+        required: false
+        default: "inference-sim"
+      cleanup:
+        description: "Delete capture Jobs at the end of the workflow"
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: nightly-golden-capture
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+  S3_BUCKET: llm-d-artifacts-783952637884
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      - uses: ./.github/actions/setup-sccache
+        with:
+          role-arn: ${{ vars.SCCACHE_ROLE_ARN }}
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          region: ${{ vars.SCCACHE_REGION }}
+          key-prefix: ${{ vars.SCCACHE_S3_KEY_PREFIX }}
+
+      - name: Validate capture configuration
+        env:
+          CLUSTER_URL: ${{ vars.CONFORMANCE_CLUSTER_URL }}
+          CAPTURE_ROLE_ARN: ${{ vars.CONFORMANCE_CAPTURE_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          test -n "$CLUSTER_URL" || { echo "Set repository variable CONFORMANCE_CLUSTER_URL"; exit 1; }
+          test -n "$CAPTURE_ROLE_ARN" || { echo "Set repository variable CONFORMANCE_CAPTURE_ROLE_ARN"; exit 1; }
+          echo "Required conformance capture repository variables are present"
+
+      - name: Install kubectl and jq
+        run: |
+          set -euo pipefail
+          echo "Installing jq and kubectl"
+          sudo apt-get update
+          sudo apt-get install -y jq
+          version="$(curl -L -s https://dl.k8s.io/release/stable.txt)"
+          echo "Resolved kubectl ${version}"
+          curl -sSLo kubectl "https://dl.k8s.io/release/${version}/bin/linux/amd64/kubectl"
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+          kubectl version --client
+          jq --version
+
+      - name: Authenticate to conformance cluster
+        uses: ./.github/actions/setup-cluster-auth
+        with:
+          cluster-url: ${{ vars.CONFORMANCE_CLUSTER_URL }}
+
+      - name: Configure AWS credentials for golden upload
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        with:
+          role-to-assume: ${{ vars.CONFORMANCE_CAPTURE_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Run capture jobs and update manifest
+        env:
+          TARGETS: ${{ inputs.targets || 'nightly-qwen3-8b-mt-s7 nightly-qwen3-8b-mt-s13 nightly-qwen3-8b-nocache-s7' }}
+          NAMESPACE: ${{ inputs.namespace || 'inference-sim' }}
+          OUT_DIR: ${{ runner.temp }}/nightly-goldens
+          S3_BUCKET: ${{ env.S3_BUCKET }}
+        run: bash ci/capture-nightly-goldens.sh
+
+      - name: Show manifest diff
+        run: git diff -- conformance/manifest.toml
+
+      - name: Open or update manifest PR
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          add-paths: conformance/manifest.toml
+          branch: auto/nightly-goldens
+          delete-branch: true
+          commit-message: "conformance: refresh nightly goldens"
+          title: "conformance: refresh nightly goldens"
+          body: "Refresh nightly conformance goldens."
+
+      - name: Cleanup capture jobs
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.cleanup) }}
+        env:
+          TARGETS: ${{ inputs.targets || 'nightly-qwen3-8b-mt-s7 nightly-qwen3-8b-mt-s13 nightly-qwen3-8b-nocache-s7' }}
+          NAMESPACE: ${{ inputs.namespace || 'inference-sim' }}
+        run: |
+          set -euo pipefail
+          echo "Cleaning up capture jobs in namespace ${NAMESPACE}"
+          for target in $TARGETS; do
+            echo "Deleting job trace-${target}"
+            kubectl delete job -n "$NAMESPACE" "trace-${target}" --ignore-not-found --wait=false || true
+          done

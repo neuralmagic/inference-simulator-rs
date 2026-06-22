@@ -1,0 +1,9 @@
+# Pin the toolchain so local builds, CI, and release artifacts all compile with
+# the same rustc. actions-rust-lang/setup-rust-toolchain reads this file when no
+# explicit `toolchain:` input is set (the case across our workflows), so CI tracks
+# it automatically. Bump deliberately; this is distinct from the MSRV
+# (`rust-version = "1.85"` in Cargo.toml), which is the floor we promise to build on.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

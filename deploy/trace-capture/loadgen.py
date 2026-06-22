@@ -334,7 +334,7 @@ async def main() -> None:
     p.add_argument("--out", required=True)
     p.add_argument(
         "--trace-out",
-        help="also append records in the inference-sim trace JSONL schema "
+        help="also append records in the vllm-vcr trace JSONL schema "
         "(client-side measurements; writes a meta line if the file is new)",
     )
     args = p.parse_args()

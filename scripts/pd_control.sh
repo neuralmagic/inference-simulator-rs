@@ -19,7 +19,7 @@ ENGINE_ID="${ENGINE_ID:-mock-prefill-0}"
 FRONTEND_BIN="${FRONTEND_BIN:-$HOME/git/vllm-main/rust/target/debug/vllm-rs}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENGINE_BIN="$REPO_ROOT/target/debug/inference-sim"
+ENGINE_BIN="$REPO_ROOT/target/debug/vllm-vcr"
 BASE_URL="http://127.0.0.1:${HTTP_PORT}"
 LOG_DIR="$(mktemp -d)"
 
@@ -35,7 +35,7 @@ echo "logs: $LOG_DIR"
 "$FRONTEND_BIN" serve "$MODEL" --data-parallel-size 1 --data-parallel-size-local 0 \
     --handshake-port "$HANDSHAKE_PORT" --port "$HTTP_PORT" >"$LOG_DIR/frontend.log" 2>&1 &
 fpid=$!
-"$ENGINE_BIN" --handshake-address "tcp://127.0.0.1:${HANDSHAKE_PORT}" \
+"$ENGINE_BIN" play --handshake-address "tcp://127.0.0.1:${HANDSHAKE_PORT}" \
     --engine-id "$ENGINE_ID" --side-channel-host 127.0.0.1 --side-channel-port 5600 \
     --log-requests >"$LOG_DIR/engine.log" 2>&1 &
 epid=$!

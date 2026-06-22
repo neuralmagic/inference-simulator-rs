@@ -23,7 +23,7 @@ FIT="$WORK/fit.jsonl"
 PLOT=(uv run scripts/plot_calibration.py)
 
 cargo build --release -q
-BIN=target/release/inference-sim-trace
+BIN=target/release/vllm-vcr
 
 # The H200 capture rig's scheduler/cache config, mirrored by the step-model
 # replays (the local-sim captures ran engine defaults instead).
@@ -47,12 +47,12 @@ replay() {
     echo "==> replay $name ($tap)"
     # The verdict gates at 10% on worst-quantile cells; small-n tails can
     # exceed that while medians and totals agree, so don't abort the build.
-    "$BIN" calibrate-e2e "$tap" --replay-arrivals --latency-trace "$FIT" \
+    "$BIN" inspect calibrate-e2e "$tap" --replay-arrivals --latency-trace "$FIT" \
         --dump-trace "$WORK/$name.jsonl" "$@" || true
 }
 
 echo "==> in-sample ITL fidelity + per-token-vs-mean (model level)"
-"$BIN" calibrate "$H8/h200-qwen3-tap-trace.jsonl" --dump-samples "$WORK/samples.json" || true
+"$BIN" inspect calibrate "$H8/h200-qwen3-tap-trace.jsonl" --dump-samples "$WORK/samples.json" || true
 "${PLOT[@]}" --samples "$WORK/samples.json" \
     --trace "$H8/h200-qwen3-tap-trace.jsonl" --out-dir "$OUT"
 

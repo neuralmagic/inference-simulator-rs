@@ -10,7 +10,7 @@
 # Layout:
 #   vllm-rs serve --data-parallel-size-local 0   (binds handshake, waits for engine)
 #        │  ZMQ + msgpack engine-core protocol
-#   inference-simulator-rs --handshake-address ...      (our backend, fakes the model)
+#   vllm-vcr play --handshake-address ...      (our backend, fakes the model)
 #
 # Override any of these via env:
 set -euo pipefail
@@ -22,7 +22,7 @@ HTTP_PORT="${HTTP_PORT:-8000}"
 FRONTEND_BIN="${FRONTEND_BIN:-$HOME/git/vllm-main/rust/target/debug/vllm-rs}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENGINE_BIN="$REPO_ROOT/target/debug/inference-sim"
+ENGINE_BIN="$REPO_ROOT/target/debug/vllm-vcr"
 BASE_URL="http://${HTTP_HOST}:${HTTP_PORT}"
 LOG_DIR="$(mktemp -d)"
 
@@ -63,7 +63,7 @@ frontend_pid=$!
 
 # 2. Our engine: connects as the headless DP engine and completes the handshake.
 echo "starting mock engine ..."
-"$ENGINE_BIN" \
+"$ENGINE_BIN" play \
     --handshake-address "tcp://127.0.0.1:${HANDSHAKE_PORT}" \
     --log-requests \
     >"$LOG_DIR/engine.log" 2>&1 &

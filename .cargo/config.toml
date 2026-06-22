@@ -1,0 +1,5 @@
+[alias]
+# `cargo xtask <cmd>` runs the repo's Rust helper tasks (compat-matrix
+# generation, Cargo.toml vLLM pinning, ...). --quiet keeps stdout to the
+# command's own output so CI can capture it directly.
+xtask = "run --quiet --package xtask --"

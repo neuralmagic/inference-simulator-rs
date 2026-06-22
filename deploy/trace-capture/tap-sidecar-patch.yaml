@@ -29,7 +29,7 @@ spec:
       containers:
         - name: tap
           image: quay.io/wseaton/mock-engine-nixl:trace-capture-v8
-          command: ["/usr/local/bin/inference-sim-tap"]
+          command: ["/usr/local/bin/vllm-vcr", "record"]
           # Addresses default to the sidecar convention: frontend handshake
           # tcp://127.0.0.1:5570, engine handshake tcp://127.0.0.1:5580 (plus
           # tap-bound :29560/:29561 data sockets). Override with

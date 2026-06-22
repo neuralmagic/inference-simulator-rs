@@ -5,7 +5,7 @@
 //!   2. `KnobLatency` structurally cannot reproduce heavy tails: its `[0.3*mean, 1.7*mean]`
 //!      clamp caps p99/p50 at roughly 1.7 for any knob settings.
 //!
-//! Four entry points, each exposed on the `inference-sim-trace` binary:
+//! Four entry points, each exposed under the `vllm-vcr inspect` subcommand:
 //!   - `gen_demo`: synthesize a heavy-tailed demo trace (lognormal TTFT/ITL).
 //!   - `calibrate`: model-level quantile comparison (source vs replay vs knob-fit).
 //!   - `calibrate_e2e`: wire-level proof using the real simulator in-process.
@@ -1259,7 +1259,6 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use clap::Parser as _;
     use tokio_util::sync::CancellationToken;
     use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
     use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
@@ -1308,7 +1307,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
         cfg.ipc_tag
     );
     let mut args: Vec<String> = vec![
-        "inference-sim".to_string(),
+        "play".to_string(),
         "--handshake-address".to_string(),
         addr.clone(),
     ];

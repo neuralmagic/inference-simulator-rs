@@ -6,9 +6,9 @@ name: Docker
 # and manual dispatch (all trusted refs).
 #
 # Per-line tagging (docs/versioning.md "Versioning"):
-#   inference-sim:<simver>-vllm<line>   immutable, the real artifact (sim ver x vLLM line)
-#   inference-sim:vllm<line>            floating, -> latest sim for that line
-#   inference-sim:latest                sim-head x the default=true line only
+#   vllm-vcr:<simver>-vllm<line>   immutable, the real artifact (sim ver x vLLM line)
+#   vllm-vcr:vllm<line>            floating, -> latest sim for that line
+#   vllm-vcr:latest                sim-head x the default=true line only
 on:
   push:
     branches: [main]
@@ -34,50 +34,24 @@ jobs:
       include: ${{ steps.parse.outputs.include }}
       simver: ${{ steps.simver.outputs.simver }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      - name: Parse compat.toml into a build matrix
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      # `cargo xtask docker-matrix` emits one row per compat.toml line, carrying
+      # the fork override (patch_repo/patch_rev, "" when the line builds upstream)
+      # so the tap and the vllm-rs frontend stay wire-identical.
+      - name: Build matrix from compat.toml
         id: parse
-        run: |
-          include=$(python3 - <<'PY'
-          import json, tomllib
-          with open("compat.toml", "rb") as f:
-              compat = tomllib.load(f)
-          rows = []
-          for v in compat.get("vllm", []):
-              rows.append({
-                  "line": v["line"],
-                  "tag": v["tag"],
-                  "protocol_rev": v["protocol_rev"],
-                  # Fork override (a DIFFERENT source than vllm.git) or "" when the
-                  # line builds upstream. Both the tap (via pin-vllm-rev.py) and the
-                  # vllm-rs frontend below build against the fork when set, so they
-                  # stay wire-identical.
-                  "patch_repo": v.get("patch_repo", ""),
-                  "patch_rev": v.get("patch_rev", ""),
-                  "fidelity_validated": bool(v.get("fidelity_validated", False)),
-                  "default": bool(v.get("default", False)),
-              })
-          print(json.dumps(rows, separators=(",", ":")))
-          PY
-          )
-          echo "include=${include}" >> "$GITHUB_OUTPUT"
+        run: echo "include=$(cargo xtask docker-matrix)" >> "$GITHUB_OUTPUT"
 
       # Sim semver is build metadata orthogonal to the vLLM line (docs/versioning.md
-      # "keep the two axes orthogonal"). Read it from [workspace.package].version.
+      # "keep the two axes orthogonal").
       - name: Read sim semver from Cargo.toml
         id: simver
-        run: |
-          simver=$(python3 - <<'PY'
-          import tomllib
-          with open("Cargo.toml", "rb") as f:
-              cargo = tomllib.load(f)
-          print(cargo["workspace"]["package"]["version"])
-          PY
-          )
-          echo "simver=${simver}" >> "$GITHUB_OUTPUT"
+        run: echo "simver=$(cargo xtask simver)" >> "$GITHUB_OUTPUT"
 
   build-push:
     needs: compat-matrix
@@ -92,13 +66,15 @@ jobs:
       # The vllm-rs frontend baked into the image must speak the same wire as the
       # tap, so it's built from this line's source: the fork when the line has one,
       # else upstream vllm.git at protocol_rev. (The tap itself is pinned by
-      # pin-vllm-rev.py below.)
+      # cargo xtask pin-vllm below.)
       FRONTEND_REPO: ${{ matrix.patch_repo != '' && matrix.patch_repo || 'https://github.com/vllm-project/vllm.git' }}
       FRONTEND_REF: ${{ matrix.patch_rev != '' && matrix.patch_rev || matrix.protocol_rev }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
 
       - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
@@ -112,11 +88,12 @@ jobs:
       # Pin the workspace Cargo.toml to this line's rev + fork patch BEFORE the build
       # context is sent. Cargo rejects patching a git dep to a different rev of the
       # same source, so the rev is swapped in [workspace.dependencies] and the fork
-      # [patch] inserted/removed here (see ci/pin-vllm-rev.py). The Dockerfile then
-      # compiles the rewritten manifest without --locked. This replaces the old
-      # CARGO_PATCH build-arg, which used the rejected --config mechanism.
+      # [patch] inserted/removed here (see cargo xtask pin-vllm), then Cargo.lock is
+      # refreshed so the Docker context carries the real pinned client.
       - name: Pin vLLM rev (line ${{ matrix.line }})
-        run: python3 ci/pin-vllm-rev.py "${{ matrix.line }}"
+        run: |
+          cargo xtask pin-vllm "${{ matrix.line }}"
+          cargo update -p vllm-engine-core-client
 
       # Per-line tag set. The immutable <simver>-vllm<line> and the floating vllm<line>
       # always ship; :latest only attaches to the default=true line on the default branch.

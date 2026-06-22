@@ -15,15 +15,14 @@
 
 use std::time::Duration;
 
-use clap::Parser as _;
 use futures::StreamExt;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 
-use inference_simulator_rs::trace::{TraceRecord, read_trace_file};
-use inference_simulator_rs::{Opt, run};
+use vllm_vcr::trace::{TraceRecord, read_trace_file};
+use vllm_vcr::{Opt, run};
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -65,7 +64,7 @@ async fn replay_fixture(fixture: &str, requests: usize) -> (Vec<TraceRecord>, Ve
         fixture.len(),
     );
     let args = vec![
-        "inference-sim",
+        "play",
         "--handshake-address",
         &addr,
         "--latency-trace",

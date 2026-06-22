@@ -17,7 +17,7 @@ MAX_TOKENS="${MAX_TOKENS:-8}"
 FRONTEND_BIN="${FRONTEND_BIN:-$HOME/git/vllm-main/rust/target/debug/vllm-rs}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENGINE_BIN="$REPO_ROOT/target/debug/inference-sim"
+ENGINE_BIN="$REPO_ROOT/target/debug/vllm-vcr"
 BASE_URL="http://${HTTP_HOST}:${HTTP_PORT}"
 LOG_DIR="$(mktemp -d)"
 
@@ -56,7 +56,7 @@ echo "starting frontend ($MODEL) ..."
 frontend_pid=$!
 
 echo "starting mock engine ..."
-"$ENGINE_BIN" \
+"$ENGINE_BIN" play \
     --handshake-address "tcp://127.0.0.1:${HANDSHAKE_PORT}" \
     --log-requests \
     >"$LOG_DIR/engine.log" 2>&1 &

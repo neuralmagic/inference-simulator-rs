@@ -10,9 +10,9 @@
 
 use std::time::Duration;
 
-use inference_simulator_rs::blockpool::KvCacheEvent;
-use inference_simulator_rs::kvevents::{KvEventsConfig, spawn};
 use tokio_util::sync::CancellationToken;
+use vllm_vcr::blockpool::KvCacheEvent;
+use vllm_vcr::kvevents::{KvEventsConfig, spawn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

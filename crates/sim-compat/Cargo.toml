@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "Parsing for compat.toml (the vLLM support window) and the conformance golden manifest. vLLM-protocol-free so it can be used from build scripts, the runtime version guard, and the conformance runner."
 
 [dependencies]

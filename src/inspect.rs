@@ -1,5 +1,5 @@
-//! CLI for converting benchmark reports to the inference-sim trace format,
-//! summarizing existing traces, and running calibration comparisons.
+//! `vllm-vcr inspect`: convert benchmark reports to the trace format, summarize
+//! existing traces, render Perfetto views, and run calibration comparisons.
 
 use std::fs;
 use std::io::{self, BufWriter, Write as _};
@@ -7,26 +7,19 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use inference_simulator_rs::calibrate::{self, PromptReplay, SessionPacing, SimDriver};
-use inference_simulator_rs::trace::{TraceWriter, open_trace_reader, read_trace_file};
-use inference_simulator_rs::trace_convert::{
+use clap::Subcommand;
+use sim_s3::TraceUri;
+use vllm_vcr::calibrate::{self, PromptReplay, SessionPacing, SimDriver};
+use vllm_vcr::perfetto::{Overlays, PerfettoOptions, write_perfetto};
+use vllm_vcr::step_stats::{read_step_stats, step_spans, step_stats_counters};
+use vllm_vcr::trace::{TraceWriter, open_trace_reader, read_trace_file};
+use vllm_vcr::trace_convert::{
     ConvertOptions, convert_guidellm, summarize_trace, write_conversion, write_summary,
 };
 
-#[derive(Parser)]
-#[command(
-    name = "inference-sim-trace",
-    about = "Convert benchmark reports to inference-sim trace format, summarize traces, and run calibration."
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
 /// Output format for calibration reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-enum ReportFormat {
+pub(crate) enum ReportFormat {
     /// Human-readable text report.
     #[default]
     Text,
@@ -36,7 +29,7 @@ enum ReportFormat {
 
 /// Magnitude profile for the synthesized demo trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-enum DemoProfile {
+pub(crate) enum DemoProfile {
     /// Realistic magnitudes (TTFT ~50-400ms, ITL ~10-60ms).
     #[default]
     Realistic,
@@ -46,7 +39,7 @@ enum DemoProfile {
 
 /// Which e2e harness runs: closed-loop sampled batches or open-loop arrival replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-enum E2eHarness {
+pub(crate) enum E2eHarness {
     /// Sample N requests and drive them closed-loop.
     #[default]
     Sampled,
@@ -56,8 +49,8 @@ enum E2eHarness {
 }
 
 #[derive(Subcommand)]
-enum Command {
-    /// Convert a guidellm benchmark report (JSON) to an inference-sim trace (JSONL).
+pub(crate) enum InspectCommand {
+    /// Convert a guidellm benchmark report (JSON) to a vllm-vcr trace (JSONL).
     FromGuidellm {
         /// Path to the guidellm report JSON file.
         input: PathBuf,
@@ -76,8 +69,41 @@ enum Command {
     },
     /// Print summary statistics from an existing trace file.
     Summarize {
-        /// Path to the JSONL trace file.
-        input: PathBuf,
+        /// Path or `s3://bucket/key` URI to the JSONL trace file.
+        input: TraceUri,
+    },
+    /// Convert a trace into the Chrome Trace Event Format (drop the output on
+    /// <https://ui.perfetto.dev> to view request spans over a concurrency
+    /// counter). Reads `.gz` traces transparently.
+    Perfetto {
+        /// Path or `s3://bucket/key` URI to the JSONL trace file (`.gz` ok).
+        input: TraceUri,
+        /// Output JSON path or `s3://bucket/key` URI. Defaults to stdout when
+        /// omitted (or no stdout dump when `--open` is set).
+        #[arg(short, long)]
+        output: Option<TraceUri>,
+        /// Step-stats sidecar (`--step-stats-out` from the tap, `.gz` ok, path
+        /// or `s3://` URI) to overlay as batch-level counter tracks: scheduler
+        /// queue depths, KV-cache usage, and spec-decode acceptance rate.
+        #[arg(long)]
+        step_stats: Option<TraceUri>,
+        /// Override the process-row label (defaults to the trace's model).
+        #[arg(long)]
+        name: Option<String>,
+        /// Give every request its own track instead of packing them into
+        /// reusable lanes (peak-concurrency rows). Handy for small traces.
+        #[arg(long)]
+        track_per_request: bool,
+        /// Serve the trace over localhost and open it in the Perfetto UI. Blocks
+        /// (the UI fetches from this process) until Ctrl-C.
+        #[arg(long)]
+        open: bool,
+        /// Port for `--open`'s local server. Defaults to 0, letting the OS
+        /// pick a free ephemeral port (the actual URL is printed and opened),
+        /// so concurrent or just-restarted servers never collide. Pin it only
+        /// when you want a stable URL.
+        #[arg(long, default_value_t = 0)]
+        port: u16,
     },
     /// Synthesize a heavy-tailed demo trace for calibration testing.
     GenDemo {
@@ -225,11 +251,37 @@ enum Command {
     },
 }
 
-fn run() -> Result<ExitCode> {
-    let cli = Cli::parse();
+/// Local path for an input URI; fetches s3:// to scratch on a short-lived runtime.
+fn materialize_input(uri: &TraceUri) -> Result<PathBuf> {
+    if let Some(path) = uri.local_path() {
+        return Ok(path.to_path_buf());
+    }
+    block_on(uri.materialize(&std::env::temp_dir()))
+}
 
-    match cli.command {
-        Command::FromGuidellm {
+/// Write rendered bytes to an output URI: local files directly; s3:// staged to
+/// scratch and uploaded.
+fn write_output(bytes: &[u8], uri: &TraceUri) -> Result<()> {
+    let local = uri.write_path(&std::env::temp_dir());
+    fs::write(&local, bytes).with_context(|| format!("writing {}", local.display()))?;
+    if uri.is_remote() {
+        block_on(uri.upload(&local))?;
+    }
+    Ok(())
+}
+
+/// Run one async S3 op to completion on a fresh single-thread runtime.
+fn block_on<T>(fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime for S3 I/O")?
+        .block_on(fut)
+}
+
+pub(crate) fn run(command: InspectCommand) -> Result<ExitCode> {
+    match command {
+        InspectCommand::FromGuidellm {
             input,
             output,
             model,
@@ -248,7 +300,8 @@ fn run() -> Result<ExitCode> {
 
             eprintln!("wrote {} records to {}", records.len(), output.display());
         }
-        Command::Summarize { input } => {
+        InspectCommand::Summarize { input } => {
+            let input = materialize_input(&input)?;
             let reader = open_trace_reader(&input)?;
             let (meta, stats) = summarize_trace(reader)?;
 
@@ -256,7 +309,62 @@ fn run() -> Result<ExitCode> {
             let mut writer = BufWriter::new(stdout.lock());
             write_summary(&mut writer, &meta, &stats)?;
         }
-        Command::GenDemo {
+        InspectCommand::Perfetto {
+            input,
+            output,
+            step_stats,
+            name,
+            track_per_request,
+            open,
+            port,
+        } => {
+            let input = materialize_input(&input)?;
+            let (meta, records) = read_trace_file(&input)?;
+            let opts = PerfettoOptions {
+                process_name: name,
+                track_per_request,
+            };
+
+            // Optional sidecar overlays: batch-level counter tracks plus the
+            // step-centric step-span track (true per-step prefill/decode view).
+            let overlays = match step_stats {
+                Some(uri) => {
+                    let path = materialize_input(&uri)?;
+                    let reader = open_trace_reader(&path)?;
+                    let snapshots = read_step_stats(reader)?;
+                    Overlays {
+                        counters: step_stats_counters(&snapshots),
+                        steps: step_spans(&snapshots),
+                    }
+                }
+                None => Overlays::default(),
+            };
+
+            // Render once into memory, then route: save, serve, and/or dump.
+            let mut bytes = Vec::new();
+            let summary = write_perfetto(&mut bytes, &meta, &records, &overlays, &opts)?;
+
+            if let Some(uri) = &output {
+                write_output(&bytes, uri)?;
+                eprintln!("wrote {} events to {uri}", summary.events);
+            }
+            if summary.dropped_requests > 0 {
+                eprintln!(
+                    "note: {} of {} records had no arrival_ms and were dropped (cannot place on a timeline)",
+                    summary.dropped_requests,
+                    summary.placed_requests + summary.dropped_requests,
+                );
+            }
+
+            if open {
+                serve_perfetto(&bytes, port)?;
+            } else if output.is_none() {
+                io::stdout()
+                    .write_all(&bytes)
+                    .context("writing perfetto trace to stdout")?;
+            }
+        }
+        InspectCommand::GenDemo {
             output,
             records,
             seed,
@@ -269,7 +377,7 @@ fn run() -> Result<ExitCode> {
             calibrate::write_demo_trace(&output, &meta, &recs)?;
             eprintln!("wrote {} records to {}", recs.len(), output.display());
         }
-        Command::Calibrate {
+        InspectCommand::Calibrate {
             trace,
             samples,
             seed,
@@ -295,7 +403,7 @@ fn run() -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
-        Command::CalibrateE2e {
+        InspectCommand::CalibrateE2e {
             trace,
             requests,
             seed,
@@ -337,16 +445,12 @@ fn run() -> Result<ExitCode> {
                     outcome.max_send_lag_ms,
                 );
                 if let Some(dump_path) = dump_trace {
-                    let meta = inference_simulator_rs::trace::TraceMeta {
+                    let meta = vllm_vcr::trace::TraceMeta {
                         source: Some("replay-arrivals".to_string()),
                         ..Default::default()
                     };
                     let mut writer = TraceWriter::create(&dump_path)?;
-                    inference_simulator_rs::trace::write_trace(
-                        &mut writer,
-                        &meta,
-                        &outcome.measured,
-                    )?;
+                    vllm_vcr::trace::write_trace(&mut writer, &meta, &outcome.measured)?;
                     writer.finish()?;
                     eprintln!(
                         "wrote {} measured records to {}",
@@ -374,6 +478,91 @@ fn run() -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Serve the rendered trace bytes over localhost (CORS-open so the hosted
+/// Perfetto UI can fetch them) and open the UI deep-linked to it. The UI pulls
+/// the file from this process, so we stay up serving every request until the
+/// user interrupts. Single in-memory body, served verbatim on any path.
+fn serve_perfetto(trace_json: &[u8], port: u16) -> Result<()> {
+    use std::io::Read as _;
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    // SO_REUSEADDR before bind: each served connection lingers in TIME_WAIT on
+    // this port for ~2*MSL after Ctrl-C, and a plain bind would then fail with
+    // EADDRINUSE on the next run. The flag lets us rebind over those.
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+        .context("creating perfetto serve socket")?;
+    socket
+        .set_reuse_address(true)
+        .context("setting SO_REUSEADDR on perfetto serve socket")?;
+    socket
+        .bind(&addr.into())
+        .with_context(|| format!("binding 127.0.0.1:{port} (is the port already in use?)"))?;
+    socket
+        .listen(128)
+        .with_context(|| format!("listening on 127.0.0.1:{port}"))?;
+    let listener = TcpListener::from(socket);
+    // Resolve the actual port: with the default (0) the OS assigned an ephemeral
+    // one, so read it back rather than echoing the 0.
+    let bound_port = listener
+        .local_addr()
+        .context("reading perfetto serve address")?
+        .port();
+    let trace_url = format!("http://127.0.0.1:{bound_port}/trace.json");
+    let ui_url = format!("https://ui.perfetto.dev/#!/?url={trace_url}");
+
+    open_browser(&ui_url);
+    eprintln!("serving {} bytes at {trace_url}", trace_json.len());
+    eprintln!("opening {ui_url}");
+    eprintln!("Ctrl-C when you're done viewing.");
+
+    // CORS headers on every response: Perfetto fetches cross-origin from
+    // ui.perfetto.dev, so the body must be allowed for any origin.
+    let header = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        trace_json.len()
+    );
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::warn!("perfetto serve: accept failed: {e}");
+                continue;
+            }
+        };
+        // Drain the request line/headers so the client's write completes before
+        // we reply; we serve the same body regardless of what was asked for.
+        let mut scratch = [0u8; 2048];
+        let _ = stream.read(&mut scratch);
+        if let Err(e) = stream
+            .write_all(header.as_bytes())
+            .and_then(|()| stream.write_all(trace_json))
+        {
+            tracing::warn!("perfetto serve: write failed: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Open a URL in the platform browser, best-effort. A failure here is not fatal:
+/// the server is already up, so we just print the URL for the user to paste.
+fn open_browser(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    if let Err(e) = std::process::Command::new(opener).arg(url).spawn() {
+        eprintln!("could not launch browser via `{opener}` ({e}); open this URL yourself:\n{url}");
+    }
 }
 
 /// Print a calibration report to stdout in the requested format.
@@ -407,16 +596,15 @@ async fn calibrate_e2e_impl(
     use std::collections::HashMap;
     use std::time::Instant;
 
-    use clap::Parser as _;
     use futures::StreamExt;
-    use inference_simulator_rs::latency::{NUM_CONCURRENCY_BUCKETS, concurrency_bucket};
-    use inference_simulator_rs::trace::TraceRecord;
-    use inference_simulator_rs::{Opt, run};
     use rand::Rng;
     use rand::SeedableRng as _;
     use tokio_util::sync::CancellationToken;
     use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
     use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
+    use vllm_vcr::latency::{NUM_CONCURRENCY_BUCKETS, concurrency_bucket};
+    use vllm_vcr::trace::TraceRecord;
+    use vllm_vcr::{Opt, run};
 
     let (_meta, all_records) = read_trace_file(trace_path)?;
 
@@ -437,7 +625,7 @@ async fn calibrate_e2e_impl(
     let trace_path_str = trace_path.to_string_lossy().to_string();
 
     let mut args: Vec<String> = vec![
-        "inference-sim".to_string(),
+        "play".to_string(),
         "--handshake-address".to_string(),
         addr.clone(),
         "--max-num-seqs".to_string(),
@@ -641,22 +829,4 @@ async fn calibrate_e2e_impl(
         request_total: None,
         verdict,
     })
-}
-
-fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(io::stderr)
-        .init();
-
-    match run() {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("error: {e:#}");
-            ExitCode::FAILURE
-        }
-    }
 }

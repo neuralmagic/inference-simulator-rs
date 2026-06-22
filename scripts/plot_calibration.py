@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["matplotlib", "numpy"]
 # ///
-"""Plot calibration sample dumps produced by `inference-sim-trace calibrate --dump-samples`.
+"""Plot calibration sample dumps produced by `vllm-vcr inspect calibrate --dump-samples`.
 
 Terminology (matches the README): "captured" curves are tap recordings of a
 real engine; "modeled" curves are the simulator's trace-fitted statistical

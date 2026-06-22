@@ -1,0 +1,44 @@
+name: "Setup Cluster Auth"
+description: "Authenticate to the conformance Kubernetes cluster via GitHub OIDC"
+inputs:
+  cluster-url:
+    description: "Kubernetes API server URL"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Build auth helper
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "Building xtask auth helper"
+        cargo build -p xtask
+        echo "xtask auth helper ready at ${GITHUB_WORKSPACE}/target/debug/xtask"
+
+    - name: Generate kubeconfig with exec credential plugin
+      shell: bash
+      env:
+        CLUSTER_URL: ${{ inputs.cluster-url }}
+        PLUGIN_PATH: ${{ github.workspace }}/target/debug/xtask
+      run: |
+        set -euo pipefail
+        if [ -z "${CLUSTER_URL}" ]; then
+          echo "cluster-url is required; set the repository variable CONFORMANCE_CLUSTER_URL" >&2
+          exit 1
+        fi
+
+        echo "Generating kubeconfig for configured conformance cluster"
+        "${PLUGIN_PATH}" github-oidc-kubeconfig \
+          --cluster-url "${CLUSTER_URL}" \
+          --plugin-path "${PLUGIN_PATH}" \
+          --kubeconfig "${HOME}/.kube/config"
+        echo "Kubeconfig written to ${HOME}/.kube/config"
+
+    - name: Verify cluster auth
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "Verifying cluster auth with a non-mutating authorization check"
+        kubectl auth can-i get pods --all-namespaces
+        echo "Cluster auth verified"

@@ -9,7 +9,7 @@
 #       | HTTP (/v1/messages or /v1/chat/completions)
 #   frontend   vllm serve --data-parallel-size-local 0     binds rpc :5570, no GPU
 #       | ZMQ
-#   tap        inference-sim-tap --record-tokens           :5570 <-> :5580, trace -> /trace
+#   tap        vllm-vcr record --record-tokens           :5570 <-> :5580, trace -> /trace
 #       | ZMQ
 #   engine     vllm serve --headless                       connects :5580, 1x GPU
 #
@@ -103,7 +103,7 @@ spec:
               until (exec 3<>/dev/tcp/127.0.0.1/5570) 2>/dev/null; do
                 echo "waiting for frontend to listen on :5570"; sleep 2
               done
-              exec /usr/local/bin/inference-sim-tap \
+              exec /usr/local/bin/vllm-vcr record \
                 --frontend-handshake=tcp://127.0.0.1:5570 \
                 --engine-handshake=tcp://127.0.0.1:5580 \
                 --input-address=tcp://127.0.0.1:29560 \

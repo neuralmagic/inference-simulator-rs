@@ -9,9 +9,7 @@
 
 #![cfg(feature = "nixl")]
 
-use inference_simulator_rs::dataplane::{
-    NixlConfig, PdRole, RequestKv, make_data_plane, nixl_is_stub,
-};
+use vllm_vcr::dataplane::{NixlConfig, PdRole, RequestKv, make_data_plane, nixl_is_stub};
 
 fn cfg(engine_id: &str, port: u32) -> NixlConfig {
     NixlConfig {

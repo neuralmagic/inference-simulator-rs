@@ -369,7 +369,7 @@ impl ActiveRequest {
         // return None and the requested max_tokens stands. Verbatim replay
         // (--replay-steps / --replay-tokens) pins each request to its own recorded
         // length downstream, so the marginal sampler must not pre-empt it.
-        let verbatim = !opt.replay_steps.is_empty() || !opt.replay_tokens.is_empty();
+        let verbatim = opt.replay_steps.is_some() || opt.replay_tokens.is_some();
         let max_tokens = if verbatim || !model_eos {
             max_tokens
         } else {
@@ -1774,7 +1774,6 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use clap::Parser as _;
     use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
 
     use super::*;
@@ -1804,7 +1803,7 @@ mod tests {
 
     fn test_opt() -> Opt {
         // clap fills every field with its declared default (all latency knobs = 0 / instant).
-        Opt::parse_from(["inference-sim"])
+        Opt::parse_from(["play"])
     }
 
     /// Build a test engine with a pre-taken internal rx for sync test usage. Returns the

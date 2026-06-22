@@ -33,16 +33,42 @@ model_cache_size = "100Gi"
 # vllm_tag. Add a line here, then point captures at it.
 [lines."v0.23.0"]
 engine_image = "docker.io/vllm/vllm-openai:v0.23.0@sha256:6d8429e38e3747723ca07ee1b17972e09bb9c51c4032b266f24fb1cc3b22ed8f"
-tap_image = "ghcr.io/neuralmagic/inference-simulator-rs:vllm0.23"
+tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
 
 [lines."nightly"]
 # Postmerge image at the nightly protocol_rev; bump alongside compat.toml's nightly rev.
-engine_image = "public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:9c7c74bf1023774cf0e247bf77a038989ee272db"
-tap_image = "ghcr.io/neuralmagic/inference-simulator-rs:vllmnightly"
+engine_image = "public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:8dd1b702f27edeed24a4336f531b01c346e04253"
+tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllmnightly"
 
 # --- capture targets ----------------------------------------------------------------
 # `name` is the Job suffix + label (must be RFC1123: lowercase, digits, '-'); the dotted
 # model id lives in `model`. `scenario`: baseline | nocache | specdecode | multimodal.
+# Nightly targets are intentionally small and multi-seed: they are the rolling HEAD
+# fidelity check consumed by the nightly canary, not the broad release capture set.
+
+[[capture]]
+name = "nightly-qwen3-8b-mt-s7"
+model = "Qwen/Qwen3-8B"
+vllm_tag = "nightly"
+scenario = "baseline"
+phases = "multiturn"
+mt_seed = "7"
+
+[[capture]]
+name = "nightly-qwen3-8b-mt-s13"
+model = "Qwen/Qwen3-8B"
+vllm_tag = "nightly"
+scenario = "baseline"
+phases = "multiturn"
+mt_seed = "13"
+
+[[capture]]
+name = "nightly-qwen3-8b-nocache-s7"
+model = "Qwen/Qwen3-8B"
+vllm_tag = "nightly"
+scenario = "nocache"
+phases = "multiturn"
+mt_seed = "7"
 
 [[capture]]
 name = "qwen3-8b"

@@ -1,11 +1,11 @@
-//! Engine-core recording tap: a transparent ZMQ proxy between a real vLLM
-//! frontend and a real engine-core, recording per-request timing into a JSONL
-//! trace file.
+//! `vllm-vcr record`: engine-core recording tap. A transparent ZMQ proxy
+//! between a real vLLM frontend and a real engine-core that records per-request
+//! timing into a JSONL trace file.
 //!
 //! ## Usage
 //!
 //! ```text
-//! inference-sim-tap --trace-out /tmp/trace.jsonl --model my-model
+//! vllm-vcr record --trace-out /tmp/trace.jsonl --model my-model
 //! ```
 //!
 //! Addresses default to the sidecar convention (frontend handshake
@@ -32,23 +32,15 @@
 //!   per chunk, with token counts in the record's `itl_tokens`.
 //! - Aborted requests are silently discarded (no trace record emitted).
 
-use std::path::Path;
-use std::process::ExitCode;
-
-use anyhow::Result;
-use clap::Parser;
-use tokio_util::sync::CancellationToken;
-use tracing::{Level, info};
+use anyhow::{Context as _, Result};
+use clap::Args;
+use sim_s3::TraceUri;
 
 use sim_tap::tap::{TapConfig, TapMetaConfig, TokenRecording, run_tap};
 use sim_trace::trace::TraceWriter;
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "inference-sim-tap",
-    about = "Transparent recording proxy between a vLLM frontend and an engine-core."
-)]
-struct TapOpt {
+#[derive(Debug, Args)]
+pub struct RecordArgs {
     /// Handshake address of the real frontend to connect to (the tap acts as
     /// an engine). The default matches the sidecar convention: the frontend
     /// binds its handshake on :5570 (`vllm-rs serve --handshake-port 5570`).
@@ -69,12 +61,14 @@ struct TapOpt {
     #[arg(long, default_value = "tcp://127.0.0.1:29561")]
     output_address: String,
 
-    /// Path to write the JSONL trace output. Gzip-compressed when the path
-    /// ends in `.gz` (recommended with --record-tokens, which grows traces by
-    /// one integer per generated token); the stream is finalized on Ctrl-C,
-    /// so don't SIGKILL the tap if you want a well-terminated gzip file.
+    /// Path or `s3://bucket/key` URI to write the JSONL trace output.
+    /// Gzip-compressed when the path ends in `.gz` (recommended with
+    /// --record-tokens, which grows traces by one integer per generated token);
+    /// the stream is finalized on SIGINT/SIGTERM, so don't SIGKILL the tap if
+    /// you want a well-terminated gzip file. An `s3://` target is written to a
+    /// local scratch file and uploaded as one object after finalize.
     #[arg(long)]
-    trace_out: String,
+    trace_out: TraceUri,
 
     /// Model name recorded in the trace metadata line.
     #[arg(long, default_value = "")]
@@ -136,101 +130,72 @@ struct TapOpt {
     )]
     record_tokens: TokenRecording,
 
-    /// Path to also write per-step scheduler-stats snapshots (JSONL, one line
-    /// per engine output message that carried stats; gzip when the path ends
-    /// in `.gz`). Includes spec-decoding draft/acceptance counts when the
-    /// engine runs with speculative decoding. Requires the engine's stats
-    /// logging to be enabled, otherwise the file stays empty.
+    /// Path or `s3://bucket/key` URI to also write per-step scheduler-stats
+    /// snapshots (JSONL, one line per engine output message that carried stats;
+    /// gzip when the path ends in `.gz`). Includes spec-decoding
+    /// draft/acceptance counts when the engine runs with speculative decoding.
+    /// Requires the engine's stats logging to be enabled, otherwise the file
+    /// stays empty. `s3://` targets upload after finalize, like --trace-out.
     #[arg(long)]
-    step_stats_out: Option<String>,
+    step_stats_out: Option<TraceUri>,
 }
 
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(Level::INFO.to_string())),
-        )
-        .init();
-}
-
-fn shutdown_signal() -> CancellationToken {
-    let token = CancellationToken::new();
-    let shutdown = token.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            info!("received Ctrl-C, shutting down tap");
-            shutdown.cancel();
-        }
-    });
-    token
-}
-
-fn main() -> ExitCode {
-    init_tracing();
-
-    let opt = TapOpt::parse();
-
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
+/// Run the recording tap on a multi-thread runtime until a shutdown signal
+/// (SIGINT/SIGTERM) or transport failure, then finalize and upload the trace.
+pub fn run(args: RecordArgs) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("failed to build Tokio runtime: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+        .context("failed to build Tokio runtime")?;
 
-    let result = runtime.block_on(async move { run_main(opt).await });
-
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("inference-sim-tap error: {e:#}");
-            ExitCode::FAILURE
-        }
-    }
+    runtime.block_on(run_record(args))
 }
 
-async fn run_main(opt: TapOpt) -> Result<()> {
-    let mut writer = TraceWriter::create(Path::new(&opt.trace_out))?;
+async fn run_record(args: RecordArgs) -> Result<()> {
+    let scratch_dir = std::env::temp_dir();
+    let trace_local = args.trace_out.write_path(&scratch_dir);
+    let step_local = args
+        .step_stats_out
+        .as_ref()
+        .map(|uri| uri.write_path(&scratch_dir));
+
+    let mut writer = TraceWriter::create(&trace_local)?;
 
     // The meta line is written by run_tap after the handshake, so it can stamp
     // the engine's reported version and raw ready-response bytes.
     let meta = TapMetaConfig {
-        model: opt.model,
-        gpu: opt.gpu,
-        tp: opt.tp,
-        max_num_seqs: opt.max_num_seqs,
-        block_size: opt.block_size,
-        config_hash: opt.config_hash,
-        vllm_tag: opt.vllm_version,
-        engine_config: opt.engine_config,
+        model: args.model,
+        gpu: args.gpu,
+        tp: args.tp,
+        max_num_seqs: args.max_num_seqs,
+        block_size: args.block_size,
+        config_hash: args.config_hash,
+        vllm_tag: args.vllm_version,
+        engine_config: args.engine_config,
     };
 
     let config = TapConfig {
-        frontend_handshake: opt.frontend_handshake,
-        engine_handshake: opt.engine_handshake,
-        input_address: opt.input_address,
-        output_address: opt.output_address,
-        block_size: opt.block_size,
-        record_tokens: opt.record_tokens,
+        frontend_handshake: args.frontend_handshake,
+        engine_handshake: args.engine_handshake,
+        input_address: args.input_address,
+        output_address: args.output_address,
+        block_size: args.block_size,
+        record_tokens: args.record_tokens,
     };
 
-    let mut step_writer = opt
-        .step_stats_out
-        .as_deref()
-        .map(|path| TraceWriter::create(Path::new(path)))
-        .transpose()?;
+    let mut step_writer = step_local.as_deref().map(TraceWriter::create).transpose()?;
 
-    let shutdown = shutdown_signal();
-    // Finalize the writers even when the proxy dies on a transport error: a
-    // gzip stream without its trailer reads as truncated.
+    let shutdown = vllm_vcr::shutdown_signal();
+    // Finalize and upload even on transport error: an untrailered gzip stream
+    // reads as truncated, so a clean shutdown must always land a complete object.
     let result = run_tap(config, meta, &mut writer, step_writer.as_mut(), shutdown).await;
     writer.finish()?;
+    args.trace_out.upload(&trace_local).await?;
     if let Some(step_writer) = step_writer {
         step_writer.finish()?;
+        if let (Some(uri), Some(local)) = (&args.step_stats_out, &step_local) {
+            uri.upload(local).await?;
+        }
     }
     result
 }

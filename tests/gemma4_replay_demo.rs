@@ -22,7 +22,6 @@
 
 use std::time::Duration;
 
-use clap::Parser as _;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::protocol::{
@@ -30,8 +29,8 @@ use vllm_engine_core_client::protocol::{
 };
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 
-use inference_simulator_rs::trace::read_trace_file;
-use inference_simulator_rs::{Opt, run};
+use vllm_vcr::trace::read_trace_file;
+use vllm_vcr::{Opt, run};
 
 const FIXTURE: &str = "tests/fixtures/gemma4_mm_trace.jsonl";
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -64,7 +63,7 @@ async fn gemma4_multimodal_capture_replays_byte_identical() {
         std::process::id()
     );
     let opt = Opt::parse_from([
-        "inference-sim",
+        "play",
         "--handshake-address",
         &addr,
         "--replay-tokens",
@@ -114,7 +113,7 @@ async fn gemma4_multimodal_capture_replays_byte_identical() {
         let last = outputs.last().unwrap().as_ref().unwrap();
         let expected_finish = record
             .finish_reason
-            .map(inference_simulator_rs::wire::engine_finish_reason)
+            .map(vllm_vcr::wire::engine_finish_reason)
             .unwrap_or(EngineCoreFinishReason::Length);
         assert_eq!(
             last.finish_reason,

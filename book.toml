@@ -1,0 +1,17 @@
+[book]
+title = "vllm-vcr"
+description = "GPU-free vLLM V1 engine-core trace recording, simulation, and replay."
+authors = ["vllm-vcr contributors"]
+src = "docs"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/neuralmagic/vllm-vcr"
+edit-url-template = "https://github.com/neuralmagic/vllm-vcr/edit/main/{path}"
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+additional-css = ["docs/theme/vllm-vcr.css"]
+
+[output.html.fold]
+enable = true
+level = 1

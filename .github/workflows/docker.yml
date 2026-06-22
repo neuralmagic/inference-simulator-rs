@@ -88,11 +88,12 @@ jobs:
       # Pin the workspace Cargo.toml to this line's rev + fork patch BEFORE the build
       # context is sent. Cargo rejects patching a git dep to a different rev of the
       # same source, so the rev is swapped in [workspace.dependencies] and the fork
-      # [patch] inserted/removed here (see cargo xtask pin-vllm). The Dockerfile then
-      # compiles the rewritten manifest without --locked. This replaces the old
-      # CARGO_PATCH build-arg, which used the rejected --config mechanism.
+      # [patch] inserted/removed here (see cargo xtask pin-vllm), then Cargo.lock is
+      # refreshed so the Docker context carries the real pinned client.
       - name: Pin vLLM rev (line ${{ matrix.line }})
-        run: cargo xtask pin-vllm "${{ matrix.line }}"
+        run: |
+          cargo xtask pin-vllm "${{ matrix.line }}"
+          cargo update -p vllm-engine-core-client
 
       # Per-line tag set. The immutable <simver>-vllm<line> and the floating vllm<line>
       # always ship; :latest only attaches to the default=true line on the default branch.

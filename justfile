@@ -33,14 +33,14 @@ image-build:
     podman build --platform linux/amd64 -t {{image}} .
 
 # Build the capture image for a specific compat.toml line, e.g. `just image-build-line 0.22`.
-# Pins Cargo.toml to the line's rev/fork via `cargo xtask pin-vllm` (leaves the tree dirty;
-# restore with `git checkout Cargo.toml Cargo.lock`), stamps VLLM_TARGET_VERSION for build.rs,
+# Pins Cargo.toml/Cargo.lock to the line's rev/fork, stamps VLLM_TARGET_VERSION for build.rs,
 # and builds the vllm-rs frontend from the same source as the tap. Tags as <image>-vllm<line>.
 # amd64 only; on Apple Silicon prefer a native remote builder over local emulation.
 image-build-line line:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo xtask pin-vllm "{{line}}"
+    cargo update -p vllm-engine-core-client
     eval "$(cargo xtask frontend-args "{{line}}")"
     podman build --platform linux/amd64 \
         --build-arg VLLM_TARGET_VERSION="$TAG" \

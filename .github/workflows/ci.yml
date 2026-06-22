@@ -174,10 +174,11 @@ jobs:
       # Pin Cargo.toml to this line's rev + fork patch. Cargo rejects patching a git
       # dep to a different rev of the same source, so the rev is swapped in
       # [workspace.dependencies] (not via --config); the per-line fork [patch] is
-      # rewritten or removed. After this the rev no longer matches Cargo.lock, so the
-      # build/test below deliberately omit --locked. compat.toml is the source of truth.
+      # rewritten or removed. Refresh Cargo.lock so Rust compiles against that pin.
       - name: Pin vLLM rev (line ${{ matrix.line }})
-        run: cargo xtask pin-vllm "${{ matrix.line }}"
+        run: |
+          cargo xtask pin-vllm "${{ matrix.line }}"
+          cargo update -p vllm-engine-core-client
 
       - name: Build (vLLM ${{ matrix.line }} @ ${{ matrix.tag }})
         run: cargo build --workspace

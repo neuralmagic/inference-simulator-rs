@@ -91,10 +91,11 @@ jobs:
         if: ${{ matrix.os == 'linux' }}
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      # Pin Cargo.toml to this line's rev + fork patch (see cargo xtask pin-vllm). The rev
-      # then no longer matches Cargo.lock, so the build omits --locked.
+      # Pin Cargo.toml/Cargo.lock to this line's rev + fork patch.
       - name: Pin vLLM rev (line ${{ matrix.line }})
-        run: cargo xtask pin-vllm "${{ matrix.line }}"
+        run: |
+          cargo xtask pin-vllm "${{ matrix.line }}"
+          cargo update -p vllm-engine-core-client
 
       # Default features only: no NIXL, so this stays a small pure-Rust binary.
       - name: Build vllm-vcr (${{ matrix.target }})

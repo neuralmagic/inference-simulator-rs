@@ -75,7 +75,9 @@ jobs:
           echo "vLLM main HEAD: ${sha}"
 
       - name: Pin protocol crate to upstream HEAD
-        run: cargo xtask pin-vllm nightly --rev "${{ steps.head.outputs.sha }}"
+        run: |
+          cargo xtask pin-vllm nightly --rev "${{ steps.head.outputs.sha }}"
+          cargo update -p vllm-engine-core-client
 
       - name: Detect nightly conformance goldens
         id: nightly-goldens

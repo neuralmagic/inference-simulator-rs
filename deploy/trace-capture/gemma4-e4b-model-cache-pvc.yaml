@@ -1,5 +1,4 @@
-# RWX cache for gemma-4-E4B-it weights (~small, ~4B effective), so redeploys skip
-# the pull. Same storage class as the other capture caches.
+# RWX weight cache for gemma-4-E4B-it.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

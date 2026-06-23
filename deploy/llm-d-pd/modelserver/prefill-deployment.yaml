@@ -1,6 +1,5 @@
-# Prefill instances. Adapted from the llm-d pd-disaggregation GPU/vLLM model server:
-# our CPU mock image instead of vllm/vllm-openai, no GPU, a small model for a light
-# tokenizer. The image's entrypoint runs vllm-rs (frontend) + vllm-vcr play (engine).
+# Prefill pods (x2): process prompt, register fake KV, expose it on NIXL (:5600) for decode.
+# No sidecar. Same vllm-vcr image as decode; MOCK_PD_ROLE=prefill.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -41,9 +40,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-            # Latency model (ms). Prefill uses the token-count prefill path for TTFT
-            # (overhead + per-token), then inter-token latency for any tokens it emits.
-            # All simulated; tune to taste. Drives vllm:time_to_first_token_seconds etc.
+            # Simulated latency (ms): prefill overhead + per-token, then ITL.
             - name: MOCK_PREFILL_OVERHEAD_MS
               value: "30"
             - name: MOCK_PREFILL_TIME_PER_TOKEN_MS

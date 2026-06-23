@@ -1,30 +1,6 @@
-# Real-engine trace capture for gemma-4-E4B (image-in / text-out multimodal).
-#
-# E4B is the SAME arch as the 26B (Gemma4ForConditionalGeneration -> gemma4_mm),
-# but it does NOT carry text_config.use_bidirectional_attention="vision", so it is
-# NOT subject to the #40106 vision-attention bug that made the 26B output gibberish.
-# It is a dense ~4B-effective omni model (audio+vision+video tokens), so it pulls
-# and loads fast. Everything else mirrors gemma4-capture.yaml.
-#
-#   loadgen / curl (port-forward :8000)
-#       | HTTP   chat/completions with inline-base64 image_url content
-#   frontend   vllm serve --data-parallel-size-local 0   (PYTHON, on GPU)  :5570
-#       | ZMQ
-#   tap        vllm-vcr record                          :5570 <-> :5580, trace -> /trace
-#       | ZMQ
-#   engine     vllm serve --headless                      gemma-4-E4B, 1x H200
-#
-# WHY THESE VERSIONS:
-#   - Engine + frontend pinned to vLLM main 16e91176; its registry maps the gemma4
-#     arch to gemma4_mm, so NO newer rev needed.
-#   - Tap reused at the same protocol rev (tap-16e91176-mmfix); NO TAP REBUILD.
-#   - google/gemma-4-E4B-it config + weights are anonymously accessible (gated:none),
-#     so no HF_TOKEN (ungated). vision
-#     soft-tokens=280, image_token_id=258880.
-#
-# Ops: handshake once in order; if any container restarts, DELETE the pod. Idle GPU
-# pods reaped ~35 min. Requests MUST set max_tokens explicitly (engine predates
-# #45417). Fetch the trace before scaling down (emptyDir).
+# Gemma-4-E4B multimodal capture: loadgen → Python frontend :5570 → tap → engine (H200).
+# Pin: vLLM 16e91176; tap tap-16e91176-mmfix. Set max_tokens explicitly.
+# Ops: delete pod on restart; fetch trace before scale-down (emptyDir).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,7 +10,7 @@ metadata:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: gemma-4-E4B
 spec:
-  replicas: 1 # scale to 0 when not capturing (re-applying resets scale)
+  replicas: 1
   selector:
     matchLabels:
       llm-d.ai/guide: trace-capture-g4e4b

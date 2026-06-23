@@ -1,3 +1,4 @@
+# DiffusionGemma capture without tap (frontend → engine direct). Debug wedge for disagg hangs.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

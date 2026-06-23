@@ -1,37 +1,6 @@
-# Real-engine trace capture for gemma-4 (image-in / text-out multimodal).
-#
-# Same three-container tap topology as diffusiongemma-capture.yaml, but gemma-4 is
-# a STANDARD autoregressive multimodal (omni) model, so it drops every
-# diffusion-specific knob: no V2 model runner, no diffusion-config / entropy
-# sampler hf-overrides, no max_soft_tokens, no max-num-seqs cap.
-#
-#   loadgen / curl (port-forward :8000)
-#       | HTTP   chat/completions with inline-base64 image_url content
-#   frontend   vllm serve --data-parallel-size-local 0   (PYTHON, on GPU)  :5570
-#       | ZMQ
-#   tap        vllm-vcr record                          :5570 <-> :5580, trace -> /trace
-#       | ZMQ
-#   engine     vllm serve --headless                      gemma-4, 1x H200
-#
-# WHY THESE VERSIONS (the load-bearing part):
-#   - Engine + frontend pinned to vLLM main 16e91176 (the DiffusionGemma rev,
-#     ~2026-06-12). gemma-4 (RedHatAI mirror published 2026-05-19) is OLDER, and
-#     16e91176's registry already maps Gemma4ForConditionalGeneration -> gemma4_mm
-#     (vllm/model_executor/models/gemma4_mm.py exists at that commit). So NO newer
-#     vLLM rev is needed despite the model card saying "vllm main".
-#   - The recording tap is built at the SAME protocol rev (16e91176) with the
-#     multimodal fixes (serde-default EngineCoreSamplingParams + per-socket drain
-#     tasks + observe_request accepts >=2 frames). Protocol crate is unchanged from
-#     the DiffusionGemma run, so NO TAP REBUILD: reuse tap-16e91176-mmfix.
-#   - Model RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic is UNGATED (gated:false), so no
-#     HF_TOKEN -- anonymous CDN pull. FP8 native on H200 (Hopper). 27B MoE
-#     (128 experts, A4B active), vision_soft_tokens_per_image=280.
-#
-# Operational rules (same as DiffusionGemma): containers handshake once in order;
-# if any restarts, DELETE the pod (a half-completed frontend<->engine handshake
-# hangs). Idle GPU pods are reaped ~35 min. Requests MUST set max_tokens explicitly
-# (engine predates #45417's HF-default fix). Fetch the trace before scaling down
-# (emptyDir).
+# Gemma-4-26B multimodal capture: loadgen → Python frontend :5570 → tap → engine (H200).
+# Pin: vLLM 16e91176; tap tap-16e91176-mmfix. Set max_tokens explicitly.
+# Ops: delete pod on restart; fetch trace before scale-down (emptyDir).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -40,7 +9,7 @@ metadata:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: gemma-4-26B-A4B
 spec:
-  replicas: 1 # scale to 0 when not capturing (re-applying resets scale)
+  replicas: 1
   selector:
     matchLabels:
       llm-d.ai/guide: trace-capture-g4

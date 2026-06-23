@@ -1,33 +1,6 @@
-# Agentic trace capture: same tap-in-the-middle layout as h200-capture.yaml,
-# but the frontend is the NATIVE PYTHON vLLM API server instead of vllm-rs,
-# because agent drivers like Claude Code speak the Anthropic Messages API
-# (/v1/messages), which vllm-rs does not serve yet. The pinned commit ships
-# the anthropic entrypoint including the x-anthropic-billing-header strip, so
-# Claude Code traffic prefix-matches cleanly.
-#
-#   Claude Code / pi / mini-swe-agent  (port-forward :8000)
-#       | HTTP (/v1/messages or /v1/chat/completions)
-#   frontend   vllm serve --data-parallel-size-local 0     binds rpc :5570, no GPU
-#       | ZMQ
-#   tap        vllm-vcr record --record-tokens           :5570 <-> :5580, trace -> /trace
-#       | ZMQ
-#   engine     vllm serve --headless                       connects :5580, 1x GPU
-#
-# Version pinning is load-bearing (see h200-capture.yaml): engine AND frontend
-# run the postmerge CI image for exactly the protocol-pin commit c9340e6f3.
-#
-# Agent client env (Claude Code):
-#   ANTHROPIC_BASE_URL=http://localhost:8000
-#   ANTHROPIC_AUTH_TOKEN=dummy
-#   ANTHROPIC_DEFAULT_OPUS_MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct   (and SONNET/HAIKU likewise)
-#   CLAUDE_CODE_ATTRIBUTION_HEADER=0             (belt and braces; the frontend strips it too)
-#
-# Operational notes:
-#   - Same one-shot handshake rule as h200-capture.yaml: any container restart
-#     means delete the pod.
-#   - The frontend runs the per-commit CPU wheel image (Dockerfile.frontend-cpu):
-#     the CUDA CI image crashes on a GPU-less container ("Failed to infer
-#     device type"), and only the CPU build resolves a platform without one.
+# Agentic capture: Python frontend (/v1/messages) → tap (--record-tokens) → headless engine.
+# Pin: engine + frontend at protocol_rev c9340e6f3; frontend uses CPU wheel image.
+# Ops: delete pod on any container restart (same handshake rule as h200-capture).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,7 +9,7 @@ metadata:
     llm-d.ai/guide: trace-capture-agentic
     llm-d.ai/model: Qwen3-Coder-30B-A3B
 spec:
-  replicas: 1 # scale to 0 when not capturing (and remember: re-applying resets scale)
+  replicas: 1
   selector:
     matchLabels:
       llm-d.ai/guide: trace-capture-agentic

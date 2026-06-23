@@ -1,26 +1,5 @@
-# Offline replay: the same python frontend as h200-capture-agentic.yaml, but
-# the engine slot is vllm-vcr play serving a captured trace with content-keyed
-# matching. No tap, no GPU anywhere in the pod. A live agent pointed at :8000
-# gets back the captured streams byte-identically; the closed loop replays an
-# entire agentic rollout (SWE-bench etc.) with zero GPU.
-#
-#   agent  (port-forward :8000)
-#       | HTTP (/v1/messages or /v1/chat/completions)
-#   frontend   vllm serve --data-parallel-size-local 0      binds rpc :5570, no GPU
-#       | ZMQ
-#   sim        vllm-vcr play --replay-match prefix          dials :5570, serves the trace
-#
-# The frontend MUST run the same model/tokenizer as the capture: prefix
-# matching happens on token ids, so identical text must tokenize identically.
-# Keep it on the protocol-pin image (c9340e6f3) like everything else.
-#
-# Getting the trace in: the sim container waits for the trace file to appear,
-# so after the pod starts:
-#   kubectl cp trace.jsonl.gz weaton-dev/<pod>:/trace/trace.jsonl.gz -c sim
-#
-# Timing axes are independent (see README "Replay pacing"): add
-# --latency-trace /trace/trace.jsonl.gz to the sim args for captured pacing,
-# or leave it off for instant replay.
+# Offline replay: Python frontend → vllm-vcr play (no tap, no GPU). --replay-match prefix.
+# Pin: same model/tokenizer as capture (c9340e6f3). kubectl cp trace to /trace/ -c sim after start.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

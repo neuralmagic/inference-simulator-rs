@@ -1,29 +1,6 @@
-# Real-engine latency trace capture: the recording tap sits between the vLLM Rust
-# frontend and a real headless vLLM engine, all over in-pod localhost TCP, so the
-# recorded TTFT/per-token ITL gaps carry no network jitter.
-#
-#   guidellm (port-forward :8000)
-#       | HTTP
-#   frontend   vllm-rs serve --data-parallel-size-local 0   binds handshake :5570
-#       | ZMQ
-#   tap        vllm-vcr record                            :5570 <-> :5580, trace -> /trace
-#       | ZMQ
-#   engine     vllm serve --headless                        connects handshake :5580, 1x GPU
-#
-# Version pinning is load-bearing: the engine image is the vLLM postmerge CI build for
-# EXACTLY the commit our protocol structs are pinned to (c9340e6f3, see Cargo.toml). The
-# msgspec data-path structs are positional (array_like), so a version-skewed engine
-# (e.g. llm-d-cuda v0.7.0 = vLLM v0.19.1) misdecodes against this frontend/tap.
-#
-# Model: Qwen3-8B at TP=1 (proof of concept; ungated, so no HF token needed, and small
-# enough that a plain HF download beats wiring up modelexpress).
-#
-# Operational notes:
-#   - The three containers handshake exactly once, in order (tap binds :5580, engine
-#     connects, then tap dials the frontend). If ANY container restarts, delete the pod;
-#     a half-rewired pod records garbage.
-#   - Fetch the trace live or after the run:
-#       kubectl exec -n weaton-dev deploy/trace-capture-h200 -c tap -- cat /trace/trace.jsonl > trace.jsonl
+# H200 trace capture: loadgen → vllm-rs :5570 → tap → headless vLLM :5580 → /trace
+# Pin: engine image must match Cargo.toml protocol_rev (c9340e6f3).
+# Ops: if any container restarts, delete the pod; fetch trace before scale-down (emptyDir).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,7 +10,7 @@ metadata:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: Qwen3-8B
 spec:
-  replicas: 1 # scale to 0 when not capturing (and remember: re-applying resets scale)
+  replicas: 1
   selector:
     matchLabels:
       llm-d.ai/guide: trace-capture

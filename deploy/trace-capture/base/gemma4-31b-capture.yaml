@@ -1,8 +1,5 @@
-# Trace capture for gemma-4-31B FP8 (image-in / text-out). frontend -> tap -> engine,
-# same topology as gemma4-capture.yaml; RedHatAI/gemma-4-31B-it-FP8-Dynamic (ungated)
-# on the 16e91176 engine + tap-16e91176-mmfix (no rebuild). FP8 image output is
-# gibberish; bf16 is the clean run (gemma4-31b-bf16-capture.yaml). Set max_tokens
-# explicitly; fetch /trace before scaling down (emptyDir).
+# Gemma-4-31B FP8 multimodal capture (same tap topology as gemma4-capture).
+# Pin: vLLM 16e91176; tap tap-16e91176-mmfix. FP8 image output may be gibberish — see bf16 variant.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -11,7 +8,7 @@ metadata:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: gemma-4-31B
 spec:
-  replicas: 1 # scale to 0 when not capturing (re-applying resets scale)
+  replicas: 1
   selector:
     matchLabels:
       llm-d.ai/guide: trace-capture-g4-31b

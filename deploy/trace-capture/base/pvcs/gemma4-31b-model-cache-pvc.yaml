@@ -1,5 +1,4 @@
-# RWX cache for gemma-4-31B-it-FP8-Dynamic weights (~31 GB FP8), so redeploys
-# skip the pull. Same storage class as the other gemma caches.
+# RWX weight cache for gemma-4-31B-it-FP8-Dynamic (~31 GB).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

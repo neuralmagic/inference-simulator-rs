@@ -1,10 +1,6 @@
 #!/bin/bash
-# In-pod load driver for the Kueue conformance capture Jobs (generated from
-# models.toml by gen-capture-jobs.py).
-# Runs the phases in $PHASES against the sidecar stack on localhost, marks the
-# tap-trace line count at each phase boundary (for slicing the JSONL locally),
-# then idles until the trace is fetched so the Job can complete and release
-# the GPU. Self-terminates after 2h if nobody fetches.
+# In-pod load driver for Kueue conformance Jobs (generated from models.toml).
+# Runs PHASES against localhost:8000; idles until trace is fetched (2h timeout).
 set -euo pipefail
 
 pip install --quiet httpx

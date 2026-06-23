@@ -1,3 +1,4 @@
+# Monolithic mock Deployment + ServiceAccount for prefix-cache routing testbed.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -5,7 +6,7 @@ resources:
   - serviceaccount.yaml
   - deployment.yaml
 
-# Repoint the image here (e.g. to a freshly built tag) without editing the Deployment.
+# Bump image tag here without editing the Deployment.
 images:
   - name: ghcr.io/neuralmagic/vllm-vcr
     newTag: vllm0.23

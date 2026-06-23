@@ -1,9 +1,5 @@
-# Trace capture for gemma-4-31B at native bf16 (image-in / text-out). Unquantized
-# google/gemma-4-31B-it (ungated, ~61 GB, fits 1x H200) to check whether the FP8 run's
-# (gemma4-31b-capture.yaml) gibberish output is a quant artifact: the #40106 bidi-vision
-# fix (PR #40534) is already in the 16e91176 engine, so the mask isn't the cause.
-# Same frontend -> tap -> engine topology, tap-16e91176-mmfix, no rebuild. Set
-# max_tokens explicitly; fetch /trace before scaling down (emptyDir).
+# Gemma-4-31B bf16 multimodal capture (unquantized; compare against FP8 variant).
+# Pin: vLLM 16e91176; tap tap-16e91176-mmfix. Set max_tokens; fetch /trace before scale-down.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -12,7 +8,7 @@ metadata:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: gemma-4-31B-bf16
 spec:
-  replicas: 1 # scale to 0 when not capturing (re-applying resets scale)
+  replicas: 1
   selector:
     matchLabels:
       llm-d.ai/guide: trace-capture-g4-31b-bf16

@@ -1,5 +1,4 @@
-# RWX cache for gemma-3-27b-it-FP8-dynamic weights (~27 GB FP8), so redeploys skip
-# the pull. Same storage class as the other capture caches.
+# RWX weight cache for gemma-3-27b-it-FP8-dynamic (~27 GB).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

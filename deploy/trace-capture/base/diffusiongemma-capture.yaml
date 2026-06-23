@@ -1,45 +1,6 @@
-# Real-engine trace capture for DiffusionGemma (image-in / text-out multimodal).
-#
-# Same three-container tap topology as h200-capture.yaml, but with the PYTHON
-# frontend (mature multimodal input processor) and a diffusiongemma-capable
-# engine:
-#
-#   loadgen / curl (port-forward :8000)
-#       | HTTP   chat/completions with image_url content
-#   frontend   vllm serve --data-parallel-size-local 0   (PYTHON, CPU)  :5570
-#       | ZMQ
-#   tap        vllm-vcr record                          :5570 <-> :5580, trace -> /trace
-#       | ZMQ
-#   engine     vllm serve --headless                      diffusiongemma, 1x H200
-#
-# WHY THESE VERSIONS (the load-bearing part):
-#   - DiffusionGemma support landed in vLLM via PR #45163, merge commit
-#     eb28452b10a1376d143b2847a78b31726db346dd (2026-06-12). Engine + frontend
-#     are pinned to that exact commit.
-#   - The recording tap is built at protocol rev c9340e6f (see Cargo.toml).
-#     Between c9340e6f and eb28452 the engine-core-client protocol crate
-#     (handshake.rs + data-path structs) did NOT change -- only a test file --
-#     so the existing tap brokers the handshake and decodes EngineCoreRequest
-#     (which already carries mm_features) correctly. NO TAP REBUILD NEEDED.
-#     The LATER commit 6c5872e (#45417) DOES touch handshake.rs; do not jump to
-#     it without rebuilding the tap against its protocol_rev.
-#   - Tradeoff of staying at eb28452: we miss #45417's "unset HF default
-#     max_new_tokens" fix, so requests MUST set max_tokens explicitly.
-#
-#   - Model RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic is UNGATED
-#     (gated:false), so no HF_TOKEN -- anonymous CDN pull. FP8 is native on
-#     H200 (Hopper).
-#
-# RISKS TO WATCH on first bring-up:
-#   - DiffusionGemma uses model-runner-v2 (VLLM_USE_V2_MODEL_RUNNER=1) + the
-#     spec-decode multi-token-block path. The v2-runner + headless-DP combo is
-#     the untested integration point. If the engine won't register, this is the
-#     first suspect.
-#   - torch-compile fix #45643 is still open upstream, so --enforce-eager.
-#
-# Same operational rules as h200-capture.yaml: containers handshake once in
-# order; if any restarts, delete the pod. Idle GPU pods are reaped ~35 min.
-# Fetch the trace before scaling down (emptyDir).
+# DiffusionGemma multimodal capture: loadgen → Python frontend :5570 → tap → engine (H200).
+# Pin: engine eb28452; tap at c9340e6f (protocol unchanged — no tap rebuild). Set max_tokens.
+# Ops: delete pod on restart; uses V2 model runner + --enforce-eager.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -48,7 +9,7 @@ metadata:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: diffusiongemma-26B-A4B
 spec:
-  replicas: 1 # scale to 0 when not capturing (re-applying resets scale)
+  replicas: 1
   selector:
     matchLabels:
       llm-d.ai/guide: trace-capture-dg

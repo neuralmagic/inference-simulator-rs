@@ -1,14 +1,5 @@
-# Single-container COUNTERFACTUAL for DiffusionGemma image-in / text-out.
-#
-# One `vllm serve` process: API server + engine in ONE container, NO
-# data-parallel split, NO --headless, NO tap, NO ZMQ in the middle. Same model,
-# same image (vllm-ci-postmerge 16e91176), same H200, same diffusion/mm flags,
-# same weights PVC as the disaggregated rig.
-#
-# Purpose: prove the vLLM build + hardware + model + image path work end to end,
-# isolating the disaggregated-rig/tap submission wedge. If image-in works here
-# but hangs in the split rig, the hang is the disaggregation; if it hangs here
-# too, the issue is fundamental (vLLM/model/diffusion mm on this build/HW).
+# DiffusionGemma counterfactual: single vllm serve container (no tap, no headless split).
+# Isolates whether image-in works without the disaggregated rig.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

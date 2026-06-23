@@ -1,14 +1,8 @@
-# Conformance capture matrix. Read by gen-capture-jobs.py, which emits one Kueue Job
-# per [[capture]] target (kubectl apply -f -). Replaces the old hand-maintained
-# validation-jobs.yaml: one declarative source for every model x scenario we capture.
+# Conformance capture matrix for gen-capture-jobs.py (one Kueue Job per [[capture]]).
+# Targets run via conformance-queue (one GPU at a time). Upload + register: docs/conformance.md.
 #
-# Each [[capture]] inherits [defaults] (scalar overrides allowed per target) and picks a
-# [lines.<vllm_tag>] for its engine + tap/frontend images. The scenario drives the engine
-# and tap flags (so the config_hash and the engine agree on prefix-cache / spec-decode).
-#
-# Captures run one at a time via conformance-queue (see conformance-queue.yaml). After a
-# capture, upload to conformance/<vllm_tag>/<gpu>/<model>/<workload>.jsonl.gz and register
-# in manifest.toml (see docs/conformance.md).
+# Each [[capture]] inherits [defaults] and [lines.<vllm_tag>] for engine/tap images.
+# scenario: baseline | nocache | specdecode | multimodal
 
 [defaults]
 namespace = "inference-sim"
@@ -20,30 +14,19 @@ block_size = 16
 max_num_seqs = 256
 max_model_len = 16384
 enforce_eager = true
-# Engine container resources; override per capture for big models.
 engine_cpu_request = "8"
 engine_cpu_limit = "16"
 engine_memory_request = "64Gi"
 engine_memory_limit = "96Gi"
 model_cache_size = "100Gi"
 
-# Per-line build artifacts: the engine image (the vLLM under test, pinned by digest for
-# releases) and the tap/frontend image (built against the line's protocol_rev). Keyed by
-# vllm_tag. Add a line here, then point captures at it.
 [lines."v0.23.0"]
 engine_image = "docker.io/vllm/vllm-openai:v0.23.0@sha256:6d8429e38e3747723ca07ee1b17972e09bb9c51c4032b266f24fb1cc3b22ed8f"
 tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
 
 [lines."nightly"]
-# Postmerge image at the nightly protocol_rev; bump alongside compat.toml's nightly rev.
 engine_image = "public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:8dd1b702f27edeed24a4336f531b01c346e04253"
 tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllmnightly"
-
-# --- capture targets ----------------------------------------------------------------
-# `name` is the Job suffix + label (must be RFC1123: lowercase, digits, '-'); the dotted
-# model id lives in `model`. `scenario`: baseline | nocache | specdecode | multimodal.
-# Nightly targets are intentionally small and multi-seed: they are the rolling HEAD
-# fidelity check consumed by the nightly canary, not the broad release capture set.
 
 [[capture]]
 name = "nightly-qwen3-8b-mt-s7"
@@ -117,20 +100,6 @@ phases = "sweep multiturn"
 engine_memory_request = "64Gi"
 engine_memory_limit = "128Gi"
 
-[[capture]]
-name = "gemma-4-12B"
-model = "google/gemma-4-12B"
-vllm_tag = "v0.23.0"
-scenario = "baseline"
-engine_memory_request = "64Gi"
-engine_memory_limit = "96i"
-
-
-
-
-
-# Multimodal: needs the loadgen image mode (a /v1/chat/completions image path) before it
-# captures successfully; the runner rejects an unknown "multimodal" phase until then.
 [[capture]]
 name = "qwen2-5-vl-7b"
 model = "Qwen/Qwen2.5-VL-7B-Instruct"

@@ -1,6 +1,5 @@
-# Vendored from llm-d guides/pd-disaggregation/router/pd-disaggregation.values.yaml
-# (llm-d v0.7.0). Configures the EPP scheduling profiles + the InferencePool selector
-# that picks up our prefill/decode pods (matchLabels llm-d.ai/guide: pd-disaggregation).
+# P/D routing: EPP plugins split prefill vs decode; InferencePool selects mock pods.
+# matchLabels: llm-d.ai/guide=pd-disaggregation
 router:
   extraServicePorts:
     - name: http
@@ -10,6 +9,7 @@ router:
 
   epp:
     pluginsConfigFile: "pd-config.yaml"
+    # P/D decider, prefill/decode filters, prefix-cache + queue scorers.
     pluginsCustomConfig:
       pd-config.yaml: |
         apiVersion: llm-d.ai/v1alpha1

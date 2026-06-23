@@ -1,35 +1,33 @@
-# Gemma-4-E4B multimodal capture: loadgen → Python frontend :5570 → tap → engine (H200).
+# Gemma-3-27B multimodal capture: loadgen → Python frontend :5570 → tap → engine (H200).
 # Pin: vLLM 16e91176; tap tap-16e91176-mmfix. Set max_tokens explicitly.
 # Ops: delete pod on restart; fetch trace before scale-down (emptyDir).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: trace-capture-gemma4-e4b
-  namespace: your-namespace
+  name: trace-capture-gemma3
   labels:
     llm-d.ai/guide: trace-capture
-    llm-d.ai/model: gemma-4-E4B
+    llm-d.ai/model: gemma-3-27b
 spec:
   replicas: 1
   selector:
     matchLabels:
-      llm-d.ai/guide: trace-capture-g4e4b
+      llm-d.ai/guide: trace-capture-g3
   strategy:
     type: Recreate # never two pods fighting over the GPU
   template:
     metadata:
       labels:
-        llm-d.ai/guide: trace-capture-g4e4b
-        llm-d.ai/model: gemma-4-E4B
+        llm-d.ai/guide: trace-capture-g3
+        llm-d.ai/model: gemma-3-27b
     spec:
-      serviceAccountName: your-gpu-serviceaccount
       containers:
-        # --- Real engine: headless gemma-4-E4B at the protocol-pinned commit ------
+        # --- Real engine: headless gemma-3-27b at the protocol-pinned commit ------
         - name: engine
           image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:16e91176cf77bf0f40ae48da22365a5e21b517af
           command: ["vllm", "serve"]
           args:
-            - google/gemma-4-E4B-it
+            - RedHatAI/gemma-3-27b-it-FP8-dynamic
             - --headless
             - --data-parallel-address=127.0.0.1
             - --data-parallel-rpc-port=5580
@@ -40,7 +38,7 @@ spec:
             - --max-model-len=16384
             - --enforce-eager                # skip torch.compile; only need a few requests
             - --generation-config=vllm       # ignore checkpoint generation defaults
-            - '--limit-mm-per-prompt={"image": 2, "audio": 0, "video": 0}'  # image-only; cap omni profiling
+            - '--limit-mm-per-prompt={"image": 2}'   # image+text model (no audio/video)
           env:
             - { name: HF_HUB_CACHE, value: /models }
             - { name: HF_HUB_DISABLE_XET, value: "1" }         # xet crawls behind istio egress
@@ -48,11 +46,11 @@ spec:
           resources:
             requests:
               cpu: "8"
-              memory: 48Gi
+              memory: 64Gi
               nvidia.com/gpu: "1"
             limits:
               cpu: "16"
-              memory: 64Gi
+              memory: 96Gi
               nvidia.com/gpu: "1"
           volumeMounts:
             - { mountPath: /dev/shm, name: shm }
@@ -66,7 +64,7 @@ spec:
           command: ["/usr/local/bin/vllm-vcr", "record"]
           args:
             - --trace-out=/trace/trace.jsonl
-            - --model=google/gemma-4-E4B-it
+            - --model=RedHatAI/gemma-3-27b-it-FP8-dynamic
             - --gpu=H200
             - --tp=1
             - --record-tokens                           # content-identical replay
@@ -83,7 +81,7 @@ spec:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:16e91176cf77bf0f40ae48da22365a5e21b517af
           command: ["vllm", "serve"]
           args:
-            - google/gemma-4-E4B-it
+            - RedHatAI/gemma-3-27b-it-FP8-dynamic
             - --data-parallel-size=1
             - --data-parallel-size-local=0
             - --data-parallel-address=127.0.0.1
@@ -93,11 +91,11 @@ spec:
             - --max-model-len=16384
             - --trust-remote-code
             - --generation-config=vllm
-            - '--limit-mm-per-prompt={"image": 2, "audio": 0, "video": 0}'
+            - '--limit-mm-per-prompt={"image": 2}'
           env:
-            - { name: VLLM_ENGINE_READY_TIMEOUT_S, value: "3600" }
+            - { name: VLLM_ENGINE_READY_TIMEOUT_S, value: "3600" }  # engine startup includes weight download
             - { name: HF_HUB_DISABLE_XET, value: "1" }
-            - { name: HF_HUB_CACHE, value: /models-fe }
+            - { name: HF_HUB_CACHE, value: /models-fe }  # frontend's own tokenizer/config cache
           ports:
             - { name: modelserver, containerPort: 8000, protocol: TCP }
           readinessProbe:
@@ -130,7 +128,7 @@ spec:
           emptyDir: {}
         - name: model-cache
           persistentVolumeClaim:
-            claimName: gemma4-e4b-model-cache   # persists weights across redeploys
+            claimName: gemma3-model-cache   # persists weights across redeploys
         - name: trace
           emptyDir: {}
         - name: fe-models

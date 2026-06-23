@@ -1,16 +1,6 @@
 #!/usr/bin/env bash
-#
-# Drive a tap-recorded latency capture against the trace-capture-h200 pod and pull
-# both recordings: the tap trace (server-side: full per-token ITL arrays, arrival
-# schedule, per-gap batch context) and the loadgen's client-side measurements from
-# the SAME run, so the two can be compared request-for-request.
-#
-# Prereqs: deployment scaled to 1 and READY (just capture-up && just capture-status),
-# kubecontext pointed at the right cluster, uv installed.
-#
-# The load generator is deploy/trace-capture/loadgen.py. guidellm 0.6.0 deadlocks
-# pre-flight against the Rust frontend regardless of flags (see the memory notes in
-# guidellm-concurrent-stall-workaround), so it is not used here.
+# Run loadgen against trace-capture-h200; pull tap trace + client-side JSON to OUT_DIR.
+# Prereqs: deployment ready (just capture-up). Uses deploy/trace-capture/loadgen.py.
 set -euo pipefail
 
 NS="${NS:-${NAMESPACE:-inference-sim}}"

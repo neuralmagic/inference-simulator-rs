@@ -5,7 +5,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: trace-capture-diffusiongemma
-  namespace: your-namespace
   labels:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: diffusiongemma-26B-A4B
@@ -22,7 +21,6 @@ spec:
         llm-d.ai/guide: trace-capture-dg
         llm-d.ai/model: diffusiongemma-26B-A4B
     spec:
-      serviceAccountName: your-gpu-serviceaccount
       containers:
         # --- Real engine: headless diffusiongemma at the protocol-pinned commit ----------
         - name: engine

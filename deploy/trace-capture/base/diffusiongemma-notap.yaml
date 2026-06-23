@@ -3,7 +3,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: trace-capture-dg-notap
-  namespace: your-namespace
   labels:
     llm-d.ai/guide: trace-capture-dgnotap
     llm-d.ai/model: diffusiongemma-26B-A4B
@@ -20,7 +19,6 @@ spec:
         llm-d.ai/guide: trace-capture-dgnotap
         llm-d.ai/model: diffusiongemma-26B-A4B
     spec:
-      serviceAccountName: your-gpu-serviceaccount
       containers:
       - name: engine
         image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:16e91176cf77bf0f40ae48da22365a5e21b517af

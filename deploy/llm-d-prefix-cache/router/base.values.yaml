@@ -1,6 +1,5 @@
-# Vendored from llm-d guides/recipes/router/base.values.yaml (llm-d v0.7.0).
-# Base values shared by the llm-d Router (EPP + Envoy sidecar). Layered under the
-# pd-disaggregation values.
+# Vendored from llm-d v0.7.0 router guide. Base EPP scheduler + Envoy proxy sizing.
+# Layered under precise-prefix-cache-routing.values.yaml.
 router:
   epp:
     replicas: 1

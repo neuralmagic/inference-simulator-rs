@@ -1,15 +1,8 @@
-# Self-contained llm-d prefill/decode deployment driven by the vllm-vcr image.
-# GPU-free: the prefill/decode pods run the real vLLM Rust frontend + our mock engine,
-# moving KV over NIXL/UCX on CPU, behind the real llm-d Router (EPP) and routing sidecar.
-#
-# Prereqs (see README.md): a kube context with the llm-d control-plane deps, the GAIE
-# CRDs applied, and the target namespace created.
-#
-#   helmfile -f deploy/llm-d-pd/helmfile.yaml apply
+# GPU-free llm-d prefill/decode stack (vllm-vcr mock engines + NIXL on CPU).
+# Prereqs: see deploy/llm-d-pd/README.md. Deploy: helmfile -f deploy/llm-d-pd/helmfile.yaml apply
 
 releases:
-  # 1. llm-d Router: EPP (scheduler), Envoy sidecar, and the InferencePool that selects
-  #    our pods via matchLabels {llm-d.ai/guide: pd-disaggregation}.
+  # llm-d Router (EPP + Envoy); selects pods labeled pd-disaggregation.
   - name: pd-disaggregation
     namespace: llm-d-pd-mock
     chart: oci://ghcr.io/llm-d/charts/llm-d-router-standalone-dev
@@ -18,7 +11,7 @@ releases:
       - router/base.values.yaml
       - router/pd-disaggregation.values.yaml
 
-  # 2. Mock model servers: prefill + decode Deployments (kustomize) using our image.
+  # Mock prefill + decode Deployments (kustomize).
   - name: mock-modelservers
     namespace: llm-d-pd-mock
     chart: ./modelserver

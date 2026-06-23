@@ -1,0 +1,22 @@
+# Trace capture Deployments, PVCs, and conformance queue (cluster-agnostic base).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - h200-capture.yaml
+  - h200-capture-agentic.yaml
+  - offline-replay.yaml
+  - conformance-queue.yaml
+  - gemma3-capture.yaml
+  - gemma4-capture.yaml
+  - gemma4-31b-capture.yaml
+  - gemma4-31b-bf16-capture.yaml
+  - gemma4-e4b-capture.yaml
+  - diffusiongemma-capture.yaml
+  - diffusiongemma-notap.yaml
+  - diffusiongemma-single.yaml
+  - pvcs/gemma3-model-cache-pvc.yaml
+  - pvcs/gemma4-model-cache-pvc.yaml
+  - pvcs/gemma4-31b-model-cache-pvc.yaml
+  - pvcs/gemma4-31b-bf16-model-cache-pvc.yaml
+  - pvcs/gemma4-e4b-model-cache-pvc.yaml

@@ -1,24 +1,5 @@
-# Kustomize strategic-merge patch: inject the recording tap into an existing
-# disaggregated vLLM pod (a `vllm-rs serve` frontend + a `vllm serve --headless`
-# engine in one pod). Reference it from your kustomization.yaml:
-#
-#   patches:
-#     - path: tap-sidecar-patch.yaml
-#       target: { kind: Deployment, name: YOUR-MODELSERVER }
-#
-# The tap sits on the frontend<->engine ZMQ boundary, so the patch does three
-# things:
-#   1. adds the tap container (binds :5580 for the engine, dials the frontend
-#      on :5570, writes the trace to an emptyDir);
-#   2. REQUIRES the engine to connect to the tap instead of the frontend:
-#      strategic merge replaces scalar lists wholesale, so restate your
-#      engine's full args with `--data-parallel-rpc-port=5580` (the tap's
-#      --engine-handshake port). The frontend keeps binding :5570.
-#   3. adds the trace volume.
-#
-# Caveats (see README.md): the engine image must match the protocol commit the
-# tap was built against; the three processes handshake once, in order, so
-# delete the pod if any container restarts; aborts are not recorded.
+# Kustomize patch: inject vllm-vcr record tap between frontend (:5570) and engine (:5580).
+# Target YOUR-MODELSERVER in your kustomization patches list. Delete pod if any container restarts.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

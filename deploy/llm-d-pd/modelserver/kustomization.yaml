@@ -1,3 +1,4 @@
+# Prefill + decode Deployments and shared ServiceAccount for llm-d P/D mock stack.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -6,7 +7,7 @@ resources:
   - prefill-deployment.yaml
   - decode-deployment.yaml
 
-# Repoint the image here (e.g. to a freshly built tag) without editing the Deployments.
+# Bump image tag here without editing the Deployments.
 images:
   - name: ghcr.io/neuralmagic/vllm-vcr
     newTag: vllm0.23

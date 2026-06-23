@@ -1,15 +1,5 @@
 #!/usr/bin/env bash
-#
-# DiffusionGemma image-in / text-out e2e smoke: prove a client gets coherent
-# content back through the full frontend -> tap -> engine path with an image in
-# the request. Run AFTER the rig is ready (just dg-up / kubectl rollout status).
-#
-# Note: the PYTHON frontend fetches image_url server-side, so the frontend pod
-# needs egress to the image host (istio egress is slow but works for plain
-# HTTP). Swap to an inline data: URI if egress is blocked.
-#
-# max_tokens is set explicitly on purpose: we pinned the engine to eb28452,
-# which predates #45417's "unset HF default max_new_tokens" fix.
+# DiffusionGemma image-in smoke: frontend → tap → engine. Set max_tokens (engine eb28452).
 set -euo pipefail
 
 NS="${NS:-your-namespace}"

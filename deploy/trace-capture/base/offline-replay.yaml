@@ -4,7 +4,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: offline-replay
-  namespace: weaton-dev
   labels:
     llm-d.ai/guide: offline-replay
     llm-d.ai/model: Qwen3-Coder-30B-A3B

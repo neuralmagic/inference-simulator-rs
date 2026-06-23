@@ -1,7 +1,5 @@
-# Decode instances. Same image as prefill but MOCK_PD_ROLE=decode, with the real
-# llm-d routing sidecar in front (native sidecar initContainer): sidecar :8000 ->
-# vllm-rs :8200. The sidecar drives the NIXL V2 P/D handshake; our engine plays the
-# NixlConnector role and pulls KV from the chosen prefill over NIXL.
+# Decode pod: llm-d routing sidecar (:8000) → vllm-rs + mock engine (:8200).
+# MOCK_PD_ROLE=decode pulls KV from prefill over NIXL (:5600). Same vllm-vcr image as prefill.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,10 +23,11 @@ spec:
         llm-d.ai/role: decode
     spec:
       serviceAccountName: mock-pd-sa
+      # Sidecar: router traffic on :8000, NIXL V2 P/D handshake, forwards to :8200.
       initContainers:
         - name: routing-proxy
           image: ghcr.io/llm-d/llm-d-routing-sidecar:v0.8.0
-          restartPolicy: Always # native sidecar
+          restartPolicy: Always
           args:
             - --port=8000
             - --vllm-port=8200
@@ -58,9 +57,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-            # Latency model (ms). Decode requests are do_remote_prefill, so their TTFT is
-            # the KV-cache transfer time (per prompt token, matching the real NIXL pull),
-            # then inter-token latency per generated token. All simulated; tune to taste.
+            # Simulated latency (ms): KV transfer = TTFT, then ITL per token.
             - name: MOCK_KV_TRANSFER_TIME_PER_TOKEN_MS
               value: "1"
             - name: MOCK_KV_TRANSFER_TIME_STDDEV_MS

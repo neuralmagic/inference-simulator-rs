@@ -1,14 +1,6 @@
 #!/usr/bin/env bash
-#
-# gemma-4 image-in / text-out e2e smoke: prove a client gets coherent content back
-# through the full frontend -> tap -> engine path with an INLINE image (no egress).
-#
-# The frontend fetches remote image_url server-side, which 403s through istio
-# egress, so we embed a solid-red PNG as a base64 data: URI built inline (pure
-# zlib, no PIL). Expect a 200 + a caption that mentions red.
-#
-# max_tokens is set explicitly on purpose: the engine is pinned to 16e91176, which
-# predates #45417's "unset HF default max_new_tokens" fix.
+# Gemma-4 image-in smoke: inline base64 PNG through frontend → tap → engine.
+# Set max_tokens explicitly (engine pinned to 16e91176, predates #45417).
 set -euo pipefail
 
 NS="${NS:-your-namespace}"

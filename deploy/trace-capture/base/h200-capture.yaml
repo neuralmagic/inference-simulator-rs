@@ -5,7 +5,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: trace-capture-h200
-  namespace: weaton-dev
   labels:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: Qwen3-8B
@@ -22,7 +21,6 @@ spec:
         llm-d.ai/guide: trace-capture
         llm-d.ai/model: Qwen3-8B
     spec:
-      serviceAccountName: modelexpress-p2p-nvidia-gpu-vllm-sa
       containers:
         # --- Real engine: headless vLLM at the protocol-pinned commit -------------------
         - name: engine

@@ -39,30 +39,6 @@ file_bytes() {
     wc -c < "$1" | tr -d '[:space:]'
 }
 
-capture_service_accounts() {
-    python3 - "${TARGETS}" <<'PY'
-import sys
-import tomllib
-
-targets = sys.argv[1].split()
-with open("deploy/trace-capture/models.toml", "rb") as f:
-    data = tomllib.load(f)
-
-defaults = data.get("defaults", {})
-captures = {c["name"]: c for c in data.get("capture", [])}
-accounts = []
-for target in targets:
-    capture = captures.get(target)
-    if not capture:
-        continue
-    account = capture.get("service_account", defaults.get("service_account"))
-    if account and account not in accounts:
-        accounts.append(account)
-
-print(" ".join(accounts))
-PY
-}
-
 validate_capture_matrix() {
     python3 - "${TARGETS}" <<'PY'
 import sys
@@ -140,23 +116,6 @@ metadata:
 spec:
   clusterQueue: ${QUEUE_NAME}
 YAML
-
-for service_account in $(capture_service_accounts); do
-    if [[ ! "${service_account}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
-        log "ERROR: invalid Kubernetes service account: ${service_account}"
-        exit 1
-    fi
-
-    log "Ensuring ServiceAccount ${service_account} exists in namespace ${NAMESPACE}"
-    cat <<YAML | kubectl apply -f -
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ${service_account}
-  namespace: ${NAMESPACE}
-automountServiceAccountToken: false
-YAML
-done
 group_end
 
 group_start "Prepare validation scripts"

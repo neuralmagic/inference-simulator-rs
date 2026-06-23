@@ -1,16 +1,8 @@
-# Vendored from llm-d v0.7.0 guides/precise-prefix-cache-routing/router/
-# precise-prefix-cache-routing.values.yaml, adapted for the mock model server:
-#   - small model (Qwen/Qwen3-0.6B) so the frontend tokenizer is light,
-#   - matchLabels point at our mock pods,
-#   - single EPP replica (no HA) to keep the GPU-free testbed minimal.
-#
-# The precise-prefix-cache-producer subscribes to each pod's KV-cache events (the ones our
-# mock engine emits on :5556), indexes the prefix blocks by re-hashing token_ids at
-# blockSize 64, and prefix-cache-scorer routes to the pod holding the longest match.
+# Prefix-cache routing: EPP indexes KV events from pods (:5556), routes by longest prefix match.
+# matchLabels: llm-d.ai/guide=precise-prefix-cache-routing. blockSize 64 must match MOCK_TOKENS_PER_BLOCK.
 router:
   tokenizer:
     enabled: true
-    # Must match the deployed model server and the token-producer modelName below.
     modelName: Qwen/Qwen3-0.6B
 
   epp:
@@ -23,14 +15,13 @@ router:
         plugins:
           - type: token-producer
             parameters:
-              modelName: Qwen/Qwen3-0.6B # Must match router.tokenizer.modelName above
+              modelName: Qwen/Qwen3-0.6B
               vllm:
                 url: "http://localhost:8000"
           - type: endpoint-notification-source
           - type: precise-prefix-cache-producer
             parameters:
               tokenProcessorConfig:
-                # Must match the model server's MOCK_TOKENS_PER_BLOCK (64).
                 blockSize: 64
               speculativeIndexing: true
               indexerConfig:
@@ -41,7 +32,6 @@ router:
                 concurrency: 8
                 discoverPods: true
                 podDiscoveryConfig:
-                  # Must match the model server's KV-events container port (5556).
                   socketPort: 5556
           - type: prefix-cache-scorer
             parameters:

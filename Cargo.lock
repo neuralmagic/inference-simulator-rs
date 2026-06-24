@@ -3263,7 +3263,7 @@ dependencies = [
  "rand",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tracing",
 ]
 
@@ -3846,7 +3846,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_tuple",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sim-compat",
  "sim-protocol",
  "sim-s3",
@@ -4262,7 +4262,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sim-compat",
  "toml_edit",
 ]

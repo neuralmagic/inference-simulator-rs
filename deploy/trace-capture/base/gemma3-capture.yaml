@@ -8,8 +8,9 @@ metadata:
   labels:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: gemma-3-27b
+    llm-d.ai/recipe: conformance
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       llm-d.ai/guide: trace-capture-g3

@@ -7,8 +7,9 @@ metadata:
   labels:
     llm-d.ai/guide: trace-capture-dg-single
     llm-d.ai/model: diffusiongemma-26B-A4B
+    llm-d.ai/recipe: conformance
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       llm-d.ai/guide: trace-capture-dg-single

@@ -4,6 +4,8 @@ apiVersion: kueue.x-k8s.io/v1beta1
 kind: ClusterQueue
 metadata:
   name: conformance-queue
+  labels:
+    llm-d.ai/recipe: conformance
 spec:
   namespaceSelector: {} # any namespace whose LocalQueue points here
   queueingStrategy: BestEffortFIFO
@@ -21,5 +23,7 @@ kind: LocalQueue
 metadata:
   name: conformance-queue
   namespace: inference-sim
+  labels:
+    llm-d.ai/recipe: conformance
 spec:
   clusterQueue: conformance-queue

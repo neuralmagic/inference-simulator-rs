@@ -8,8 +8,9 @@ metadata:
   labels:
     llm-d.ai/guide: trace-capture-agentic
     llm-d.ai/model: Qwen3-Coder-30B-A3B
+    llm-d.ai/recipe: agentic
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       llm-d.ai/guide: trace-capture-agentic

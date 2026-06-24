@@ -102,7 +102,7 @@ log "Ensuring namespace ${NAMESPACE} exists"
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
 if ! kubectl get clusterqueue "${QUEUE_NAME}" >/dev/null 2>&1; then
-    log "ERROR: missing ClusterQueue ${QUEUE_NAME}; apply deploy/trace-capture/conformance-queue.yaml first"
+    log "ERROR: missing ClusterQueue ${QUEUE_NAME}; apply conformance queue from deploy/trace-capture/base/conformance-queue.yaml first"
     exit 1
 fi
 

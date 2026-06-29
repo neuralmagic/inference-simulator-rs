@@ -17,11 +17,13 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
+use tracing::info;
 
-use crate::trace::{ItlSummary, TraceMeta, TraceRecord, read_trace, write_trace};
+use crate::trace::{ItlSummary, TraceMeta, TraceFinishReason, TraceRecord, read_trace, write_trace};
 
 // guidellm JSON schema (minimal subset we actually use)
 
@@ -315,6 +317,264 @@ pub fn summarize_trace(reader: impl BufRead) -> Result<(TraceMeta, Vec<BucketSta
 
     Ok((meta, stats))
 }
+
+/// Conversation structure in ShareGPT/similiar datasets
+#[derive(Debug, Deserialize)]
+pub struct Conversation {
+    pub id: String,
+    pub messages: Vec<Message>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Message {
+    pub role: String,
+    pub content: String,
+}
+
+/// Load a tokenizer from HuggingFace Hub
+fn load_tokenizer(model_name: &str) -> Result<tokenizers::Tokenizer> {
+    use hf_hub::api::sync::Api;
+
+    // Download tokenizer.json from HuggingFace
+    let api = Api::new().context("initializing HuggingFace Hub API")?;
+    let repo = api.model(model_name.to_string());
+    let tokenizer_path = repo.get("tokenizer.json")
+        .context("downloading tokenizer.json from HuggingFace")?;
+
+    // Load tokenizer from file
+    tokenizers::Tokenizer::from_file(tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("loading tokenizer: {}", e))
+}
+
+/// Convert a dataset file (CSV/JSON/JSONL/Parquet) to trace JSONL format.
+/// Uses a HuggingFace tokenizer to extract real token IDs from conversation text.
+pub fn convert_dataset_to_trace(
+    input_path: &Path,
+    output_path: &Path,
+) -> Result<()> {
+    use std::fs::File;
+    use std::io::BufWriter;
+
+    info!(
+        input = %input_path.display(),
+        output = %output_path.display(),
+        "Converting dataset to trace format"
+    );
+
+    // Load tokenizer (default to GPT-2, which works for many models)
+    // TODO: Make tokenizer configurable via CLI arg or auto-detect from model metadata
+    let tokenizer = load_tokenizer("gpt2")?;
+
+    info!("Loaded tokenizer: gpt2");
+
+    let ext = input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    let conversations = match ext {
+        "csv" => parse_csv_dataset(input_path)?,
+        "json" | "jsonl" => parse_json_dataset(input_path)?,
+        "parquet" => parse_parquet_dataset(input_path)?,
+        _ => bail!(
+            "Unsupported dataset format: {} (supported: csv, json, jsonl, parquet)",
+            ext
+        ),
+    };
+
+    if conversations.is_empty() {
+        bail!("Dataset contains no valid conversations");
+    }
+
+    // Convert conversations to trace records using real tokenization
+    let mut records = Vec::new();
+    for (idx, conv) in conversations.iter().enumerate() {
+        match convert_conversation_to_trace(conv, &tokenizer) {
+            Ok(record) => records.push(record),
+            Err(e) => {
+                tracing::warn!(idx, conv_id = %conv.id, error = %e, "Skipping invalid conversation");
+            }
+        }
+    }
+
+    if records.is_empty() {
+        bail!("No valid trace records generated from dataset");
+    }
+
+    // Write trace file
+    let meta = TraceMeta {
+        model: None,
+        gpu: None,
+        tp: None,
+        max_num_seqs: None,
+        source: Some(format!("dataset:{}", input_path.file_name().unwrap().to_string_lossy())),
+        block_size: None,
+        config_hash: None,
+        vllm_version: None,
+        ready_response_hex: None,
+        extra: HashMap::new(),
+    };
+
+    let file = File::create(output_path)
+        .with_context(|| format!("creating output file: {}", output_path.display()))?;
+    let mut writer = BufWriter::new(file);
+    write_trace(&mut writer, &meta, &records)?;
+
+    info!(records = records.len(), "Dataset conversion complete");
+    Ok(())
+}
+
+fn parse_csv_dataset(path: &Path) -> Result<Vec<Conversation>> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let file = File::open(path)?;
+    let mut reader = csv::Reader::from_reader(BufReader::new(file));
+    let mut conversations = Vec::new();
+
+    for result in reader.deserialize() {
+        let conv: Conversation = result?;
+        conversations.push(conv);
+    }
+
+    Ok(conversations)
+}
+
+fn parse_json_dataset(path: &Path) -> Result<Vec<Conversation>> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let file = File::open(path)?;
+
+    // Try parsing as JSON array first
+    let reader = BufReader::new(file);
+    if let Ok(convs) = serde_json::from_reader::<_, Vec<Conversation>>(reader) {
+        return Ok(convs);
+    }
+
+    // Fall back to JSONL (one conversation per line)
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut conversations = Vec::new();
+
+    for line in BufRead::lines(reader) {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let conv: Conversation = serde_json::from_str(&line)?;
+        conversations.push(conv);
+    }
+
+    Ok(conversations)
+}
+
+fn parse_parquet_dataset(path: &Path) -> Result<Vec<Conversation>> {
+    use std::fs::File;
+    use arrow::array::RecordBatch;
+    use arrow::json::ArrayWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut conversations = Vec::new();
+
+    for batch_result in reader {
+        let batch: RecordBatch = batch_result?;
+
+        // Convert Arrow batch to JSON using ArrayWriter
+        let mut json_buf = Vec::new();
+        {
+            let mut writer = ArrayWriter::new(&mut json_buf);
+            writer.write(&batch)?;
+            writer.finish()?;
+        }
+
+        // Parse JSON lines
+        let json_str = String::from_utf8(json_buf)
+            .context("converting Arrow JSON to UTF-8")?;
+
+        for line in json_str.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(conv) = serde_json::from_str::<Conversation>(line) {
+                conversations.push(conv);
+            }
+        }
+    }
+
+    Ok(conversations)
+}
+
+/// Convert a ShareGPT-like conversation to a TraceRecord by tokenizing the text
+/// and extracting real token IDs.
+fn convert_conversation_to_trace(
+    conv: &Conversation,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<TraceRecord> {
+    // Extract prompt (all messages before first assistant/gpt response)
+    let prompt_msgs: Vec<_> = conv
+        .messages
+        .iter()
+        .take_while(|m| m.role != "assistant" && m.role != "gpt")
+        .collect();
+
+    if prompt_msgs.is_empty() {
+        bail!("No user messages found in conversation {}", conv.id);
+    }
+
+    // Extract response (first assistant/gpt message)
+    let response = conv
+        .messages
+        .iter()
+        .find(|m| m.role == "assistant" || m.role == "gpt")
+        .with_context(|| format!("No assistant response in conversation {}", conv.id))?;
+
+    // Tokenize prompt text to get real token IDs
+    let prompt_text = prompt_msgs
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let prompt_encoding = tokenizer
+        .encode(prompt_text.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("tokenizing prompt: {}", e))?;
+    let prompt_tokens = prompt_encoding.len();
+
+    // Tokenize response text to get real output token IDs
+    let response_encoding = tokenizer
+        .encode(response.content.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("tokenizing response: {}", e))?;
+
+    let output_token_ids: Vec<u32> = response_encoding.get_ids().to_vec();
+    let output_tokens = output_token_ids.len();
+
+    if output_tokens == 0 {
+        bail!("Empty response after tokenization in conversation {}", conv.id);
+    }
+
+    Ok(TraceRecord {
+        prompt_tokens,
+        cached_tokens: 0,
+        output_tokens,
+        ttft_ms: 0.0,  // Placeholder - runtime latency model fills this
+        itl_ms: None,
+        itl_summary: None,
+        concurrency: 1,
+        arrival_ms: None,
+        itl_ctx: None,
+        block_hashes: None,
+        output_token_ids: Some(output_token_ids),
+        finish_reason: Some(TraceFinishReason::Stop),
+        itl_tokens: None,
+    })
+}
+
+
 
 /// Write the summary as aligned plain text.
 pub fn write_summary(

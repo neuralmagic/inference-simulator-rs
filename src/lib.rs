@@ -121,23 +121,20 @@ pub struct Opt {
     #[arg(long, default_value_t = 32_000)]
     pub vocab_size: u32,
 
-    /// Path or `s3://bucket/key` URI to a JSONL trace whose recorded output
-    /// token ids (tap `--record-tokens`) are served verbatim instead of random tokens, making
-    /// replayed streams content-identical to the capture. A request resolves
-    /// to its record through the trailing `-<index>` of its request id, where
-    /// the index is the record's position in the arrival-ordered subset (the
-    /// arrival-replay harness names them `replay-{i}`). Unmatched requests
+    /// Path or `s3://bucket/key`/`hf://org/repo/file` URI to a JSONL trace whose
+    /// recorded output token ids (tap `--record-tokens`) are served verbatim instead
+    /// of random tokens, making replayed streams content-identical to the capture.
+    /// A request resolves to its record through the trailing `-<index>` of its request
+    /// id (the arrival-replay harness names them `replay-{i}`) or, with
+    /// `--replay-match prefix`, by longest block-hash prefix match. Unmatched requests
     /// fall back to random tokens.
+    ///
+    /// Also accepts HuggingFace-style dataset files (JSON/JSONL/CSV/Parquet): the
+    /// dataset is loaded in memory at startup, prompts and responses are tokenized
+    /// with the GPT-2 tokenizer (downloaded from HuggingFace), and output tokens are
+    /// served directly via [`tokens::HFDatasetTokens`] — no trace conversion.
     #[arg(long)]
     pub replay_tokens: Option<TraceUri>,
-
-    /// HuggingFace dataset (path, s3://, or hf:// URI) to drive output token generation.
-    /// Supports JSON/JSONL/CSV/Parquet formats. Use hf://org/repo/file.json to download
-    /// from HuggingFace Hub. Each request is assigned to a dataset row sequentially
-    /// (round-robin). Responses are tokenized using GPT-2 tokenizer from HuggingFace
-    /// (downloaded automatically). Mutually exclusive with `--replay-tokens`.
-    #[arg(long)]
-    pub dataset_tokens: Option<TraceUri>,
 
     /// JSONL trace (path or `s3://bucket/key` URI) whose recorded per-chunk
     /// decode timing (`itl_ms` gaps and
@@ -440,31 +437,26 @@ impl Opt {
         }
     }
 
-    /// Build the token source: dataset-driven tokens (from `--dataset-tokens`),
-    /// replay recorded output ids (from `--replay-tokens`), or random draws.
-    /// Returns an error if inputs are invalid or mutually exclusive flags are set.
+    /// Build the token source: replay recorded output ids or dataset-driven tokens
+    /// (from `--replay-tokens`), or random draws.
     pub(crate) fn build_token_source(&self) -> Result<Box<dyn tokens::TokenSource>> {
-        // Check for mutually exclusive flags
-        if self.dataset_tokens.is_some() && self.replay_tokens.is_some() {
-            bail!("--dataset-tokens and --replay-tokens are mutually exclusive");
-        }
-
-        // Dataset-driven tokens
-        if let Some(uri) = &self.dataset_tokens {
-            let dataset_path = local_input(uri, "--dataset-tokens")?;
-            return Ok(Box::new(tokens::HFDatasetTokens::from_file(
-                &dataset_path,
-                self.vocab_size,
-            )?));
-        }
-
-        // Replay tokens from trace
         let Some(uri) = &self.replay_tokens else {
             return Ok(Box::new(tokens::RandomTokens {
                 vocab_size: self.vocab_size,
             }));
         };
-        let (meta, records) = trace::read_trace_file(local_input(uri, "--replay-tokens")?)?;
+
+        let path = local_input(uri, "--replay-tokens")?;
+        if sim_trace::dataset_convert::is_dataset_file(path)? {
+            return Ok(Box::new(tokens::HFDatasetTokens::from_file(
+                path,
+                self.tokens_per_block,
+                self.vocab_size,
+                self.replay_match,
+            )?));
+        }
+
+        let (meta, records) = trace::read_trace_file(path)?;
         let subset = trace::replay_subset(records);
         if subset.is_empty() {
             bail!(
@@ -765,7 +757,6 @@ async fn materialize_remote_inputs(opt: &mut Opt) -> Result<()> {
         std::collections::HashMap::new();
 
     for field in [
-        &mut opt.dataset_tokens,
         &mut opt.replay_tokens,
         &mut opt.replay_steps,
         &mut opt.latency_trace,

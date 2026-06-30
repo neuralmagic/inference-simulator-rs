@@ -248,6 +248,76 @@ fn first_string_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Op
         .find_map(|key| obj.get(*key).and_then(Value::as_str).map(str::to_string))
 }
 
+/// Whether `--replay-tokens` should load this path as an in-memory HuggingFace
+/// dataset rather than a captured trace JSONL.
+pub fn is_dataset_file(path: &Path) -> Result<bool> {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
+    {
+        return Ok(false);
+    }
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "csv" | "parquet" => return Ok(true),
+        "json" | "jsonl" => {}
+        _ => return Ok(false),
+    }
+
+    let content = std::fs::read(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if content.is_empty() {
+        return Ok(false);
+    }
+
+    if ext == "jsonl" || looks_like_jsonl(&content) {
+        for line in BufReader::new(content.as_slice()).lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(trimmed)
+                .with_context(|| format!("parsing first line of {}", path.display()))?;
+            return Ok(!looks_like_trace_record(&value) && !value.get("meta").is_some());
+        }
+        return Ok(false);
+    }
+
+    let value: Value =
+        serde_json::from_slice(&content).context("parsing JSON file")?;
+    if value.get("meta").is_some() || value.get("benchmarks").is_some() {
+        return Ok(false);
+    }
+    Ok(!looks_like_trace_json(&value))
+}
+
+fn looks_like_trace_json(value: &Value) -> bool {
+    match value {
+        Value::Array(rows) => rows.first().is_some_and(looks_like_trace_record),
+        Value::Object(map) => {
+            for key in ["train", "validation", "test", "data"] {
+                if let Some(Value::Array(rows)) = map.get(key) {
+                    return rows.first().is_some_and(looks_like_trace_record);
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn looks_like_trace_record(value: &Value) -> bool {
+    value.get("ttft_ms").and_then(Value::as_f64).is_some()
+        && value.get("prompt_tokens").is_some()
+        && value.get("output_tokens").is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +347,40 @@ mod tests {
         let response1 = extract_response(&rows[0]).unwrap();
         assert_eq!(response1, "Hello there");
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn is_dataset_file_detects_instruction_json() {
+        let dir = std::env::temp_dir().join(format!(
+            "sim-trace-dataset-detect-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("data.json");
+        std::fs::write(
+            &input,
+            r#"[{"instruction":"Say hi","output":"Hello there"}]"#,
+        )
+        .unwrap();
+        assert!(is_dataset_file(&input).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn is_dataset_file_rejects_trace_shape_jsonl() {
+        let dir = std::env::temp_dir().join(format!(
+            "sim-trace-trace-detect-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("trace.jsonl");
+        std::fs::write(
+            &input,
+            r#"{"prompt_tokens":10,"output_tokens":5,"ttft_ms":10.0,"concurrency":1}"#,
+        )
+        .unwrap();
+        assert!(!is_dataset_file(&input).unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -12,6 +12,8 @@ description = "S3 object I/O for vllm-vcr trace files: materialize a remote trac
 anyhow = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+hf-hub = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 hf-hub = { workspace = true }

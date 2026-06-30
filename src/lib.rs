@@ -131,6 +131,14 @@ pub struct Opt {
     #[arg(long)]
     pub replay_tokens: Option<TraceUri>,
 
+    /// HuggingFace dataset (path, s3://, or hf:// URI) to drive output token generation.
+    /// Supports JSON/JSONL/CSV/Parquet formats. Use hf://org/repo/file.json to download
+    /// from HuggingFace Hub. Each request is assigned to a dataset row sequentially
+    /// (round-robin). Responses are tokenized using GPT-2 tokenizer from HuggingFace
+    /// (downloaded automatically). Mutually exclusive with `--replay-tokens`.
+    #[arg(long)]
+    pub dataset_tokens: Option<TraceUri>,
+
     /// JSONL trace (path or `s3://bucket/key` URI) whose recorded per-chunk
     /// decode timing (`itl_ms` gaps and
     /// `itl_tokens` burst sizes) is replayed VERBATIM, the timing/framing
@@ -432,9 +440,25 @@ impl Opt {
         }
     }
 
-    /// Build the token source: replay recorded output ids (from `--replay-tokens`) or
-    /// random draws. Returns an error if the trace is unreadable or carries no tokens.
+    /// Build the token source: dataset-driven tokens (from `--dataset-tokens`),
+    /// replay recorded output ids (from `--replay-tokens`), or random draws.
+    /// Returns an error if inputs are invalid or mutually exclusive flags are set.
     pub(crate) fn build_token_source(&self) -> Result<Box<dyn tokens::TokenSource>> {
+        // Check for mutually exclusive flags
+        if self.dataset_tokens.is_some() && self.replay_tokens.is_some() {
+            bail!("--dataset-tokens and --replay-tokens are mutually exclusive");
+        }
+
+        // Dataset-driven tokens
+        if let Some(uri) = &self.dataset_tokens {
+            let dataset_path = local_input(uri, "--dataset-tokens")?;
+            return Ok(Box::new(tokens::HFDatasetTokens::from_file(
+                &dataset_path,
+                self.vocab_size,
+            )?));
+        }
+
+        // Replay tokens from trace
         let Some(uri) = &self.replay_tokens else {
             return Ok(Box::new(tokens::RandomTokens {
                 vocab_size: self.vocab_size,
@@ -741,6 +765,7 @@ async fn materialize_remote_inputs(opt: &mut Opt) -> Result<()> {
         std::collections::HashMap::new();
 
     for field in [
+        &mut opt.dataset_tokens,
         &mut opt.replay_tokens,
         &mut opt.replay_steps,
         &mut opt.latency_trace,

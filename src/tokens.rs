@@ -4,13 +4,18 @@
 //! that paces them. The default `RandomTokens` reproduces the original behavior: uniform
 //! random draws from `0..vocab_size` using the per-request seeded rng. `ReplayTokens`
 //! serves the output ids recorded in a trace (tap `--record-tokens`), making replayed
-//! streams content-identical to the capture.
+//! streams content-identical to the capture. `HFDatasetTokens` loads a HuggingFace dataset
+//! and serves tokenized responses directly, enabling dataset-driven token generation.
 
 use std::collections::HashMap;
+use std::path::Path;
 
+use anyhow::{Context as _, Result};
+use hf_hub::api::sync::Api;
 use rand::Rng as _;
 use rand::rngs::StdRng;
-use tracing::{debug, warn};
+use tokenizers::Tokenizer;
+use tracing::{debug, info, warn};
 use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
 use crate::trace::TraceRecord;
@@ -276,6 +281,179 @@ impl TokenSource for PrefixMatchTokens {
 
     fn finish_reason(&self, request_id: &str) -> Option<EngineCoreFinishReason> {
         self.record(request_id).and_then(|r| r.finish_reason)
+    }
+}
+
+/// One dataset row with prompt and tokenized response.
+struct DatasetRow {
+    #[allow(dead_code)]
+    prompt_text: String,
+    #[allow(dead_code)]
+    response_text: String,
+    response_tokens: Vec<u32>,
+}
+
+/// Serves tokens from a HuggingFace dataset by tokenizing response text.
+///
+/// Requests are assigned to dataset rows sequentially (round-robin when the
+/// dataset exhausts). This enables content-driven simulation where output tokens
+/// come from actual dataset text rather than random draws or pre-recorded traces.
+pub(crate) struct HFDatasetTokens {
+    rows: Vec<DatasetRow>,
+    /// Map from request_id to assigned row index
+    assignments: HashMap<String, usize>,
+    /// Next unused row index (for sequential assignment)
+    next_row: usize,
+    /// Current token position per request
+    positions: HashMap<String, usize>,
+    /// Fallback when position exceeds row tokens
+    fallback: RandomTokens,
+}
+
+impl HFDatasetTokens {
+    /// Load a dataset file and tokenize all responses using GPT-2 tokenizer from HuggingFace.
+    pub(crate) fn from_file(
+        dataset_path: &Path,
+        vocab_size: u32,
+    ) -> Result<Self> {
+        info!(
+            dataset = %dataset_path.display(),
+            "loading dataset with GPT-2 tokenizer from HuggingFace (openai-community/gpt2)"
+        );
+
+        // Download tokenizer.json from HuggingFace
+        let api = Api::new()
+            .map_err(|e| anyhow::anyhow!("initializing HuggingFace API: {}", e))?;
+        let repo = api.model("openai-community/gpt2".to_string());
+        let tokenizer_file = repo.get("tokenizer.json")
+            .map_err(|e| anyhow::anyhow!("downloading GPT-2 tokenizer from HuggingFace: {}", e))?;
+
+        info!(
+            tokenizer_cache = %tokenizer_file.display(),
+            "GPT-2 tokenizer cached"
+        );
+
+        let tokenizer = Tokenizer::from_file(tokenizer_file)
+            .map_err(|e| anyhow::anyhow!("loading GPT-2 tokenizer: {}", e))?;
+
+        let json_rows = sim_trace::dataset_convert::parse_dataset(dataset_path)
+            .with_context(|| format!("parsing dataset {}", dataset_path.display()))?;
+
+        if json_rows.is_empty() {
+            anyhow::bail!("dataset {} contains no rows", dataset_path.display());
+        }
+
+        let mut rows = Vec::with_capacity(json_rows.len());
+        for (idx, row) in json_rows.iter().enumerate() {
+            let prompt_text = sim_trace::dataset_convert::extract_prompt(row)
+                .with_context(|| format!("extracting prompt from row {idx}"))?;
+            let response_text = sim_trace::dataset_convert::extract_response(row)
+                .with_context(|| format!("extracting response from row {idx}"))?;
+
+            let encoding = tokenizer
+                .encode(response_text.clone(), false)
+                .map_err(|e| anyhow::anyhow!("tokenizing response for row {idx}: {e}"))?;
+
+            let response_tokens: Vec<u32> = encoding.get_ids().to_vec();
+
+            if response_tokens.is_empty() {
+                warn!(row = idx, "row has empty response after tokenization, skipping");
+                continue;
+            }
+
+            rows.push(DatasetRow {
+                prompt_text,
+                response_text,
+                response_tokens,
+            });
+        }
+
+        if rows.is_empty() {
+            anyhow::bail!(
+                "dataset {} has no rows with tokenizable responses",
+                dataset_path.display()
+            );
+        }
+
+        info!(
+            rows = rows.len(),
+            "loaded dataset with tokenized responses"
+        );
+
+        Ok(HFDatasetTokens {
+            rows,
+            assignments: HashMap::new(),
+            next_row: 0,
+            positions: HashMap::new(),
+            fallback: RandomTokens { vocab_size },
+        })
+    }
+
+    fn row(&self, request_id: &str) -> Option<&DatasetRow> {
+        self.assignments
+            .get(request_id)
+            .and_then(|&idx| self.rows.get(idx))
+    }
+}
+
+impl TokenSource for HFDatasetTokens {
+    fn on_request_added(&mut self, request_id: &str, _prompt_token_ids: &[u32]) -> Option<usize> {
+        let row_idx = self.next_row % self.rows.len();
+        self.assignments.insert(request_id.to_string(), row_idx);
+        self.positions.insert(request_id.to_string(), 0);
+        self.next_row += 1;
+
+        debug!(
+            request_id,
+            dataset_row = row_idx,
+            tokens = self.rows[row_idx].response_tokens.len(),
+            "assigned request to dataset row"
+        );
+
+        Some(self.rows[row_idx].response_tokens.len())
+    }
+
+    fn next_tokens(&mut self, ctx: &TokenCtx<'_>, n: usize, rng: &mut StdRng) -> Vec<u32> {
+        let row = match self.row(ctx.request_id) {
+            Some(r) => r,
+            None => {
+                return self.fallback.next_tokens(ctx, n, rng);
+            }
+        };
+
+        let pos = self.positions.get(ctx.request_id).copied().unwrap_or(0);
+        let available = &row.response_tokens[pos.min(row.response_tokens.len())..];
+        let count = n.min(available.len());
+
+        let mut tokens = available[..count].to_vec();
+
+        // Update position
+        if let Some(p) = self.positions.get_mut(ctx.request_id) {
+            *p += count;
+        }
+
+        // Pad with fallback if we've exhausted the dataset row
+        if tokens.len() < n {
+            tokens.extend(self.fallback.next_tokens(ctx, n - tokens.len(), rng));
+        }
+
+        tokens
+    }
+
+    fn on_request_finished(&mut self, request_id: &str) {
+        self.assignments.remove(request_id);
+        self.positions.remove(request_id);
+    }
+
+    fn finish_reason(&self, request_id: &str) -> Option<EngineCoreFinishReason> {
+        let row = self.row(request_id)?;
+        let pos = self.positions.get(request_id).copied().unwrap_or(0);
+
+        if pos >= row.response_tokens.len() {
+            Some(EngineCoreFinishReason::Stop)
+        } else {
+            None
+        }
     }
 }
 

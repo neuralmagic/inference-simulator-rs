@@ -8,6 +8,7 @@
 //! engine crates instead.
 
 pub mod config_hash;
+pub mod dataset_convert;
 pub mod latency;
 pub mod perfetto;
 pub mod trace;

@@ -343,4 +343,43 @@ mod tests {
         let local: TraceUri = "/tmp/x.jsonl".parse().unwrap();
         assert_eq!(local.write_path(dir), PathBuf::from("/tmp/x.jsonl"));
     }
+
+    #[test]
+    fn parses_hf_uri_basic() {
+        let uri: TraceUri = "hf://neuralmagic/vllm-traces/trace.jsonl.gz"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            uri,
+            TraceUri::HuggingFace {
+                repo_id: "neuralmagic/vllm-traces".to_string(),
+                filename: "trace.jsonl.gz".to_string(),
+                revision: None,
+            }
+        );
+        assert!(uri.is_remote());
+        assert_eq!(uri.to_string(), "hf://neuralmagic/vllm-traces/trace.jsonl.gz");
+    }
+
+    #[test]
+    fn parses_hf_uri_with_revision() {
+        let uri: TraceUri = "hf://org/repo@v1.2/data/file.json"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            uri,
+            TraceUri::HuggingFace {
+                repo_id: "org/repo".to_string(),
+                filename: "data/file.json".to_string(),
+                revision: Some("v1.2".to_string()),
+            }
+        );
+        assert_eq!(uri.to_string(), "hf://org/repo@v1.2/data/file.json");
+    }
+
+    #[test]
+    fn rejects_malformed_hf_uri() {
+        assert!("hf://repo".parse::<TraceUri>().is_err()); // no filename
+        assert!("hf://repo/".parse::<TraceUri>().is_err()); // empty filename
+    }
 }

@@ -47,7 +47,7 @@ jobs:
           persist-credentials: false
 
       # Toolchain plus coarse Cargo cache; sccache adds compiler object caching.
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           components: rustfmt, clippy
 
@@ -109,7 +109,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       # `cargo xtask ci-matrix` reads compat.toml + conformance/manifest.toml via
       # sim-compat and emits one row per [[vllm]] line (compact JSON on stdout).
@@ -162,7 +162,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - uses: ./.github/actions/setup-sccache
         with:
@@ -197,7 +197,7 @@ jobs:
       # sub condition must be updated to the new repo path on the GitHub rename.
       - name: Configure AWS credentials (golden fetch, vLLM ${{ matrix.line }})
         if: ${{ matrix.has_goldens }}
-        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
         with:
           role-to-assume: arn:aws:iam::783952637884:role/llm-d-conformance-ci
           aws-region: us-east-1

@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
       # `cargo xtask release-matrix` crosses every compat.toml line with the
       # native-arch release platforms (defined in xtask). The default line also
       # publishes the line-agnostic trace tooling.
@@ -75,7 +75,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           target: ${{ matrix.target }}
 
@@ -137,7 +137,7 @@ jobs:
       # graph transitively covers the sim-* members. The default-line inspect tarball
       # is the same binary as that line's main tarball, so it shares this SBOM.
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-cyclonedx@0.5.9
 
@@ -176,7 +176,7 @@ jobs:
       # asset); verify with `gh attestation verify <tarball> --repo neuralmagic/vllm-vcr`.
       - name: Attest build provenance
         if: ${{ github.ref_type == 'tag' }}
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: 'dist/*.tar.gz'
 

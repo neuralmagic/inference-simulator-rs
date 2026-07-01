@@ -47,7 +47,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - uses: ./.github/actions/setup-sccache
         with:
@@ -85,7 +85,7 @@ jobs:
           cluster-url: ${{ vars.CONFORMANCE_CLUSTER_URL }}
 
       - name: Configure AWS credentials for golden upload
-        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
         with:
           role-to-assume: ${{ vars.CONFORMANCE_CAPTURE_ROLE_ARN }}
           aws-region: us-east-1

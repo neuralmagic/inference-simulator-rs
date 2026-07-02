@@ -56,3 +56,29 @@ sha256 = "233dd2b4400cee4e425d065c3696b368e8dc41f164099e530f3b90221558c63d"
 config_hash = "dffa077a1b73c97ce94a383b2166fec7ddd0080612a7e56204d2fdfd5dd4f36f"
 workload = "multiturn-nocache"
 role = "fidelity"
+
+# BEGIN NIGHTLY GOLDENS
+[[golden]]
+line = "nightly"
+bucket_path = "conformance/nightly/H200/Qwen/Qwen3-8B/nightly-qwen3-8b-mt-s7.jsonl.gz"
+sha256 = "ec9c2e70cac98789cac590169703891d3e0ff3ad6c2639717fb239ba977bf386"
+config_hash = "d962e0c06ca78d83f3376ac41601c2afcdf28a93683c6f7a08d2fdffeacea638"
+workload = "nightly-qwen3-8b-mt-s7"
+role = "fidelity"
+
+[[golden]]
+line = "nightly"
+bucket_path = "conformance/nightly/H200/Qwen/Qwen3-8B/nightly-qwen3-8b-mt-s13.jsonl.gz"
+sha256 = "c696c1dd13cff1a3c4f5466e88ed5c4b18edb3904e55c1304aa967a9ec71bc07"
+config_hash = "d962e0c06ca78d83f3376ac41601c2afcdf28a93683c6f7a08d2fdffeacea638"
+workload = "nightly-qwen3-8b-mt-s13"
+role = "fidelity"
+
+[[golden]]
+line = "nightly"
+bucket_path = "conformance/nightly/H200/Qwen/Qwen3-8B/nightly-qwen3-8b-nocache-s7.jsonl.gz"
+sha256 = "3d6ae45def31e4cfbc4924325172b901e2c05d914511ce76b48049783fe35023"
+config_hash = "7d62d01c586a495b0c4bcec851a6342d6c4be4098a14e33bb26bce29c5bbe1a1"
+workload = "nightly-qwen3-8b-nocache-s7"
+role = "fidelity"
+# END NIGHTLY GOLDENS
